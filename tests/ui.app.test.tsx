@@ -123,8 +123,74 @@ async function* fastStream(events: readonly ScanEvent[]): AsyncGenerator<ScanEve
   yield { kind: 'done' };
 }
 
+/**
+ * A stream the test drives event by event, so "this arrived *after* the user pressed
+ * enter" can be expressed as an ordering rather than as a hopeful sleep. `push` resolves
+ * once the app's consumer has actually pulled the event off the queue.
+ */
+interface Feed {
+  stream: AsyncIterable<ScanEvent>;
+  push(event: ScanEvent): Promise<void>;
+  done(): void;
+}
+
+const feeds: Feed[] = [];
+
+function feed(): Feed {
+  const queue: { event: ScanEvent; taken: () => void }[] = [];
+  let wake: (() => void) | undefined;
+  let finished = false;
+
+  const wakeUp = (): void => {
+    const resume = wake;
+    wake = undefined;
+    resume?.();
+  };
+
+  async function* generate(): AsyncGenerator<ScanEvent> {
+    for (;;) {
+      const next = queue.shift();
+      if (next !== undefined) {
+        next.taken();
+        yield next.event;
+        continue;
+      }
+      if (finished) {
+        yield { kind: 'done' };
+        return;
+      }
+      await new Promise<void>((resolve) => {
+        wake = resolve;
+      });
+    }
+  }
+
+  const created: Feed = {
+    stream: generate(),
+    push(event: ScanEvent): Promise<void> {
+      return new Promise<void>((resolve) => {
+        queue.push({ event, taken: resolve });
+        wakeUp();
+      });
+    },
+    done(): void {
+      finished = true;
+      wakeUp();
+    },
+  };
+  feeds.push(created);
+  return created;
+}
+
 const projectEvent = (project: Project): ScanEvent => ({ kind: 'project', project });
 const cacheEvent = (cache: CacheEntry): ScanEvent => ({ kind: 'cache', cache });
+
+/** Where each target points, for asserting on the work list without matching on shape. */
+function targetPaths(targets: readonly CleanTarget[]): string[] {
+  return targets
+    .map((target) => (target.kind === 'project' ? target.artifact.path : target.cache.path))
+    .sort();
+}
 
 type Instance = ReturnType<typeof render>;
 
@@ -210,6 +276,7 @@ function mount(
 
 afterEach(() => {
   for (const held of gates.splice(0)) held.open();
+  for (const source of feeds.splice(0)) source.done();
   for (const instance of rendered.splice(0)) instance.unmount();
 });
 
@@ -469,6 +536,118 @@ describe('confirmation and exit', () => {
     expect(ui.frame()).not.toContain('Move to Trash?');
     expect(ui.frame()).toContain('Nothing selected');
     expect(ui.cleaned).toEqual([]);
+  });
+});
+
+/**
+ * Consent is given to a *screen*, not to a variable. The scan is still running while the
+ * confirmation is up, and rows that arrive during it are auto-selected by the same default
+ * that preselects dormant projects. If the confirmation reads live selection, the user
+ * approves one list and `clean` receives a longer one — the work list grows between the
+ * question and the answer, which is the one place in this tool where that is not allowed.
+ */
+describe('the confirmation is a snapshot', () => {
+  const shown = (): Project =>
+    makeProject('shown', 'dormant', [artifact('dist', 'build', 3 * GB)]);
+  const latecomer = (): Project =>
+    makeProject('latecomer', 'dormant', [artifact('target', 'build', 40 * GB)]);
+
+  it('trashes only what was on screen when the user confirmed', async () => {
+    const source = feed();
+    const ui = mount(source.stream);
+
+    await source.push(projectEvent(shown()));
+    await ui.waitForText('shown');
+    expect(ui.frame()).toContain('selected 1');
+
+    await ui.press(ENTER);
+    expect(ui.frame()).toContain('Move to Trash?');
+    expect(ui.frame()).toContain('shown');
+
+    // Arrives from the still-running scan, after the question was already on screen.
+    await source.push(projectEvent(latecomer()));
+    await delay(50);
+
+    expect(ui.frame()).toContain('Move to Trash?');
+    expect(ui.frame()).not.toContain('latecomer');
+    expect(ui.frame()).toContain('across 1 directory');
+    expect(ui.frame()).not.toContain('43.0G');
+
+    await ui.press(ENTER);
+    await vi.waitFor(() => expect(ui.cleaned).toHaveLength(1), { timeout: 1_000, interval: 10 });
+
+    expect(targetPaths(ui.cleaned[0] ?? [])).toEqual(['/dev/shown/dist']);
+
+    await vi.waitFor(() => expect(ui.exits).toHaveLength(1), { timeout: 1_000, interval: 10 });
+    expect(ui.exits[0]?.trashedBytes).toBe(3 * GB);
+  });
+
+  it('holds the frozen total even when a cache lands mid-question', async () => {
+    const source = feed();
+    const ui = mount(source.stream);
+
+    await source.push(projectEvent(shown()));
+    await ui.waitForText('shown');
+    await ui.press(ENTER);
+
+    await source.push(cacheEvent(makeCache('gradle', 7 * GB)));
+    await delay(50);
+
+    expect(ui.frame()).not.toContain('gradle');
+    expect(ui.frame()).toContain('3.0G across 1 directory');
+
+    await ui.press(ENTER);
+    await vi.waitFor(() => expect(ui.cleaned).toHaveLength(1), { timeout: 1_000, interval: 10 });
+    expect(targetPaths(ui.cleaned[0] ?? [])).toEqual(['/dev/shown/dist']);
+  });
+
+  it('discloses the arrivals rather than swallowing them', async () => {
+    const source = feed();
+    const ui = mount(source.stream);
+
+    await source.push(projectEvent(shown()));
+    await ui.waitForText('shown');
+    await ui.press(ENTER);
+    expect(ui.frame()).not.toContain('found while confirming');
+
+    await source.push(projectEvent(latecomer()));
+    await source.push(cacheEvent(makeCache('gradle', 7 * GB)));
+    await delay(50);
+
+    expect(ui.frame()).toContain('2 more found while confirming');
+  });
+
+  /**
+   * The freeze is scoped to the run, not to the row: escaping back to the list must show
+   * everything the scan has found, latecomers included, and a second confirmation must
+   * offer them.
+   */
+  it('keeps latecomers in the background list and offers them on the next pass', async () => {
+    const source = feed();
+    const ui = mount(source.stream);
+
+    await source.push(projectEvent(shown()));
+    await ui.waitForText('shown');
+    await ui.press(ENTER);
+
+    await source.push(projectEvent(latecomer()));
+    await delay(50);
+    await ui.press(ESCAPE);
+
+    expect(ui.frame()).toContain('latecomer');
+    expect(ui.frame()).toContain('selected 2');
+
+    await ui.press(ENTER);
+    expect(ui.frame()).toContain('Move to Trash?');
+    expect(ui.frame()).toContain('latecomer');
+    expect(ui.frame()).toContain('across 2 directories');
+
+    await ui.press(ENTER);
+    await vi.waitFor(() => expect(ui.cleaned).toHaveLength(1), { timeout: 1_000, interval: 10 });
+    expect(targetPaths(ui.cleaned[0] ?? [])).toEqual([
+      '/dev/latecomer/target',
+      '/dev/shown/dist',
+    ]);
   });
 });
 

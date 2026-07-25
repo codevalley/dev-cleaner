@@ -1,7 +1,7 @@
 /**
  * The two-pane interface.
  *
- * Three properties are worth stating, because each one is a decision rather than a detail.
+ * Four properties are worth stating, because each one is a decision rather than a detail.
  *
  * **Progressive rendering.** The app consumes a `ScanEvent` stream and re-renders on every
  * event. It never awaits `done` before painting: on a 133 GB tree the first project is
@@ -17,6 +17,13 @@
  * to `categoriesForPreset` and `clean`. The UI is therefore renderable — and testable —
  * without touching a filesystem, and the module that can delete is reached through exactly
  * one, explicit seam.
+ *
+ * **Consent is a snapshot, and it is the collision between the two properties above.**
+ * Progressive rendering means the scan is still delivering projects while the confirmation
+ * is on screen, and the default selection preselects each one as it lands. Read live, the
+ * confirmation screen would grow a work list behind a question the user has already been
+ * asked. `ConfirmSnapshot` freezes what was shown; arrivals are counted and disclosed, and
+ * wait for the next pass.
  */
 
 import { Box, Text, render, useApp, useInput, useStdin, useStdout } from 'ink';
@@ -71,7 +78,29 @@ export interface AppProps {
   height?: number | undefined;
 }
 
-type Phase = 'list' | 'confirm' | 'cleaning';
+/**
+ * What the user was actually shown when they asked to confirm.
+ *
+ * The scan keeps running while the confirmation is up, and every project it finds is fed
+ * through the same default that preselects dormant work. Read live, the confirmation would
+ * therefore describe one set of directories and `clean` would receive a longer one: the
+ * user consents to a screen, and the work list grows behind it. Freezing rows, targets and
+ * the total at the moment the question is asked makes the answer apply to the question.
+ */
+interface ConfirmSnapshot {
+  rows: readonly Row[];
+  targets: readonly CleanTarget[];
+  bytes: number;
+}
+
+/**
+ * Modelled as a union rather than a string plus a nullable snapshot: `confirm` and
+ * `cleaning` cannot exist without the frozen list, and the type is what says so.
+ */
+type Phase =
+  | { kind: 'list' }
+  | { kind: 'confirm'; snapshot: ConfirmSnapshot }
+  | { kind: 'cleaning'; snapshot: ConfirmSnapshot };
 
 const MIN_LIST_WIDTH = 28;
 const MAX_LIST_WIDTH = 52;
@@ -100,7 +129,7 @@ export function App({
   const [preset, setPreset] = useState<Preset>(initialPreset ?? 'recommended');
   const [selection, setSelection] = useState<Selection>(EMPTY_SELECTION);
   const [cursorId, setCursorId] = useState<string | undefined>(undefined);
-  const [phase, setPhase] = useState<Phase>('list');
+  const [phase, setPhase] = useState<Phase>({ kind: 'list' });
   const [message, setMessage] = useState<string | undefined>(undefined);
 
   /** Rows whose default selection has already been applied, so a user's `space` sticks. */
@@ -181,33 +210,38 @@ export function App({
     exit();
   }, [exit, onExit]);
 
-  const runClean = useCallback(async () => {
-    setPhase('cleaning');
-    try {
-      const result = await onClean(targets);
-      const trashedBytes = result
-        .filter((outcome) => outcome.outcome === 'trashed')
-        .reduce((sum, outcome) => sum + outcome.bytes, 0);
-      onExit?.({ cleaned: true, outcomes: result, trashedBytes });
-      exit();
-    } catch (error) {
-      setPhase('list');
-      setMessage(`clean failed: ${error instanceof Error ? error.message : String(error)}`);
-    }
-  }, [exit, onClean, onExit, targets]);
+  // Takes the snapshot as an argument rather than reading state: the work list handed to
+  // `clean` is the one the user saw, not whatever the stream has made of it since.
+  const runClean = useCallback(
+    async (snapshot: ConfirmSnapshot) => {
+      setPhase({ kind: 'cleaning', snapshot });
+      try {
+        const result = await onClean(snapshot.targets);
+        const trashedBytes = result
+          .filter((outcome) => outcome.outcome === 'trashed')
+          .reduce((sum, outcome) => sum + outcome.bytes, 0);
+        onExit?.({ cleaned: true, outcomes: result, trashedBytes });
+        exit();
+      } catch (error) {
+        setPhase({ kind: 'list' });
+        setMessage(`clean failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    },
+    [exit, onClean, onExit],
+  );
 
   useInput(
     (input, key) => {
-      if (phase === 'cleaning') return;
+      if (phase.kind === 'cleaning') return;
 
       if (input === 'q' || (key.ctrl && input === 'c')) {
         quit();
         return;
       }
 
-      if (phase === 'confirm') {
-        if (key.escape) setPhase('list');
-        else if (key.return) void runClean();
+      if (phase.kind === 'confirm') {
+        if (key.escape) setPhase({ kind: 'list' });
+        else if (key.return) void runClean(phase.snapshot);
         return;
       }
 
@@ -229,30 +263,48 @@ export function App({
         setPreset(cyclePreset);
       } else if (key.return) {
         if (targets.length === 0) setMessage('Nothing selected');
-        else setPhase('confirm');
+        else setPhase({ kind: 'confirm', snapshot: { rows: chosen, targets, bytes: totalBytes } });
       }
     },
     { isActive: isRawModeSupported },
   );
 
-  if (phase === 'confirm') {
+  if (phase.kind === 'confirm') {
+    const { snapshot } = phase;
+    // Rows the scan turned up after the question was asked. They stay in the background
+    // list and are offered on the next pass; what they must not do is join this run
+    // unannounced. Counting them is the difference between "not included" and "hidden".
+    const frozen = new Set(snapshot.rows.map((row) => row.id));
+    const arrivals = chosen.filter((row) => !frozen.has(row.id)).length;
+
     return (
-      <Confirm
-        rows={chosen}
-        targetCount={targets.length}
-        bytes={totalBytes}
-        width={Math.min(columns - 4, 56)}
-      />
+      <Box flexDirection="column">
+        <Confirm
+          rows={snapshot.rows}
+          targetCount={snapshot.targets.length}
+          bytes={snapshot.bytes}
+          width={Math.min(columns - 4, 56)}
+        />
+        {arrivals > 0 ? (
+          <Box paddingX={1}>
+            <Text dimColor>
+              {`${arrivals} more found while confirming · not in this run, esc to review`}
+            </Text>
+          </Box>
+        ) : null}
+      </Box>
     );
   }
 
-  if (phase === 'cleaning') {
+  if (phase.kind === 'cleaning') {
+    const { snapshot } = phase;
+    const cleaningCount = snapshot.targets.length;
     return (
       <Box flexDirection="column" paddingX={1}>
         <Text bold color="yellow">
-          {`Moving ${formatBytes(totalBytes)} to the Trash…`}
+          {`Moving ${formatBytes(snapshot.bytes)} to the Trash…`}
         </Text>
-        <Text dimColor>{`${targets.length} ${targets.length === 1 ? 'directory' : 'directories'}`}</Text>
+        <Text dimColor>{`${cleaningCount} ${cleaningCount === 1 ? 'directory' : 'directories'}`}</Text>
       </Box>
     );
   }

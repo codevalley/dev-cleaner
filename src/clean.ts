@@ -51,13 +51,13 @@
  * module tests replace: the shipped path and the tested path differ in that one function.
  */
 
-import { lstat, realpath } from 'node:fs/promises';
-import fsSync, { type Stats } from 'node:fs';
+import { lstat, readdir, realpath } from 'node:fs/promises';
+import fsSync, { type Dirent, type Stats } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
 import { isArtifactBasename } from './artifacts.js';
-import type { CleanOutcome, CleanTarget, Refusal, TrashFn } from './types.js';
+import type { Artifact, CleanOutcome, CleanTarget, Refusal, TrashFn } from './types.js';
 
 export interface CleanOptions {
   trash: TrashFn;
@@ -373,7 +373,63 @@ function lexicalRejection(target: CleanTarget, options: CleanOptions): Rejection
  * says: link first (so a symlinked path is reported as a symlink rather than by whatever
  * its target happens to be), then the worktree check, then existence.
  */
-async function filesystemRejection(deletePath: string): Promise<Rejection | undefined> {
+/**
+ * How deep to look inside a candidate for a nested repository, and how many directories to
+ * visit before giving up. A worktree or deploy clone is placed deliberately and sits near
+ * the top (`build/wip`, `dist/site`); nothing is gained by walking an entire build tree.
+ *
+ * Exhausting the budget returns `undefined` — i.e. "no repository found". That is the one
+ * fail-*open* edge in this module, and it is the right trade: the alternative is refusing
+ * every large build directory on the machine, which trains the user to ignore refusals.
+ */
+const NESTED_SCAN_MAX_DEPTH = 4;
+const NESTED_SCAN_MAX_DIRS = 2_000;
+
+/**
+ * Finds a `.git` (either form) anywhere shallow inside `deletePath`.
+ *
+ * `deps` artifacts are exempt and deliberately so: `node_modules` routinely contains `.git`
+ * directories from git-installed dependencies, every one of them reproducible by a
+ * reinstall. Refusing on those would make the biggest category permanently unclearable —
+ * a guard nobody can satisfy is a guard that gets switched off.
+ */
+async function findNestedRepository(
+  deletePath: string,
+  category: Artifact['category'] | undefined,
+): Promise<string | undefined> {
+  if (category === 'deps') return undefined;
+
+  let budget = NESTED_SCAN_MAX_DIRS;
+  const queue: Array<{ dir: string; depth: number }> = [{ dir: deletePath, depth: 0 }];
+
+  while (queue.length > 0 && budget > 0) {
+    const current = queue.shift();
+    if (current === undefined) break;
+    budget -= 1;
+
+    let entries: Dirent[];
+    try {
+      entries = await readdir(current.dir, { withFileTypes: true });
+    } catch {
+      continue; // Unreadable subtree: nothing to assert about it.
+    }
+
+    for (const entry of entries) {
+      if (entry.name === '.git') return path.join(current.dir, '.git');
+      // Symlinks are never followed (invariant 2) — a link cannot hide a repository we
+      // would actually delete, since trashing the candidate removes the link, not its target.
+      if (entry.isDirectory() && current.depth + 1 <= NESTED_SCAN_MAX_DEPTH) {
+        queue.push({ dir: path.join(current.dir, entry.name), depth: current.depth + 1 });
+      }
+    }
+  }
+  return undefined;
+}
+
+async function filesystemRejection(
+  deletePath: string,
+  category?: Artifact['category'],
+): Promise<Rejection | undefined> {
   // Invariant 2, over the whole ancestor chain. A terminal `lstat` alone passes
   // `~/Library/pnpm/store` when `~/Library/pnpm` is a link elsewhere.
   for (const ancestor of ancestorsOf(deletePath)) {
@@ -411,6 +467,17 @@ async function filesystemRejection(deletePath: string): Promise<Rejection | unde
     return refused(
       'contains-repository',
       `${deletePath} is a git repository (its .git is a directory); refusing to trash history`,
+    );
+  }
+
+  // ...and the same question asked of the candidate's *contents*. Checking only the
+  // candidate itself leaves `build/wip/.git` — `git worktree add build/wip` — to be
+  // destroyed as a side effect of trashing `build`, with no refusal and no mention of it.
+  const nested = await findNestedRepository(deletePath, category);
+  if (nested !== undefined) {
+    return refused(
+      'contains-repository',
+      `${deletePath} contains a git repository or worktree at ${nested}`,
     );
   }
 
@@ -491,7 +558,11 @@ export async function clean(
     }
 
     const rejection =
-      lexicalRejection(target, options) ?? (await filesystemRejection(deletePathOf(target)));
+      lexicalRejection(target, options) ??
+      (await filesystemRejection(
+        deletePathOf(target),
+        target.kind === 'project' ? target.artifact.category : undefined,
+      ));
     if (rejection !== undefined) {
       record(
         rejection.outcome === 'refused'
