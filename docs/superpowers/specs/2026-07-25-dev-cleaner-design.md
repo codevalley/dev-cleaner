@@ -31,6 +31,10 @@ development and must not be touched.
 - Continuous background monitoring or scheduling.
 - Non-interactive/CI mode (`--yes`, `--json`). Deferred; add if demand appears.
 - Reporting non-artifact space hogs. Out of scope for v1.
+- **Repository management of any kind.** The tool does not remove git worktrees, prune
+  worktree registrations, delete branches, or run garbage collection. It deletes
+  regenerable files and nothing else. See "Worktrees" below for why this boundary is
+  load-bearing rather than merely tidy.
 
 ---
 
@@ -80,6 +84,20 @@ interface Artifact {
   bytes: number;
 }
 
+interface GitInfo {
+  branch: string;
+  lastCommitMs: number;
+  hasUncommittedChanges: boolean;
+  /** True when this root is a linked worktree (its `.git` is a file). */
+  isWorktree: boolean;
+  /** Worktrees only, display context. Undefined for main checkouts. */
+  worktree?: {
+    mainRepo: string;      // absolute path to the owning repository
+    isMerged: boolean;     // HEAD is an ancestor of the default branch
+    isClean: boolean;      // no modified or untracked files
+  };
+}
+
 interface Project {
   root: string;          // absolute
   name: string;          // path relative to scan root, e.g. "v2/gitayuga"
@@ -90,6 +108,9 @@ interface Project {
   activity: ActivityScore;
 }
 ```
+
+`GitInfo.worktree` is populated for display only. No field on it may gate a deletion
+decision — a worktree's artifacts are cleaned on the same terms as any other project's.
 
 ---
 
@@ -109,6 +130,42 @@ twelve of its crates plus its Xcode sub-app.
 Directories with no marker are containers and the walk continues through them. This is
 how `v2/` and `2026/` are handled: they are not projects, but their children are.
 
+### Worktrees
+
+**Exception to the roll-up rule:** a directory containing a `.git` *file* — as opposed to
+a `.git` directory — is a linked git worktree, and always begins a new project root, even
+when nested inside an existing one. The enclosing project's walk stops at that boundary.
+
+A worktree is an independent checkout with its own branch, its own build state, and its
+own history. Treating it as an ordinary project root means every downstream module —
+`detect`, `artifacts`, `size`, `activity`, `clean` — handles it with no special-case code.
+
+This is not a cosmetic choice. Under plain roll-up, a worktree's artifacts are attributed
+to its parent and inherit the parent's activity score. On the reference machine
+`tinysync` is active (last commit 12 days ago) while its nested worktree sits on a branch
+last touched 6 weeks ago — so 33 GB of stale build output would be silently protected by
+the parent's recency. Scoring the worktree independently is what makes the single largest
+reclaimable item visible.
+
+Detection costs one `lstat`: a main checkout's `.git` is a directory, a linked worktree's
+is a file. No `git` subprocess is required during the walk.
+
+**The tool never removes a worktree**, only its artifact directories. Three reasons:
+
+1. It would break the allowlist invariant. A worktree directory is not in the artifact
+   table, so removing one is the only operation that could delete a path the allowlist
+   does not name — the single exception that would make "allowlist, never blocklist"
+   false, and with it the fail-closed guarantee.
+2. It would corrupt git state. Trashing a worktree leaves `.git/worktrees/<name>/`
+   pointing at a missing directory — a `prunable` phantom entry. Trashing only `target/`
+   leaves a fully valid worktree. The artifact-only path is the one that keeps the
+   repository coherent.
+3. It is repository management, not disk cleanup, and carries a different risk class and
+   a different undo path.
+
+Worktree status (registered, clean, merged) is still computed and shown in the detail
+pane as context for the user's decision. It informs; it never gates deletion.
+
 ### Pruning
 
 The walk never descends into a directory whose basename appears in the artifact table,
@@ -120,11 +177,19 @@ sub-second one.
 
 Never descended into, never treated as artifacts:
 
-- `.git`
-- `.worktrees`, and any directory containing a `.git` *file* (a linked worktree). Git
-  worktrees are real checkouts holding real source and possibly uncommitted work.
-- `.claude` — may contain worktrees and session state.
+- `.git` (the directory form — object storage, not build output)
 - Any symbolic link.
+
+`.worktrees/` and `.claude/worktrees/` are **walked, not skipped**. An earlier draft
+skipped them wholesale on the theory that worktrees hold real source and possibly
+uncommitted work. That reasoning was sound but the conclusion was too blunt: it protected
+the source by hiding the artifacts sitting beside it, concealing the largest single
+reclaimable item on the reference machine. The allowlist already guarantees source is
+never touched — a blanket skip adds no safety, only blindness.
+
+Other contents of `.claude/` (settings, commands, transcripts) contain no type markers and
+name no artifact directories, so the walk finds nothing there and the allowlist would
+refuse them regardless. No special case is required.
 
 ---
 
@@ -319,7 +384,15 @@ Vitest.
   their entire job is filesystem interpretation.
 - **Discovery cases:** nested projects (`v2/zerolist`), container directories (`v2/`),
   roll-up (a repo with nested markers collapses to one), pruning (no descent into
-  `node_modules`), skipping (`.worktrees`, `.claude`, symlinks).
+  `node_modules`), symlink skipping.
+- **Worktree cases:** a linked worktree nested inside a project root emerges as its *own*
+  root, not absorbed into the parent; its artifacts are attributed to it and not to the
+  parent; it receives an independent activity score. The regression test to hold onto:
+  an *active* parent containing a *dormant* worktree must still offer the worktree's
+  artifacts. That is the exact case a blanket skip or a naive roll-up gets wrong.
+- **Worktree non-removal:** no code path produces a delete target equal to a worktree
+  root. Asserted directly against `clean.ts`'s work list, since this is an invariant
+  rather than a behaviour.
 - **Detection cases:** polyglot projects — a Flutter tree must yield
   `{flutter, gradle, xcode, ruby}` and the union of their artifact paths.
 - **Safety cases (adversarial):** a symlink pointing at `$HOME`; a `node_modules` outside
