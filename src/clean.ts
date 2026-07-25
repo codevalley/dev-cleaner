@@ -46,6 +46,11 @@
  *   walk already applies — `git worktree add build feature` produces a checkout with a
  *   name the artifact table claims, and one ordering slip anywhere upstream is enough to
  *   offer real source with uncommitted work for deletion.
+ * - **Git history is never collateral damage.** The same question is asked three ways: is
+ *   the candidate itself a repository (`.git` a directory, the `gh-pages` deploy clone), is
+ *   it a linked worktree (`.git` a file), and does it *contain* either within a few levels.
+ *   The third check can also come back "I could not finish", and that is reported as a
+ *   refusal rather than as a clean bill of health — see `findNestedRepository`.
  *
  * Invariant 4 (trash, not unlink) is `systemTrash`, and it is the *only* part of this
  * module tests replace: the shipped path and the tested path differ in that one function.
@@ -57,7 +62,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { isArtifactBasename } from './artifacts.js';
-import type { Artifact, CleanOutcome, CleanTarget, Refusal, TrashFn } from './types.js';
+import type { CleanOutcome, CleanTarget, Refusal, TrashFn } from './types.js';
 
 export interface CleanOptions {
   trash: TrashFn;
@@ -82,6 +87,16 @@ export interface CleanOptions {
    * as required so that omitting it is a compile error rather than a silent unsafe prune.
    */
   unselectedNodeModules: readonly string[];
+  /**
+   * How many directories the nested-repository scan may read per candidate. Optional, and
+   * **tighten-only**: values at or above the shipped budget (and `NaN`, `Infinity`, a
+   * missing field) all mean the shipped budget, so no caller can widen it or make the scan
+   * run unbounded. Lowering it can only produce *more* refusals — a candidate the scan
+   * could not finish is refused, never permitted — which is what makes it safe to expose
+   * and what makes the budget testable end to end through `clean` rather than only against
+   * the scanner in isolation.
+   */
+  nestedScanMaxDirs?: number;
 }
 
 /**
@@ -369,43 +384,85 @@ function lexicalRejection(target: CleanTarget, options: CleanOptions): Rejection
 }
 
 /**
- * The guards that must look at the disk, in the order that makes each refusal mean what it
- * says: link first (so a symlinked path is reported as a symlink rather than by whatever
- * its target happens to be), then the worktree check, then existence.
- */
-/**
  * How deep to look inside a candidate for a nested repository, and how many directories to
- * visit before giving up. A worktree or deploy clone is placed deliberately and sits near
- * the top (`build/wip`, `dist/site`); nothing is gained by walking an entire build tree.
+ * read before admitting we do not know.
  *
- * Exhausting the budget returns `undefined` — i.e. "no repository found". That is the one
- * fail-*open* edge in this module, and it is the right trade: the alternative is refusing
- * every large build directory on the machine, which trains the user to ignore refusals.
+ * ## Depth is policy; the budget is not
+ *
+ * A worktree or deploy clone is placed deliberately and sits near the top (`build/wip`,
+ * `dist/site`, `.venv/src/mylib`); walking an entire build tree to the leaves buys nothing.
+ * Depth is therefore a stated limit on what this check *claims*, and the claim stops at
+ * four: bundler's own git-gem layout, `vendor/bundle/ruby/<ver>/bundler/gems/<gem>-<sha>`,
+ * is one level past it and is not seen. Raising the limit is affordable — the reference
+ * `target/` grows from 11,423 directories to 13,861 at depth 6 — but it is a widening of
+ * this module's promise and belongs with its own fixtures, not smuggled in here.
+ *
+ * The directory budget is a different thing: a bound on worst-case *time*. The previous
+ * version conflated the two and treated exhaustion as an answer — it returned "no
+ * repository found" — which made the guard inert precisely where build trees are biggest.
+ * Measured on the reference machine, one Rust `target/` (67 GB) holds 8,187 directories at
+ * depth ≤ 3; the old budget of 2,000 was spent before the walk had finished depth 3, so a
+ * repository anywhere below that was invisible and the directory was trashed in silence.
+ * A guard that fails open on the largest directories on the disk is not a guard.
+ *
+ * So the budget is 50,000 — about 4× the 11,423 directories that same `target/` presents
+ * at depth ≤ 4 (3.3 s cold, 0.8 s warm) — and exhausting it yields `unverified`, which
+ * `filesystemRejection` turns into a refusal that says the candidate could not be checked.
+ * Ordinary trees are two orders of magnitude under the budget and are unaffected; the one
+ * thing that must never happen — losing a repository because a *sibling* directory had
+ * many entries — is now impossible rather than merely unlikely.
+ *
+ * ## Breadth-first, on purpose
+ *
+ * Now that exhaustion refuses rather than permits, the traversal order can no longer cost
+ * anyone their history; it only decides how often the answer is *definite*. Nested
+ * repositories are shallow by nature, so breadth-first — every shallower depth finished
+ * before a deeper one is touched — turns the common case into "there is a repository at
+ * `<path>`" rather than "this was too large to check". The queue is drained with a moving
+ * head index instead of `shift()`, which at this budget is the difference between O(n) and
+ * O(n²) element moves.
  */
 const NESTED_SCAN_MAX_DEPTH = 4;
-const NESTED_SCAN_MAX_DIRS = 2_000;
+/** Exported so a test can hold the *size* of the budget to the measurement above; the
+ * previous value of 2,000 was the defect, not an implementation detail. */
+export const NESTED_SCAN_MAX_DIRS = 50_000;
 
 /**
- * Finds a `.git` (either form) anywhere shallow inside `deletePath`.
+ * What a scan of a candidate's contents concluded.
  *
- * `deps` artifacts are exempt and deliberately so: `node_modules` routinely contains `.git`
- * directories from git-installed dependencies, every one of them reproducible by a
- * reinstall. Refusing on those would make the biggest category permanently unclearable —
- * a guard nobody can satisfy is a guard that gets switched off.
+ * `unverified` is the load-bearing case and the reason this is a union rather than
+ * `string | undefined`: it is *not* `clear`, and no caller may read it as "safe". The old
+ * signature had no way to say "I do not know", so it said "nothing here".
  */
-async function findNestedRepository(
+export type NestedScan =
+  | { kind: 'clear' }
+  | { kind: 'repository'; at: string }
+  | { kind: 'unverified'; visited: number };
+
+/**
+ * Looks for a `.git` (either form) anywhere within `NESTED_SCAN_MAX_DEPTH` of `deletePath`.
+ *
+ * Pure search, no policy: *which* candidates are scanned is `nestedScanApplies`, so the
+ * exemptions live in exactly one place and cannot drift from the reasoning that justifies
+ * them.
+ */
+export async function findNestedRepository(
   deletePath: string,
-  category: Artifact['category'] | undefined,
-): Promise<string | undefined> {
-  if (category === 'deps') return undefined;
-
-  let budget = NESTED_SCAN_MAX_DIRS;
+  maxDirs: number = NESTED_SCAN_MAX_DIRS,
+): Promise<NestedScan> {
   const queue: Array<{ dir: string; depth: number }> = [{ dir: deletePath, depth: 0 }];
+  let head = 0;
+  let visited = 0;
 
-  while (queue.length > 0 && budget > 0) {
-    const current = queue.shift();
+  while (head < queue.length) {
+    // Checked with work still queued, so a scan that happens to finish on its last
+    // permitted directory is `clear` rather than `unverified`.
+    if (visited >= maxDirs) return { kind: 'unverified', visited };
+
+    const current = queue[head];
+    head += 1;
     if (current === undefined) break;
-    budget -= 1;
+    visited += 1;
 
     let entries: Dirent[];
     try {
@@ -415,7 +472,7 @@ async function findNestedRepository(
     }
 
     for (const entry of entries) {
-      if (entry.name === '.git') return path.join(current.dir, '.git');
+      if (entry.name === '.git') return { kind: 'repository', at: path.join(current.dir, '.git') };
       // Symlinks are never followed (invariant 2) — a link cannot hide a repository we
       // would actually delete, since trashing the candidate removes the link, not its target.
       if (entry.isDirectory() && current.depth + 1 <= NESTED_SCAN_MAX_DEPTH) {
@@ -423,12 +480,58 @@ async function findNestedRepository(
       }
     }
   }
-  return undefined;
+  return { kind: 'clear' };
 }
 
+/**
+ * Which candidates get looked inside. Two exemptions, each as narrow as its reasoning:
+ *
+ * - **`node_modules`, matched by NAME.** Git-installed npm dependencies leave `.git`
+ *   directories throughout it, every one reproducible by a reinstall; refusing on those
+ *   would make the biggest category on the machine permanently unclearable, and a guard
+ *   nobody can satisfy is a guard that gets switched off. This was previously written as
+ *   the whole `deps` *category*, which is a far larger set — `.venv`, `venv`,
+ *   `vendor/bundle` and `Pods` are all `deps`. `pip install -e git+ssh://…#egg=mylib`, the
+ *   documented way to work on a dependency in place, leaves a full clone with unpushed
+ *   commits at `.venv/src/mylib/.git`, and the category-wide exemption trashed it without a
+ *   word under `--preset aggressive`. The argument was only ever about one directory name,
+ *   so the exemption is one directory name.
+ * - **Caches, entirely.** A cache is not a project artifact: it is allowlisted by *exact
+ *   path* from `caches.ts`, which is a stronger claim than "we looked inside and saw
+ *   nothing", and its documented layout may legitimately contain clones. `~/.pub-cache`
+ *   keeps every git-sourced Dart package as a full clone at
+ *   `~/.pub-cache/git/<pkg>-<sha>/.git`, so scanning caches would block that cache
+ *   permanently, for every user, with no action they could take to satisfy it.
+ */
+function nestedScanApplies(target: CleanTarget): boolean {
+  if (target.kind !== 'project') return false;
+  return path.basename(deletePathOf(target)) !== NODE_MODULES;
+}
+
+/**
+ * Tighten-only. Anything not below the shipped budget — including `undefined`, `NaN` and
+ * `Infinity`, none of which compare `<` — means the shipped budget, so the option cannot
+ * widen the scan or set it running unbounded; negatives clamp to 0, which refuses every
+ * scanned candidate and so fails closed.
+ */
+export function nestedScanBudget(requested: number | undefined): number {
+  return requested !== undefined && requested < NESTED_SCAN_MAX_DIRS
+    ? Math.max(0, Math.floor(requested))
+    : NESTED_SCAN_MAX_DIRS;
+}
+
+/**
+ * The guards that must look at the disk, in the order that makes each refusal mean what it
+ * says: link first (so a symlinked path is reported as a symlink rather than by whatever
+ * its target happens to be), then the worktree check, then existence.
+ *
+ * `nested` is the policy for the contents scan — whether to run it at all, and its budget.
+ * Both are decided by the caller (`nestedScanApplies`, `nestedScanBudget`) so that this
+ * function only ever *applies* the guards.
+ */
 async function filesystemRejection(
   deletePath: string,
-  category?: Artifact['category'],
+  nested: { scan: boolean; maxDirs: number },
 ): Promise<Rejection | undefined> {
   // Invariant 2, over the whole ancestor chain. A terminal `lstat` alone passes
   // `~/Library/pnpm/store` when `~/Library/pnpm` is a link elsewhere.
@@ -473,12 +576,25 @@ async function filesystemRejection(
   // ...and the same question asked of the candidate's *contents*. Checking only the
   // candidate itself leaves `build/wip/.git` — `git worktree add build/wip` — to be
   // destroyed as a side effect of trashing `build`, with no refusal and no mention of it.
-  const nested = await findNestedRepository(deletePath, category);
-  if (nested !== undefined) {
-    return refused(
-      'contains-repository',
-      `${deletePath} contains a git repository or worktree at ${nested}`,
-    );
+  if (nested.scan) {
+    const scan = await findNestedRepository(deletePath, nested.maxDirs);
+    if (scan.kind === 'repository') {
+      return refused(
+        'contains-repository',
+        `${deletePath} contains a git repository or worktree at ${scan.at}`,
+      );
+    }
+    // Not a repository sighting — the opposite: the scan ran out of budget with the
+    // question still open. Reporting that as "clear" is how a 67 GB `target/` gets trashed
+    // with a worktree inside it, so an unfinished scan refuses and says so.
+    if (scan.kind === 'unverified') {
+      return refused(
+        'contains-repository',
+        `${deletePath} is too large to verify: read ${scan.visited} directories without ` +
+          'ruling out a git repository inside it, so it is refused rather than risk ' +
+          'trashing history',
+      );
+    }
   }
 
   if (stats === undefined) {
@@ -559,10 +675,10 @@ export async function clean(
 
     const rejection =
       lexicalRejection(target, options) ??
-      (await filesystemRejection(
-        deletePathOf(target),
-        target.kind === 'project' ? target.artifact.category : undefined,
-      ));
+      (await filesystemRejection(deletePathOf(target), {
+        scan: nestedScanApplies(target),
+        maxDirs: nestedScanBudget(options.nestedScanMaxDirs),
+      }));
     if (rejection !== undefined) {
       record(
         rejection.outcome === 'refused'

@@ -209,13 +209,18 @@ const rendered: Instance[] = [];
 
 function mount(
   stream: AsyncIterable<ScanEvent>,
-  overrides: { preset?: Preset } = {},
+  overrides: {
+    preset?: Preset;
+    /** Called after every attempt is recorded; throw to make that attempt fail. */
+    onAttempt?: (attempt: number) => void;
+  } = {},
 ): Harness {
   const cleaned: CleanTarget[][] = [];
   const exits: ExitSummary[] = [];
 
   const onClean = async (targets: readonly CleanTarget[]): Promise<CleanOutcome[]> => {
     cleaned.push([...targets]);
+    overrides.onAttempt?.(cleaned.length);
     return targets.map((target) => ({
       target,
       label: target.kind === 'project' ? target.artifact.relPath : target.cache.label,
@@ -521,6 +526,64 @@ describe('confirmation and exit', () => {
     expect(ui.exits[0]?.cleaned).toBe(true);
     expect(ui.exits[0]?.trashedBytes).toBe(5 * GB);
     expect(ui.exits[0]?.outcomes).toHaveLength(2);
+  });
+
+  /**
+   * A confirmation dialog is exactly where a user double-taps or holds the key. Both
+   * keystrokes land in the same tick, before React has committed the `cleaning` phase, so
+   * both reach the previous render's handler closure while it still reads `confirm`.
+   * Nothing but a synchronously-latched guard can stop the second one: a state flag is set
+   * asynchronously, which is the race itself. Trashing twice is mostly idempotent, but the
+   * reported summary would describe the second run and a non-idempotent backend would
+   * double-delete.
+   */
+  it('cleans exactly once when two enters land in the same tick', async () => {
+    const ui = mount(stream());
+    await ui.waitForText('bump');
+
+    await ui.press(ENTER);
+    expect(ui.frame()).toContain('Move to Trash?');
+
+    // Deliberately not `press`: no await between them, so React cannot re-render in
+    // between and both handlers see phase.kind === 'confirm'.
+    ui.instance.stdin.write(ENTER);
+    ui.instance.stdin.write(ENTER);
+
+    await vi.waitFor(() => expect(ui.exits).toHaveLength(1), { timeout: 1_000, interval: 10 });
+    await delay(100);
+
+    expect(ui.cleaned).toHaveLength(1);
+    expect(ui.exits).toHaveLength(1);
+    expect(ui.exits[0]?.trashedBytes).toBe(5 * GB);
+  });
+
+  /**
+   * The latch spends the *run*, not the app. A clean that throws reports nothing and exits
+   * nothing, so the user is back at the list with a decision still to make; a latch that
+   * stayed set would leave every subsequent enter silently inert.
+   */
+  it('lets the user retry after a failed clean', async () => {
+    const ui = mount(stream(), {
+      onAttempt: (attempt) => {
+        if (attempt === 1) throw new Error('trash unavailable');
+      },
+    });
+    await ui.waitForText('bump');
+
+    await ui.press(ENTER);
+    await ui.press(ENTER);
+    await ui.waitForText('clean failed: trash unavailable');
+    expect(ui.cleaned).toHaveLength(1);
+    expect(ui.exits).toEqual([]);
+
+    await ui.press(ENTER);
+    expect(ui.frame()).toContain('Move to Trash?');
+    await ui.press(ENTER);
+
+    await vi.waitFor(() => expect(ui.exits).toHaveLength(1), { timeout: 1_000, interval: 10 });
+    expect(ui.cleaned).toHaveLength(2);
+    expect(ui.exits[0]?.cleaned).toBe(true);
+    expect(ui.exits[0]?.trashedBytes).toBe(5 * GB);
   });
 
   it('refuses to open the confirmation with an empty selection', async () => {

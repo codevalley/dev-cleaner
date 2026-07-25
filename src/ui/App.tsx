@@ -135,6 +135,20 @@ export function App({
   /** Rows whose default selection has already been applied, so a user's `space` sticks. */
   const seen = useRef<Set<string>>(new Set());
 
+  /**
+   * Consent is spent, not just given.
+   *
+   * Ink re-subscribes `useInput` in a passive effect, so two keystrokes delivered in one
+   * tick — a double-tap, or the key repeat of a held ENTER, which on a confirmation dialog
+   * is entirely ordinary — both reach the *previous* render's handler while `phase` still
+   * reads `confirm`. A `setPhase` cannot stop the second one: state updates are asynchronous,
+   * and that asynchrony is the race. Only a ref latched synchronously, before the first
+   * `await`, makes the transition single-use. Trashing the same path twice is mostly
+   * idempotent, but the reported summary would describe the second run, and a trash backend
+   * that is not idempotent would delete twice.
+   */
+  const cleanStarted = useRef(false);
+
   const columns = width ?? stdout?.columns ?? 80;
   const listWidth = Math.min(MAX_LIST_WIDTH, Math.max(MIN_LIST_WIDTH, Math.floor(columns * 0.55)));
   const detailWidth = Math.max(MIN_LIST_WIDTH, columns - listWidth);
@@ -214,6 +228,11 @@ export function App({
   // `clean` is the one the user saw, not whatever the stream has made of it since.
   const runClean = useCallback(
     async (snapshot: ConfirmSnapshot) => {
+      // Latched here, synchronously: everything above the first `await` runs before the
+      // caller returns, so the second keystroke of the same tick finds the latch already set.
+      if (cleanStarted.current) return;
+      cleanStarted.current = true;
+
       setPhase({ kind: 'cleaning', snapshot });
       try {
         const result = await onClean(snapshot.targets);
@@ -223,6 +242,9 @@ export function App({
         onExit?.({ cleaned: true, outcomes: result, trashedBytes });
         exit();
       } catch (error) {
+        // The run is over and nothing was reported, so the next one is a new decision:
+        // release the latch or a failed clean would leave the app unable to retry.
+        cleanStarted.current = false;
         setPhase({ kind: 'list' });
         setMessage(`clean failed: ${error instanceof Error ? error.message : String(error)}`);
       }
