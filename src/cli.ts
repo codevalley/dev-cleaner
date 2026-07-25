@@ -22,6 +22,7 @@
 
 import { createRequire } from 'node:module';
 import { realpathSync } from 'node:fs';
+import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import { renderCleanSummary, renderReport } from './report.js';
@@ -271,6 +272,28 @@ async function* recordCaches(
   }
 }
 
+/**
+ * Records every `node_modules` the scan discovers, whether or not it is selected.
+ *
+ * Invariant 5 asks whether any hardlink source will still be on disk when the run ends.
+ * `clean` can see the ones that were *selected and failed*, but not the ones that were
+ * never selected — and under the default preset that is every single one, since
+ * `recommended` omits the `deps` category while still selecting the pnpm store.
+ */
+async function* recordNodeModules(
+  source: AsyncIterable<ScanEvent>,
+  into: string[],
+): AsyncGenerator<ScanEvent> {
+  for await (const event of source) {
+    if (event.kind === 'project') {
+      for (const artifact of event.project.artifacts) {
+        if (path.basename(artifact.path) === 'node_modules') into.push(artifact.path);
+      }
+    }
+    yield event;
+  }
+}
+
 async function runStaticReport(
   options: CliOptions,
   deps: MainDeps,
@@ -301,15 +324,31 @@ async function runInteractive(options: CliOptions, deps: MainDeps, io: CliIO): P
   const trash = deps.trash ?? (await import('./clean.js')).systemTrash;
 
   const allowedCachePaths: string[] = [];
-  const stream = recordCaches(scanStream(scanOptionsFor(options, deps)), allowedCachePaths);
+  // Every `node_modules` the scan sees, selected or not. Invariant 5 needs the ones that
+  // will still be on disk afterwards, and under the default `recommended` preset that is
+  // *all* of them — `deps` is not in the preset, so none is ever a target.
+  const nodeModulesSeen: string[] = [];
+  const stream = recordCaches(
+    recordNodeModules(scanStream(scanOptionsFor(options, deps)), nodeModulesSeen),
+    allowedCachePaths,
+  );
 
   const summary = await runApp({
     stream,
     categoriesFor,
     preset: options.preset,
     nowMs: deps.nowMs ?? Date.now(),
-    onClean: (targets: readonly CleanTarget[]) =>
-      cleanTargets(targets, { trash, roots: options.roots, allowedCachePaths }),
+    onClean: (targets: readonly CleanTarget[]) => {
+      const selected = new Set(
+        targets.flatMap((t) => (t.kind === 'project' ? [t.artifact.path] : [])),
+      );
+      return cleanTargets(targets, {
+        trash,
+        roots: options.roots,
+        allowedCachePaths,
+        unselectedNodeModules: nodeModulesSeen.filter((p) => !selected.has(p)),
+      });
+    },
   });
 
   // Invariant 8: the disclosure only makes sense when something was actually trashed, and

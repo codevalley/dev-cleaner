@@ -245,7 +245,7 @@ function recordingTrash(): { trash: TrashFn; trashed: string[] } {
 }
 
 function cleanOptions(trash: TrashFn): CleanOptions {
-  return { trash, roots: [f.root], allowedCachePaths: [] };
+  return { trash, roots: [f.root], allowedCachePaths: [], unselectedNodeModules: [] };
 }
 
 /** Every artifact of every discovered project, as `clean` wants them. */

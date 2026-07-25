@@ -39,7 +39,14 @@ export type CleanTarget =
   | { kind: 'cache'; cache: CacheEntry };
 export type Refusal =
   | 'not-in-artifact-table' | 'outside-project-root' | 'symlink'
-  | 'guarded-path' | 'worktree-root' | 'unknown-cache' | 'store-prune-unsafe';
+  | 'guarded-path' | 'worktree-root' | 'unknown-cache' | 'store-prune-unsafe'
+  /**
+   * The target is, or contains, a real git repository (`.git` as a *directory*).
+   * Distinct from `worktree-root`, which is `.git` as a *file*. The common case is a
+   * `gh-pages` deploy directory: `git clone -b gh-pages <repo> dist` makes `dist/` a
+   * repository whose history exists nowhere else if it holds unpushed commits.
+   */
+  | 'contains-repository';
 export interface CleanOutcome {
   target: CleanTarget; label: string; bytes: number;
   outcome: 'trashed' | 'refused' | 'failed';
