@@ -15,16 +15,43 @@
  * thing that makes the reported number mean what it appears to mean.
  *
  * Marks are ASCII (`[x]` / `[ ]` / `[-]`) rather than the list's `◉` / `○`: this output is
- * redirected to files and pipes, where the terminal glyphs are noise. `[-]` is a cache the
- * run has already established it would refuse (`CacheEntry.blocked`); it is listed with its
- * reason and left out of the "selected by default" total, because a total that includes
- * something the tool will then refuse is a promise it does not keep.
+ * redirected to files and pipes, where the terminal glyphs are noise. `[-]` is a row the run
+ * has already established it would refuse; it is listed with its reason and left out of the
+ * "selected by default" total, because a total that includes something the tool will then
+ * refuse is a promise it does not keep.
+ *
+ * ## Where the `[-]` rows come from
+ *
+ * Two screens, and only one of them is written here. `CacheEntry.blocked` arrives with the
+ * cache from `caches.ts`; everything else comes from `screenReport`, which asks
+ * `clean.ts`'s own guards — the exact functions the deletion boundary runs — which rows they
+ * would refuse. That is the point: the report shows what is *selected* and `clean` decides
+ * what is *deletable*, so any second opinion computed here would drift from the boundary and
+ * the tool would go back to promising space it then refuses. `renderReport` itself stays a
+ * pure string builder over rows and blocks; `renderScreenedReport` is the pairing the CLI
+ * uses, so the printing path cannot forget to screen.
+ *
+ * Cost is bounded the way `clean.ts` documents: the cheap tier (a handful of `lstat`s, no
+ * subtree walked) over every listed row, the expensive tier (the nested-repository scan)
+ * only over what is actually selected. An unselected row's bytes are not in the promised
+ * total, so a scan that costs seconds per candidate buys nothing there.
  */
 
-import type { CacheEntry, Category, CleanOutcome, Preset, Project } from './types.js';
+import path from 'node:path';
+
+import { screenTargets, screenTargetsCheaply } from './clean.js';
+import type { Screening, ScreeningOptions } from './clean.js';
+import type { CacheEntry, Category, CleanOutcome, CleanTarget, Preset, Project } from './types.js';
 import { formatBytes, formatIdle } from './ui/format.js';
-import { buildRows, defaultSelection, enabledArtifacts, isSelected } from './ui/model.js';
-import type { Row, Selection } from './ui/model.js';
+import {
+  buildRows,
+  defaultSelection,
+  enabledArtifacts,
+  isSelected,
+  rowBlock,
+  toTargets,
+} from './ui/model.js';
+import type { Row, RowBlock, RowBlocks, Selection } from './ui/model.js';
 
 /**
  * Structurally a `ScanResult` plus the preset's categories. Taking the shape rather than
@@ -38,6 +65,22 @@ export interface ReportInput {
   categories: ReadonlySet<Category>;
   preset?: Preset | undefined;
   roots?: readonly string[] | undefined;
+  /**
+   * Rows the run has already established it would refuse, by row id — `screenReport`'s
+   * output. Absent means "nothing was screened", which is honest for a caller that has not
+   * screened but is never what the CLI does: see `renderScreenedReport`.
+   */
+  blocks?: RowBlocks | undefined;
+}
+
+/**
+ * `ReportInput` with the one thing screening cannot be done without: the scan roots, already
+ * `realpath`-resolved by `resolveScanRoot`. Required rather than optional, because a screen
+ * run with no roots refuses every project row as `outside-project-root` — a report that
+ * blocks everything is exactly as useless as one that blocks nothing.
+ */
+export interface ScreenedReportInput extends ReportInput {
+  roots: readonly string[];
 }
 
 /** Width of the name column. Wide enough for `apps/macos-file-provider` unabbreviated. */
@@ -70,23 +113,31 @@ function projectMeta(project: Project): string {
   return [types, age, reason].filter((part) => part.length > 0).join(' · ');
 }
 
-/** The `blocked` reason of a cache row, or `undefined` for anything that can be cleaned. */
-function blockedReason(row: Row): string | undefined {
-  return row.kind === 'cache' ? row.cache.blocked?.reason : undefined;
+/** The one reason this row cannot be cleaned, whichever screen established it. */
+function blockedReason(row: Row, blocks: RowBlocks | undefined): string | undefined {
+  return rowBlock(row, blocks)?.reason;
 }
 
-function itemLines(row: Row, selection: Selection, categories: ReadonlySet<Category>): string[] {
+function itemLines(
+  row: Row,
+  selection: Selection,
+  categories: ReadonlySet<Category>,
+  blocks: RowBlocks | undefined,
+): string[] {
   if (row.kind === 'header') return [];
 
   // A third mark, not an empty box: `[ ]` means "you could select this", and a blocked row
   // is one the run has already established it would refuse. Same reason the mark exists at
   // all — the report is the only view a piped invocation ever gets.
-  const blocked = blockedReason(row);
+  const blocked = blockedReason(row, blocks);
   const mark = blocked !== undefined ? '[-]' : isSelected(selection, row) ? '[x]' : '[ ]';
   const lines = [`  ${mark} ${column(row.label, row.bytes)}`];
 
   if (row.kind === 'project') {
     lines.push(`      ${projectMeta(row.project)}`);
+    // Printed before the artifact breakdown, which is what the reason usually names: the
+    // user reads "why not" next to the mark, then which directory provoked it.
+    if (blocked !== undefined) lines.push(`      blocked: ${blocked}`);
     for (const artifact of enabledArtifacts(row.project, categories)) {
       lines.push(`      ${column(`${artifact.relPath}/`, artifact.bytes)}  ${artifact.category}`);
     }
@@ -102,9 +153,9 @@ function itemLines(row: Row, selection: Selection, categories: ReadonlySet<Categ
  * it would be selected by default, each project broken down by artifact.
  */
 export function renderReport(input: ReportInput): string {
-  const { projects, caches, categories, preset, roots } = input;
+  const { projects, caches, categories, preset, roots, blocks } = input;
   const rows = buildRows({ projects, caches, categories });
-  const selection = defaultSelection(rows);
+  const selection = defaultSelection(rows, blocks);
 
   const lines: string[] = ['dev-cleaner'];
   if (roots !== undefined && roots.length > 0) lines.push(`roots:  ${roots.join(', ')}`);
@@ -120,12 +171,21 @@ export function renderReport(input: ReportInput): string {
       lines.push('', `${row.label}  ·  ${plural(row.count, 'item')}  ·  ${formatBytes(row.bytes)}`);
       continue;
     }
-    lines.push(...itemLines(row, selection, categories));
+    lines.push(...itemLines(row, selection, categories, blocks));
   }
 
   const selected = rows.filter((row) => row.kind !== 'header' && isSelected(selection, row));
-  const protectedRows = rows.filter((row) => row.kind === 'project' && row.section === 'active');
-  const blockedRows = rows.filter((row) => blockedReason(row) !== undefined);
+  const blockedRows = rows.filter((row) => blockedReason(row, blocks) !== undefined);
+  // Blocked wins over protected, so the two lines below partition what is missing from the
+  // total instead of overlapping. An active project that is *also* refused would otherwise
+  // have its bytes named twice, and a user adding the excluded numbers up would find more
+  // missing than there is.
+  const protectedRows = rows.filter(
+    (row) =>
+      row.kind === 'project' &&
+      row.section === 'active' &&
+      blockedReason(row, blocks) === undefined,
+  );
   const selectedBytes = selected.reduce((sum, row) => sum + row.bytes, 0);
 
   lines.push(
@@ -152,6 +212,167 @@ export function renderReport(input: ReportInput): string {
   lines.push('', NOTHING_DELETED);
 
   return `${lines.join('\n')}\n`;
+}
+
+/** Every row, selected — the argument that makes `toTargets` enumerate a row's own targets. */
+function everySelection(rows: readonly Row[]): Selection {
+  return {
+    projects: new Set(rows.flatMap((row) => (row.kind === 'project' ? [row.project.root] : []))),
+    caches: new Set(rows.flatMap((row) => (row.kind === 'cache' ? [row.cache.id] : []))),
+  };
+}
+
+/**
+ * Every `node_modules` the scan found, whatever the preset — invariant 5's input.
+ *
+ * Deliberately *not* filtered by category: under `recommended` the `deps` category is off, so
+ * no `node_modules` is a target at all, and every one of them will still be on disk
+ * hardlinking into the package store when the run ends. Filtering here would report the
+ * store as prunable in the one configuration nearly every user runs.
+ */
+function nodeModulesPaths(projects: readonly Project[]): string[] {
+  return projects.flatMap((project) =>
+    project.artifacts
+      .filter((artifact) => path.basename(artifact.path) === 'node_modules')
+      .map((artifact) => artifact.path),
+  );
+}
+
+/**
+ * The boundary's inputs for one hypothetical selection. `unselectedNodeModules` is a property
+ * of the *run*, not of a target, so it is recomputed per call from the targets being screened
+ * — the recipe `ScreeningOptions` documents.
+ */
+function screeningOptions(
+  input: ScreenedReportInput,
+  targets: readonly CleanTarget[],
+  allNodeModules: readonly string[],
+): ScreeningOptions {
+  const cleaned = new Set(
+    targets.flatMap((target) => (target.kind === 'project' ? [target.artifact.path] : [])),
+  );
+  return {
+    roots: input.roots,
+    // The caches this scan produced, and only those: the same allowlist `cli.ts` builds from
+    // the stream for the interactive path, so a cache row cannot be `unknown-cache` here.
+    allowedCachePaths: input.caches.map((cache) => cache.path),
+    unselectedNodeModules: allNodeModules.filter((candidate) => !cleaned.has(candidate)),
+  };
+}
+
+/**
+ * One row, one reason. A row is blocked when **any** of its targets would be refused, and the
+ * first refusal is the one shown.
+ *
+ * Blocking the whole row is the conservative side of a choice forced by the fact that
+ * selection is row-granular: a project row is one checkbox over several artifacts, so if one
+ * of them is refused the row cannot deliver the bytes printed beside it. Excluding the row
+ * under-promises (the run would still trash its other artifacts, and the user can select it
+ * by hand to get them); counting it would over-promise, which is the defect being fixed.
+ */
+function record(
+  into: Map<string, RowBlock>,
+  screenings: readonly Screening[],
+  owner: ReadonlyMap<CleanTarget, Row>,
+  accept: (row: Row) => boolean,
+): void {
+  for (const screening of screenings) {
+    const row = owner.get(screening.target);
+    if (row === undefined || !accept(row) || into.has(row.id)) continue;
+    into.set(row.id, { reason: `${screening.refusal}: ${screening.detail}` });
+  }
+}
+
+/**
+ * Ask `clean.ts`'s own guards which rows this run would refuse, before anything is selected
+ * and before anything is printed. Nothing is deleted, written or moved: `screenTargets`
+ * `lstat`s, `realpath`s and `readdir`s, and returns verdicts.
+ *
+ * The two tiers are the cost bound (see `clean.ts`'s header):
+ *
+ * - the **cheap** tier over every listed row — a handful of `lstat`s each, no subtree walked,
+ *   so a 133 GB scan pays microseconds per row for the symlinked-ancestor, worktree,
+ *   guarded-path, containment and allowlist verdicts;
+ * - the **full** tier only over what the default selection actually promises, because the
+ *   nested-repository scan is seconds per candidate on a large `target/` and an unselected
+ *   row's bytes are in nobody's total.
+ *
+ * Where the full tier ran, its verdict is the one kept: it is the cheap tier's guards plus
+ * the contents scan, so it is what `clean` would do for that selection.
+ */
+export async function screenReport(input: ScreenedReportInput): Promise<RowBlocks> {
+  const { projects, caches, categories } = input;
+  const rows = buildRows({ projects, caches, categories });
+  const everything = everySelection(rows);
+
+  // Row → the targets selecting it would produce, via the *same* `toTargets` the interface
+  // hands to `clean`. Anything else here would be a second opinion about what a row means.
+  const owner = new Map<CleanTarget, Row>();
+  const all: CleanTarget[] = [];
+  for (const row of rows) {
+    for (const target of toTargets({ rows: [row], selection: everything, categories })) {
+      owner.set(target, row);
+      all.push(target);
+    }
+  }
+
+  const allNodeModules = nodeModulesPaths(projects);
+  const blocks = new Map<string, RowBlock>();
+
+  // The cheap tier is independent of what ends up selected, so it runs once over everything.
+  const cheap = await screenTargetsCheaply(all, screeningOptions(input, all, allNodeModules));
+
+  // Screening has to reach a FIXED POINT, because blocking a row can *add* a refusal rather
+  // than only removing work.
+  //
+  // Invariant 5's input is `unselectedNodeModules` — the hardlink sources that will still be
+  // on disk afterwards — which is a property of the whole selection, not of one target. So
+  // when a project row is blocked (say its `dist` is a gh-pages clone), its `node_modules`
+  // leaves the cleaned set, joins `unselectedNodeModules`, and can make a store prune unsafe
+  // that screened clean a moment ago. An earlier version screened the pre-block selection
+  // once and asserted in a comment that later rounds "would only ever remove work"; that is
+  // true of every refusal reason except this one, and this one is the reason the screening
+  // exists.
+  //
+  // Blocking is monotone — a round can only add blocks, never retract one — so the loop
+  // converges. Two rounds settle every case reachable today; the third is a backstop, and
+  // exiting by exhaustion rather than by stability would mean shipping an unscreened promise,
+  // so the loop is written to terminate on stability.
+  const MAX_ROUNDS = 3;
+  for (let round = 0; round < MAX_ROUNDS; round += 1) {
+    const selection = defaultSelection(rows, blocks);
+    const isPromised = (row: Row): boolean => isSelected(selection, row);
+    const selected = all.filter((target) => {
+      const row = owner.get(target);
+      return row !== undefined && isPromised(row);
+    });
+
+    const before = blocks.size;
+    // A row that is not promised still gets its cheap verdict recorded, so the listing can
+    // explain a row it is not offering; the expensive tier is spent only on what is promised.
+    record(blocks, cheap, owner, (row) => !isPromised(row));
+    record(
+      blocks,
+      await screenTargets(selected, screeningOptions(input, selected, allNodeModules)),
+      owner,
+      () => true,
+    );
+    if (blocks.size === before) break;
+  }
+  return blocks;
+}
+
+/**
+ * The report the CLI prints: screened, then rendered.
+ *
+ * The pairing is the point. `renderReport` cannot screen — it is synchronous and pure, which
+ * is what makes it testable against fixed inputs — so if screening were left to the caller
+ * there would be a way to print an unscreened report, and the promised total would go back to
+ * being a number the run does not keep. One function does both, and it is the only one
+ * `cli.ts` calls.
+ */
+export async function renderScreenedReport(input: ScreenedReportInput): Promise<string> {
+  return renderReport({ ...input, blocks: await screenReport(input) });
 }
 
 const OUTCOME_WIDTH = 8;

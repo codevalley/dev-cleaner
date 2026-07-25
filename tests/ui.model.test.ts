@@ -16,6 +16,7 @@ import {
   isSelected,
   moveCursor,
   projectBytes,
+  rowBlock,
   selectedBytes,
   selectedCount,
   selectedRows,
@@ -300,6 +301,112 @@ describe('defaultSelection and a cache that cannot be cleaned', () => {
       categories: AGGRESSIVE,
     });
     expect(targets).toContainEqual({ kind: 'cache', cache: (store as { cache: CacheEntry }).cache });
+  });
+});
+
+/**
+ * The other half of the same honesty fix, and the one that was missing: a **project** row the
+ * run has already established it would refuse.
+ *
+ * `CacheEntry.blocked` covered exactly one case. A project row can be refused for six of the
+ * boundary's reasons — `contains-repository`, `worktree-root`, `symlink`, `guarded-path`,
+ * `outside-project-root`, `not-in-artifact-table` — and `defaultSelection` selected every
+ * dormant project row unconditionally regardless. That was invisible only because
+ * `scoreActivity` ships as a stub returning `active` for everything, so nothing is ever
+ * dormant and nothing is ever preselected; the rows below are built with
+ * `status: 'dormant'` **directly**, which is the code path that goes live the day the scorer
+ * is authored.
+ */
+describe('defaultSelection and a project row that cannot be cleaned', () => {
+  const rows = rowsOf([
+    makeProject('worktree-app', 'dormant', [artifact('build', 'build', 7 * GB)]),
+    makeProject('bump', 'dormant', [artifact('dist', 'build', 4 * GB)]),
+  ]);
+  const blockedRow = rows.find((row) => row.label === 'worktree-app') as Row;
+  const cleanRow = rows.find((row) => row.label === 'bump') as Row;
+  const blocks = new Map([
+    [blockedRow.id, { reason: 'worktree-root: /dev/worktree-app/build is a linked git worktree' }],
+  ]);
+  const selection = defaultSelection(rows, blocks);
+
+  it('does not preselect it, dormant though it is', () => {
+    expect(isSelected(selection, blockedRow)).toBe(false);
+  });
+
+  it('still preselects the dormant projects that are actually deliverable', () => {
+    expect(isSelected(selection, cleanRow)).toBe(true);
+  });
+
+  it('still lists it — it exists and it occupies disk', () => {
+    expect(labels(rows)).toContain('worktree-app');
+    expect(blockedRow.bytes).toBe(7 * GB);
+  });
+
+  it('leaves its bytes out of what the run promises to reclaim', () => {
+    // 4G, not 11G. The 7G is on the disk and is listed; it is simply not promised.
+    expect(selectedBytes(rows, selection)).toBe(4 * GB);
+    expect(selectedCount(rows, selection)).toBe(1);
+  });
+
+  it('still lets the user select it by hand — a default, not a lock', () => {
+    const toggled = toggleRow(selection, blockedRow);
+    expect(isSelected(toggled, blockedRow)).toBe(true);
+    expect(selectedBytes(rows, toggled)).toBe(11 * GB);
+  });
+
+  it('is selected by a section toggle like any other row', () => {
+    expect(isSelected(toggleSection(selection, rows, 'projects'), blockedRow)).toBe(true);
+  });
+
+  it('still becomes a clean target once chosen, so the boundary can do its job', () => {
+    // Filtering it out of `toTargets` would make `clean.ts`'s own guards unreachable from
+    // the only path a user can invoke, and defence in depth would become defence in one.
+    const targets = toTargets({
+      rows,
+      selection: toggleRow(selection, blockedRow),
+      categories: AGGRESSIVE,
+    });
+    const roots = targets.map((target) => (target.kind === 'project' ? target.project.root : ''));
+    expect(roots).toContain('/dev/worktree-app');
+  });
+
+  it('selects everything when no blocks are supplied, exactly as before', () => {
+    // The screen is what withholds a row, never the shape of the row: a caller that has not
+    // screened gets the old behaviour rather than a silently different default.
+    const unscreened = defaultSelection(rows);
+    expect(isSelected(unscreened, blockedRow)).toBe(true);
+    expect(selectedBytes(rows, unscreened)).toBe(11 * GB);
+  });
+});
+
+describe('rowBlock', () => {
+  const rows = rowsOf(
+    [makeProject('bump', 'dormant', [artifact('dist', 'build', GB)])],
+    [
+      { ...makeCache('pnpm-store', 7 * GB), blocked: { reason: 'hardlinked from elsewhere' } },
+      makeCache('npm', GB),
+    ],
+  );
+  const store = rows.find((row) => row.label === 'pnpm-store') as Row;
+  const npm = rows.find((row) => row.label === 'npm') as Row;
+  const header = rows.find((row) => row.kind === 'header') as Row;
+
+  it('prefers the cache’s own reason, so two screens cannot report one row twice', () => {
+    // `caches.ts` answers a question the boundary vet cannot even ask — whether anything
+    // *outside every scanned root* still hardlinks into the store — so when both object, the
+    // specific reason is the one the user reads, and the row is blocked once, not twice.
+    const blocks = new Map([[store.id, { reason: 'store-prune-unsafe: pruning would orphan …' }]]);
+    expect(rowBlock(store, blocks)?.reason).toBe('hardlinked from elsewhere');
+  });
+
+  it('falls through to the screen for a cache nothing upstream objected to', () => {
+    const blocks = new Map([[npm.id, { reason: 'symlink: /home/.gradle is a symbolic link' }]]);
+    expect(rowBlock(npm, blocks)?.reason).toMatch(/^symlink: /);
+    expect(rowBlock(npm)).toBeUndefined();
+  });
+
+  it('never blocks a header, which is not a thing anyone can select', () => {
+    expect(rowBlock(header, new Map([[header.id, { reason: 'nonsense' }]]))).toBeUndefined();
   });
 });
 

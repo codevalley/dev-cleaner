@@ -24,12 +24,27 @@
  * confirmation screen would grow a work list behind a question the user has already been
  * asked. `ConfirmSnapshot` freezes what was shown; arrivals are counted and disclosed, and
  * wait for the next pass.
+ *
+ * **The snapshot is screened before it is shown, and that is the whole point of freezing
+ * it.** The list describes what is *selected*; `clean.ts` decides what is *deletable*. When
+ * those two are computed by different code the tool promises space it then refuses — so the
+ * moment the set stops moving is the moment to ask the boundary's own guards about it.
+ * `enter` therefore opens a `screening` phase, not the question: `onScreen` (the CLI's bound
+ * `screenTargets`) is run over exactly the frozen targets, first with the cheap tier and then
+ * with the full one, and only then is the question rendered — with what will be trashed and
+ * what will not, separately, and a headline counting only the former.
+ *
+ * Screening reads the filesystem and the nested-repository scan is budgeted at 50,000
+ * directories per candidate, so it is visible work: the `screening` phase says so rather than
+ * letting the interface freeze, and — following the precedent set by `cleaning` — no
+ * keystroke can advance out of it. The two keys that *abandon* it still work, because unlike
+ * a clean in flight nothing has been touched yet and leaving is always honest.
  */
 
 import { Box, Text, render, useApp, useInput, useStdin, useStdout } from 'ink';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
-import { Confirm } from './Confirm.js';
+import { Confirm, type BlockedEntry, type ConfirmEntry } from './Confirm.js';
 import { Detail } from './Detail.js';
 import { Footer } from './Footer.js';
 import { List } from './List.js';
@@ -54,6 +69,10 @@ import {
   type Selection,
 } from './model.js';
 import type { ScanEvent } from '../scan.js';
+// Type-only, and deliberately so: `import type` is erased at compile time, so the UI still
+// never *loads* the module that can delete. The seam through which the screen is actually
+// reached is the `onScreen` prop, exactly as `onClean` is for the deletion itself.
+import type { Screening, ScreeningTier } from '../clean.js';
 import type { CacheEntry, Category, CleanOutcome, CleanTarget, Preset, Project } from '../types.js';
 
 export interface ExitSummary {
@@ -70,6 +89,24 @@ export interface AppProps {
   categoriesFor: (preset: Preset) => Set<Category>;
   /** `clean` from src/clean.ts, bound to its options by the CLI. */
   onClean: (targets: readonly CleanTarget[]) => Promise<CleanOutcome[]>;
+  /**
+   * `screenTargets` from src/clean.ts, bound to its options by the CLI — the same guards
+   * `onClean` will apply, asked before the user is asked.
+   *
+   * The tier is passed through so this component decides what it pays for: `'cheap'` for an
+   * immediate partial answer, `'full'` (cheap plus the nested-repository scan) for the
+   * verdict the question is rendered from. The binding must recompute
+   * `unselectedNodeModules` from the targets it is handed — invariant 5 is a property of the
+   * whole run, so a screen of a hypothetical selection has to be told what that selection is
+   * (see `ScreeningOptions.unselectedNodeModules`).
+   *
+   * Optional only so that a caller which cannot vet — a test, a harness — still renders. An
+   * app without it confirms exactly what it lists, which is the dishonest total this prop
+   * exists to remove; `cli.ts` is expected to supply it.
+   */
+  onScreen?:
+    | ((targets: readonly CleanTarget[], tier: ScreeningTier) => Promise<readonly Screening[]>)
+    | undefined;
   onExit?: ((summary: ExitSummary) => void) | undefined;
   preset?: Preset | undefined;
   nowMs?: number | undefined;
@@ -79,7 +116,7 @@ export interface AppProps {
 }
 
 /**
- * What the user was actually shown when they asked to confirm.
+ * What the user asked about: the selection, frozen, before the guards have had their say.
  *
  * The scan keeps running while the confirmation is up, and every project it finds is fed
  * through the same default that preselects dormant work. Read live, the confirmation would
@@ -87,20 +124,143 @@ export interface AppProps {
  * user consents to a screen, and the work list grows behind it. Freezing rows, targets and
  * the total at the moment the question is asked makes the answer apply to the question.
  */
-interface ConfirmSnapshot {
+interface Candidate {
   rows: readonly Row[];
   targets: readonly CleanTarget[];
   bytes: number;
 }
 
 /**
- * Modelled as a union rather than a string plus a nullable snapshot: `confirm` and
- * `cleaning` cannot exist without the frozen list, and the type is what says so.
+ * The candidate after screening — what the user is actually shown and consents to.
+ *
+ * `targets` and `bytes` are **narrowed to the deletable set**: they are what `clean` will be
+ * handed and what it will trash, so the number on screen and the work list are the same
+ * fact, derived from one another rather than computed twice.
+ *
+ * `rows` is not narrowed. It stays the full frozen selection because it is the identity the
+ * arrivals disclosure compares against — a row that was on screen and turned out to be
+ * blocked has still been seen, and counting it as an arrival would be a second lie.
+ */
+interface ConfirmSnapshot extends Candidate {
+  /** Per-row lines for what will be trashed, each sized by its deletable targets only. */
+  entries: readonly ConfirmEntry[];
+  /** Per-target lines for what will not be, each carrying the boundary's refusal code. */
+  blocked: readonly BlockedEntry[];
+  blockedBytes: number;
+}
+
+/**
+ * Modelled as a union rather than a string plus a nullable snapshot: `screening`, `confirm`
+ * and `cleaning` cannot exist without the frozen list, and the type is what says so. The
+ * `screening` phase carries the *unscreened* candidate — it is the state of not yet knowing
+ * — while `confirm` and `cleaning` can only be built from a screened one.
  */
 type Phase =
   | { kind: 'list' }
+  | { kind: 'screening'; candidate: Candidate; provisional: readonly BlockedEntry[] }
   | { kind: 'confirm'; snapshot: ConfirmSnapshot }
   | { kind: 'cleaning'; snapshot: ConfirmSnapshot };
+
+/**
+ * Identity of a target for matching a `Screening` back to the target it judged.
+ *
+ * By delete path rather than by object identity: `screenTargets` happens to return the very
+ * objects it was given, but this crosses a prop boundary a caller may map over, and a
+ * mismatch here would silently mark a blocked directory deletable. Artifact paths are
+ * deduplicated by absolute path upstream and a cache is allowlisted by exact path, so the
+ * key is unique in both arms.
+ */
+function targetKey(target: CleanTarget): string {
+  return target.kind === 'project'
+    ? `artifact:${target.artifact.path}`
+    : `cache:${target.cache.path}`;
+}
+
+/** Which row a target belongs to. Mirrors the ids `buildRows` assigns. */
+function rowKey(target: CleanTarget): string {
+  return target.kind === 'project' ? `project:${target.project.root}` : `cache:${target.cache.id}`;
+}
+
+function targetBytes(target: CleanTarget): number {
+  return target.kind === 'project' ? target.artifact.bytes : target.cache.bytes;
+}
+
+/**
+ * What a blocked target is called on screen. Display data only — nothing here gates a
+ * decision, which is why it can fall back to a path when a name is missing.
+ */
+function targetLabel(target: CleanTarget): string {
+  if (target.kind === 'cache') {
+    return target.cache.label.length > 0 ? target.cache.label : target.cache.path;
+  }
+  const { project, artifact } = target;
+  const name = project.name.length > 0 ? project.name : project.root;
+  const relative = artifact.relPath.length > 0 ? artifact.relPath : artifact.path;
+  return `${name}/${relative}`;
+}
+
+function blockedEntriesOf(
+  targets: readonly CleanTarget[],
+  screenings: readonly Screening[],
+): BlockedEntry[] {
+  const verdicts = new Map(screenings.map((screening) => [targetKey(screening.target), screening]));
+  // Driven by `targets`, not by `screenings`: the order is the one the user saw, and a
+  // verdict about something that was never selected cannot smuggle a row onto the screen.
+  return targets.flatMap((target) => {
+    const verdict = verdicts.get(targetKey(target));
+    return verdict === undefined
+      ? []
+      : [
+          {
+            id: targetKey(target),
+            label: targetLabel(target),
+            bytes: targetBytes(target),
+            refusal: verdict.refusal,
+          },
+        ];
+  });
+}
+
+/**
+ * The candidate plus the verdicts, as the thing the user is shown.
+ *
+ * Everything the confirmation states is derived here from the *deletable* targets — the
+ * per-row lines, the byte total, the count — so the headline cannot describe a set the work
+ * list does not. Blocked targets leave the work list entirely rather than being passed to
+ * `clean` for it to refuse a second time: consent is given to what will happen, and dropping
+ * them is also the fail-closed direction for invariant 5, since a `node_modules` that will
+ * not be trashed is then correctly counted as one still on disk when the run ends.
+ */
+function screenedSnapshot(
+  candidate: Candidate,
+  screenings: readonly Screening[],
+): ConfirmSnapshot {
+  const blocked = blockedEntriesOf(candidate.targets, screenings);
+  const blockedKeys = new Set(blocked.map((entry) => entry.id));
+  const targets = candidate.targets.filter((target) => !blockedKeys.has(targetKey(target)));
+
+  const bytesByRow = new Map<string, number>();
+  for (const target of targets) {
+    const key = rowKey(target);
+    bytesByRow.set(key, (bytesByRow.get(key) ?? 0) + targetBytes(target));
+  }
+
+  const entries: ConfirmEntry[] = candidate.rows.flatMap((row) => {
+    const bytes = bytesByRow.get(row.id);
+    // A row every one of whose artifacts was blocked has nothing left to consent to; it
+    // appears in the blocked list instead of as a 0B line inviting a pointless yes.
+    return bytes === undefined ? [] : [{ id: row.id, label: row.label, bytes }];
+  });
+
+  return {
+    rows: candidate.rows,
+    targets,
+    bytes: targets.reduce((sum, target) => sum + targetBytes(target), 0),
+    entries,
+    blocked,
+    blockedBytes: blocked.reduce((sum, entry) => sum + entry.bytes, 0),
+  };
+}
 
 const MIN_LIST_WIDTH = 28;
 const MAX_LIST_WIDTH = 52;
@@ -111,6 +271,7 @@ export function App({
   stream,
   categoriesFor,
   onClean,
+  onScreen,
   onExit,
   preset: initialPreset,
   width,
@@ -148,6 +309,25 @@ export function App({
    * that is not idempotent would delete twice.
    */
   const cleanStarted = useRef(false);
+
+  /**
+   * Which screening run owns the screen.
+   *
+   * A screen can take seconds (the nested scan is budgeted at 50,000 directories per
+   * candidate) and the user can leave it — `esc` back to the list, `q` out of the app. The
+   * `await` does not know that, so its result would arrive and open a confirmation for a
+   * selection the user has since changed, or set state on a component that is gone. Every
+   * departure bumps this counter; a result whose run is no longer the current one is
+   * dropped. Freezing the set is worth nothing if a stale verdict can unfreeze it.
+   */
+  const screenRun = useRef(0);
+  const mounted = useRef(true);
+  useEffect(
+    () => () => {
+      mounted.current = false;
+    },
+    [],
+  );
 
   const columns = width ?? stdout?.columns ?? 80;
   const listWidth = Math.min(MAX_LIST_WIDTH, Math.max(MIN_LIST_WIDTH, Math.floor(columns * 0.55)));
@@ -252,9 +432,74 @@ export function App({
     [exit, onClean, onExit],
   );
 
+  /**
+   * Ask the boundary's own guards about the frozen set, then render the question from the
+   * answer. Two passes, because they cost different orders of magnitude:
+   *
+   * - the **cheap** tier is a handful of `lstat`s per target and returns effectively at once,
+   *   so its verdicts go straight onto the waiting screen — a user watching a 67 GB `target/`
+   *   being scanned can already see that three other rows are blocked;
+   * - the **full** tier repeats that work (microseconds) and adds the nested-repository scan,
+   *   which is the only tier that can find a worktree *inside* a candidate, and is what the
+   *   confirmation is finally built from.
+   *
+   * A screen that throws sends the user back to the list with the error rather than to the
+   * question. Proceeding would mean rendering a total nobody checked, which is precisely the
+   * defect this path exists to close; `clean` would still refuse at the boundary, but the
+   * promise on screen would already have been made.
+   */
+  const beginScreening = useCallback(
+    async (candidate: Candidate) => {
+      const run = screenRun.current + 1;
+      screenRun.current = run;
+      const stale = (): boolean => !mounted.current || screenRun.current !== run;
+
+      setPhase({ kind: 'screening', candidate, provisional: [] });
+
+      if (onScreen === undefined) {
+        setPhase({ kind: 'confirm', snapshot: screenedSnapshot(candidate, []) });
+        return;
+      }
+
+      try {
+        const cheap = await onScreen(candidate.targets, 'cheap');
+        if (stale()) return;
+        setPhase({
+          kind: 'screening',
+          candidate,
+          provisional: blockedEntriesOf(candidate.targets, cheap),
+        });
+
+        const full = await onScreen(candidate.targets, 'full');
+        if (stale()) return;
+        setPhase({ kind: 'confirm', snapshot: screenedSnapshot(candidate, full) });
+      } catch (error) {
+        if (stale()) return;
+        setPhase({ kind: 'list' });
+        setMessage(`check failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    },
+    [onScreen],
+  );
+
   useInput(
     (input, key) => {
       if (phase.kind === 'cleaning') return;
+
+      // Mid-screen, the keyboard is as inert as it is mid-clean — no key may advance to the
+      // question, and none may reach the list underneath and change what is being screened.
+      // The exception is leaving: nothing has been touched yet, so `q` reports the truth and
+      // `esc` abandons a check whose result is then dropped by the run counter.
+      if (phase.kind === 'screening') {
+        if (input === 'q' || (key.ctrl && input === 'c')) {
+          screenRun.current += 1;
+          quit();
+        } else if (key.escape) {
+          screenRun.current += 1;
+          setPhase({ kind: 'list' });
+        }
+        return;
+      }
 
       if (input === 'q' || (key.ctrl && input === 'c')) {
         quit();
@@ -263,7 +508,10 @@ export function App({
 
       if (phase.kind === 'confirm') {
         if (key.escape) setPhase({ kind: 'list' });
-        else if (key.return) void runClean(phase.snapshot);
+        // Nothing deletable survived the screen, so there is nothing to say yes to: `enter`
+        // would otherwise run a clean of zero targets and report "nothing was selected" to a
+        // user who selected plenty and was refused all of it.
+        else if (key.return && phase.snapshot.targets.length > 0) void runClean(phase.snapshot);
         return;
       }
 
@@ -285,11 +533,31 @@ export function App({
         setPreset(cyclePreset);
       } else if (key.return) {
         if (targets.length === 0) setMessage('Nothing selected');
-        else setPhase({ kind: 'confirm', snapshot: { rows: chosen, targets, bytes: totalBytes } });
+        else void beginScreening({ rows: chosen, targets, bytes: totalBytes });
       }
     },
     { isActive: isRawModeSupported },
   );
+
+  if (phase.kind === 'screening') {
+    const { candidate, provisional } = phase;
+    const checking = candidate.targets.length;
+    return (
+      <Box flexDirection="column" paddingX={1}>
+        <Text bold color="cyan">
+          Checking what can be trashed…
+        </Text>
+        <Text dimColor>
+          {`${checking} ${checking === 1 ? 'directory' : 'directories'} · ` +
+            `${formatBytes(candidate.bytes)} · looking inside each for git repositories`}
+        </Text>
+        {provisional.length > 0 ? (
+          <Text color="red">{`${provisional.length} blocked so far`}</Text>
+        ) : null}
+        <Text dimColor>esc cancel · q quit</Text>
+      </Box>
+    );
+  }
 
   if (phase.kind === 'confirm') {
     const { snapshot } = phase;
@@ -302,9 +570,11 @@ export function App({
     return (
       <Box flexDirection="column">
         <Confirm
-          rows={snapshot.rows}
+          entries={snapshot.entries}
+          blocked={snapshot.blocked}
           targetCount={snapshot.targets.length}
           bytes={snapshot.bytes}
+          blockedBytes={snapshot.blockedBytes}
           width={Math.min(columns - 4, 56)}
         />
         {arrivals > 0 ? (

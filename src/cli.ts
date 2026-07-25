@@ -26,10 +26,11 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import { storeHasIncomingHardlinks } from './caches.js';
-import { renderCleanSummary, renderReport } from './report.js';
+import { renderCleanSummary, renderScreenedReport } from './report.js';
 import { SafetyError } from './types.js';
 import type { Category, CleanOutcome, CleanTarget, Preset, TrashFn } from './types.js';
-import type { CleanOptions } from './clean.js';
+import { screenTargets } from './clean.js';
+import type { CleanOptions, ScreeningTier } from './clean.js';
 import type { ScanEvent, ScanOptions, ScanResult } from './scan.js';
 import type { ExitSummary, RunOptions } from './ui/App.js';
 
@@ -407,8 +408,13 @@ async function runStaticReport(
 
   const result = await scanAll(scanOptionsFor(options, deps, categories));
 
+  // `renderScreenedReport`, never `renderReport`: the report's total is a promise about what
+  // a clean would deliver, and the only way to keep it is to ask the deletion boundary's own
+  // guards first. `options.roots` are the resolved ones — `main` replaces them before either
+  // path runs — which is what `clean.ts`'s containment check compares against, so a report
+  // and a run agree about which projects are in scope.
   io.write(
-    renderReport({
+    await renderScreenedReport({
       projects: result.projects,
       caches: result.caches,
       categories,
@@ -440,15 +446,42 @@ async function runInteractive(options: CliOptions, deps: MainDeps, io: CliIO): P
     allowedCachePaths,
   );
 
+  /**
+   * Invariant 5's input is a property of the whole run, not of one target, so it must be
+   * recomputed for whichever selection is being asked about — screening a hypothetical set
+   * and cleaning a real one are the same question at different times.
+   */
+  const unselectedFor = (targets: readonly CleanTarget[]): string[] => {
+    const selected = new Set(
+      targets.flatMap((t) => (t.kind === 'project' ? [t.artifact.path] : [])),
+    );
+    return nodeModulesSeen.filter((p) => !selected.has(p));
+  };
+
   const summary = await runApp({
     stream,
     categoriesFor,
     preset: options.preset,
     nowMs: deps.nowMs ?? Date.now(),
+    /**
+     * Without this binding the whole pre-consent screening layer is dead code: `onScreen` is
+     * optional, so omitting it compiles, every unit test passes, and the confirmation screen
+     * silently shows an unscreened list. The interactive path is the only one that deletes,
+     * which makes this the one binding that must not be forgotten — hence the test that
+     * asserts `runApp` receives it.
+     */
+    onScreen: async (targets: readonly CleanTarget[], tier: ScreeningTier) =>
+      screenTargets(
+        targets,
+        {
+          trash,
+          roots: options.roots,
+          allowedCachePaths,
+          unselectedNodeModules: unselectedFor(targets),
+        },
+        tier,
+      ),
     onClean: async (targets: readonly CleanTarget[]) => {
-      const selected = new Set(
-        targets.flatMap((t) => (t.kind === 'project' ? [t.artifact.path] : [])),
-      );
       // Invariant 5, machine-wide. `unselectedNodeModules` below is scoped to the scan, so
       // it goes empty the moment the one scanned project is cleaned successfully — while
       // every unscanned project on the disk still hardlinks into the store. The store is
@@ -458,7 +491,7 @@ async function runInteractive(options: CliOptions, deps: MainDeps, io: CliIO): P
         trash,
         roots: options.roots,
         allowedCachePaths,
-        unselectedNodeModules: nodeModulesSeen.filter((p) => !selected.has(p)),
+        unselectedNodeModules: unselectedFor(targets),
       });
       // Appended, not interleaved: a store prune is the last thing `clean` would have done
       // (`orderTargets` rank 2), so the summary still reads in execution order.

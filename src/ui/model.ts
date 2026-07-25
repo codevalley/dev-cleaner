@@ -21,6 +21,32 @@
 
 import type { CacheEntry, Category, CleanTarget, Preset, Project } from '../types.js';
 
+/**
+ * Why a row cannot be cleaned on this run, established *before* anything is selected.
+ *
+ * `CacheEntry.blocked` is the same fact for the one case `caches.ts` can answer on its own
+ * (a package store with incoming hardlinks); this is the general form, and it exists because
+ * the general form is what a project row needs. A project row can be refused for every
+ * reason `clean.ts` names — `contains-repository`, `worktree-root`, `symlink`,
+ * `guarded-path`, `outside-project-root`, `not-in-artifact-table` — and none of them is
+ * expressible on `Project`, which is the scan's vocabulary rather than the boundary's.
+ */
+export interface RowBlock {
+  /** The refusal in the words the summary would use, e.g. `worktree-root: /x/build is …`. */
+  reason: string;
+}
+
+/**
+ * Blocks by `Row.id` — one block per row, never a list.
+ *
+ * A row is one thing the user can select, so it is one thing that can be blocked: keying by
+ * id is what makes "listed once, explained once, subtracted once" a property of the type
+ * rather than of every caller's arithmetic. Two screens speaking about the same cache — the
+ * store probe in `caches.ts` and the boundary vet in `clean.ts` — therefore cannot report it
+ * twice.
+ */
+export type RowBlocks = ReadonlyMap<string, RowBlock>;
+
 /** Rows are grouped into three sections, always rendered in this order. */
 export type Section = 'projects' | 'active' | 'caches';
 
@@ -166,27 +192,53 @@ export function isSelected(selection: Selection, row: Row): boolean {
 }
 
 /**
+ * Why this row cannot be cleaned, or `undefined` when nothing has objected to it.
+ *
+ * Two screens can speak about the same row, and this is where that is reconciled to one
+ * answer. `CacheEntry.blocked` wins: it is established earlier and more cheaply, in
+ * `caches.ts`, and it answers a question the boundary vet cannot even ask — whether anything
+ * *elsewhere on the machine*, outside every scanned root, still hardlinks into a package
+ * store. Preferring it means the user reads the specific reason rather than the general one,
+ * and — because the result is one block, not two — the row is marked once, explained once
+ * and subtracted from the promised total once.
+ */
+export function rowBlock(row: Row, blocks?: RowBlocks): RowBlock | undefined {
+  if (row.kind === 'header') return undefined;
+  if (row.kind === 'cache' && row.cache.blocked !== undefined) return row.cache.blocked;
+  return blocks?.get(row.id);
+}
+
+/**
  * Dormant projects and caches start selected; active projects do not. Both halves matter:
  * the tool is useless if nothing is preselected, and dangerous if work in progress is.
  *
- * A cache carrying a `blocked` reason is the third case, and it is about honesty rather
- * than safety. `clean.ts` would refuse it anyway; preselecting it would still count its
- * bytes into the total the user is shown and consents to, and then hand back a refusal for
- * the largest line in the run. Promising something and then refusing it is how a user
- * learns that refusals are noise — the same failure `clean.ts` names from the other side
- * ("a guard nobody can satisfy is a guard that gets switched off").
+ * A row carrying a block is the third case, and it is about honesty rather than safety.
+ * `clean.ts` would refuse it anyway; preselecting it would still count its bytes into the
+ * total the user is shown and consents to, and then hand back a refusal for the largest line
+ * in the run. Promising something and then refusing it is how a user learns that refusals
+ * are noise — the same failure `clean.ts` names from the other side ("a guard nobody can
+ * satisfy is a guard that gets switched off").
  *
- * Not selecting it is still only a *default*: `toggleRow` treats a blocked row like any
- * other, exactly as it does a protected project, and the boundary refusal is what makes
- * that safe.
+ * `blocks` covers **project rows as well as caches**, and that is the whole reason it is a
+ * parameter rather than a field read off the row. A project row can be refused for six of
+ * the boundary's reasons and `Project` has no way to say so; screening only `cache.blocked`
+ * left every project row promised-then-refused the moment activity scoring starts marking
+ * anything dormant. Callers that have not screened pass nothing and get today's behaviour
+ * for caches — the report and the interface both screen, and the empty default is what keeps
+ * `defaultSelection` usable from a component that only has rows.
+ *
+ * Not selecting a blocked row is still only a *default*: `toggleRow` treats it like any
+ * other, exactly as it does a protected active project, and the boundary refusal is what
+ * makes leaving it reachable safe.
  */
-export function defaultSelection(rows: readonly Row[]): Selection {
+export function defaultSelection(rows: readonly Row[], blocks?: RowBlocks): Selection {
   const projects = new Set<string>();
   const caches = new Set<string>();
 
   for (const row of rows) {
+    if (rowBlock(row, blocks) !== undefined) continue;
     if (row.kind === 'project' && row.section === 'projects') projects.add(row.project.root);
-    else if (row.kind === 'cache' && row.cache.blocked === undefined) caches.add(row.cache.id);
+    else if (row.kind === 'cache') caches.add(row.cache.id);
   }
   return { projects, caches };
 }

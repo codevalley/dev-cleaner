@@ -54,6 +54,41 @@
  *
  * Invariant 4 (trash, not unlink) is `systemTrash`, and it is the *only* part of this
  * module tests replace: the shipped path and the tested path differ in that one function.
+ *
+ * ## Screening: the same guards, asked before consent
+ *
+ * The report shows what is *selected*; this module decides what is *deletable*. When those
+ * two are computed by different code the tool promises space it then refuses, which is the
+ * defect `screenTargets` exists to make structurally impossible. It is the same vetting,
+ * exported as a read-only predicate: `clean` and `screenTargets` are two thin loops over
+ * one `rejectionFor`, so a screen that says "fine" cannot be paired with a boundary that
+ * refuses. Copying the body here instead would reproduce today's bug with the polarity
+ * flipped, which is worse — a promise kept by accident rather than by construction.
+ *
+ * `screenTargets` never deletes and never writes: it `lstat`s, `realpath`s and `readdir`s,
+ * and returns verdicts. The only thing it cannot predict is a `TrashFn` that throws (see
+ * the divergence note on `screenTargets`).
+ *
+ * ### The two tiers, and what they cost
+ *
+ * A caller screening a 133 GB tree cannot afford to look inside every candidate, so the
+ * work is split at the one place where the cost changes by orders of magnitude:
+ *
+ * - **`'cheap'` — no subtree is ever walked.** The allowlist, containment, the guarded
+ *   paths, the symlink ancestor chain and the direct `.git` checks. Cost is a handful of
+ *   syscalls per target and does not depend on how big the target is: one `lstat` per path
+ *   component (≤ ~12), one `realpath` of the parent, one `lstat` of the target and one of
+ *   its `.git`. Microseconds. Run this on everything, always.
+ * - **`'full'` — cheap, plus the nested-repository scan.** That scan `readdir`s the
+ *   candidate's contents breadth-first to depth 4, budgeted at `NESTED_SCAN_MAX_DIRS`
+ *   (50,000) directories per candidate; the reference 67 GB Rust `target/` presents 11,423
+ *   of them and takes 3.3 s cold, 0.8 s warm. Run this only on the set actually selected —
+ *   and note it is the only tier that can produce `contains-repository` for something
+ *   *inside* the candidate, including the `unverified` "too large to check" refusal.
+ *
+ * Every other refusal reason is decided by the cheap tier, `contains-repository` included
+ * when the candidate is *itself* a repository. So cheap-always/full-on-selection loses
+ * nothing but the contents scan, and `clean` always runs `'full'`.
  */
 
 import { lstat, readdir, realpath } from 'node:fs/promises';
@@ -64,8 +99,18 @@ import path from 'node:path';
 import { isArtifactBasename } from './artifacts.js';
 import type { CleanOutcome, CleanTarget, Refusal, TrashFn } from './types.js';
 
-export interface CleanOptions {
-  trash: TrashFn;
+/**
+ * Everything the guards need. Deliberately *not* including the `TrashFn`: this is the
+ * argument to the read-only screen, and a predicate that demanded a way to delete would
+ * invite exactly the mistake it exists to prevent.
+ *
+ * `trash` is declared here as optional-and-ignored purely so that a caller holding a
+ * `CleanOptions` — or writing one out as a literal — can hand it straight to
+ * `screenTargets` without reshaping it. Nothing in the screening path ever calls it.
+ */
+export interface ScreeningOptions {
+  /** Never called by `screenTargets`; present only so a `CleanOptions` passes through. */
+  trash?: TrashFn;
   /** The scan roots, already `realpath`-resolved by `resolveScanRoot`. */
   roots: readonly string[];
   /** Cache paths the scan actually produced. Any other cache target is refused. */
@@ -85,6 +130,22 @@ export interface CleanOptions {
    *
    * Callers that cannot enumerate them must pass the empty array *knowingly*; it is typed
    * as required so that omitting it is a compile error rather than a silent unsafe prune.
+   *
+   * **When screening a hypothetical selection.** This is a property of the *whole run*, not
+   * of one target, so it has to be recomputed for every selection the caller wants a
+   * verdict on: pass every `node_modules` path the scan found minus those in the `targets`
+   * array being screened —
+   *
+   * ```ts
+   * const selected = new Set(targets.map((t) => t.kind === 'project' ? t.artifact.path : ''));
+   * const unselectedNodeModules = allNodeModulesPaths.filter((p) => !selected.has(p));
+   * await screenTargets(targets, { ...options, unselectedNodeModules });
+   * ```
+   *
+   * Screening the default selection and then screening again after the user toggles a
+   * `node_modules` row therefore takes two calls with two different arrays — which is the
+   * honest shape of it, because toggling that one row is exactly what changes whether the
+   * store prune is safe.
    */
   unselectedNodeModules: readonly string[];
   /**
@@ -97,6 +158,11 @@ export interface CleanOptions {
    * the scanner in isolation.
    */
   nestedScanMaxDirs?: number;
+}
+
+/** What `clean` needs: the guards' inputs, plus the one thing that actually deletes. */
+export interface CleanOptions extends ScreeningOptions {
+  trash: TrashFn;
 }
 
 /**
@@ -324,7 +390,7 @@ function rankOf(target: CleanTarget): number {
  * never be touched is refused without so much as an `lstat` on it — and so that a refusal
  * does not depend on whether the dangerous path happens to exist on this machine.
  */
-function lexicalRejection(target: CleanTarget, options: CleanOptions): Rejection | undefined {
+function lexicalRejection(target: CleanTarget, options: ScreeningOptions): Rejection | undefined {
   const deletePath = deletePathOf(target);
 
   if (target.kind === 'project') {
@@ -521,18 +587,18 @@ export function nestedScanBudget(requested: number | undefined): number {
 }
 
 /**
- * The guards that must look at the disk, in the order that makes each refusal mean what it
- * says: link first (so a symlinked path is reported as a symlink rather than by whatever
- * its target happens to be), then the worktree check, then existence.
+ * The CHEAP tier of the filesystem guards, in the order that makes each refusal mean what
+ * it says: link first (so a symlinked path is reported as a symlink rather than by whatever
+ * its target happens to be), then the worktree check, then the candidate-is-a-repository
+ * check.
  *
- * `nested` is the policy for the contents scan — whether to run it at all, and its budget.
- * Both are decided by the caller (`nestedScanApplies`, `nestedScanBudget`) so that this
- * function only ever *applies* the guards.
+ * Nothing here walks a subtree. The cost is one `lstat` per path component, one `realpath`,
+ * and two more `lstat`s — bounded by the *depth* of the path, never by its size, which is
+ * what makes it affordable to run over every row of a 133 GB scan before anything is
+ * selected. The contents scan is `nestedRepositoryRejection`; existence and shape are
+ * `shapeRejection`, which reports `failed` rather than a refusal and so runs last.
  */
-async function filesystemRejection(
-  deletePath: string,
-  nested: { scan: boolean; maxDirs: number },
-): Promise<Rejection | undefined> {
+async function shallowFilesystemRejection(deletePath: string): Promise<Rejection | undefined> {
   // Invariant 2, over the whole ancestor chain. A terminal `lstat` alone passes
   // `~/Library/pnpm/store` when `~/Library/pnpm` is a link elsewhere.
   for (const ancestor of ancestorsOf(deletePath)) {
@@ -573,30 +639,54 @@ async function filesystemRejection(
     );
   }
 
-  // ...and the same question asked of the candidate's *contents*. Checking only the
-  // candidate itself leaves `build/wip/.git` — `git worktree add build/wip` — to be
-  // destroyed as a side effect of trashing `build`, with no refusal and no mention of it.
-  if (nested.scan) {
-    const scan = await findNestedRepository(deletePath, nested.maxDirs);
-    if (scan.kind === 'repository') {
-      return refused(
-        'contains-repository',
-        `${deletePath} contains a git repository or worktree at ${scan.at}`,
-      );
-    }
-    // Not a repository sighting — the opposite: the scan ran out of budget with the
-    // question still open. Reporting that as "clear" is how a 67 GB `target/` gets trashed
-    // with a worktree inside it, so an unfinished scan refuses and says so.
-    if (scan.kind === 'unverified') {
-      return refused(
-        'contains-repository',
-        `${deletePath} is too large to verify: read ${scan.visited} directories without ` +
-          'ruling out a git repository inside it, so it is refused rather than risk ' +
-          'trashing history',
-      );
-    }
-  }
+  return undefined;
+}
 
+/**
+ * The EXPENSIVE tier: the same question asked of the candidate's *contents*. Checking only
+ * the candidate itself leaves `build/wip/.git` — `git worktree add build/wip` — to be
+ * destroyed as a side effect of trashing `build`, with no refusal and no mention of it.
+ *
+ * This is the one part of the vetting whose cost scales with the size of the candidate
+ * (`readdir` breadth-first to depth 4, up to `maxDirs` directories), which is why it is a
+ * tier of its own rather than another paragraph in the function above.
+ */
+async function nestedRepositoryRejection(
+  deletePath: string,
+  maxDirs: number,
+): Promise<Rejection | undefined> {
+  const scan = await findNestedRepository(deletePath, maxDirs);
+  if (scan.kind === 'repository') {
+    return refused(
+      'contains-repository',
+      `${deletePath} contains a git repository or worktree at ${scan.at}`,
+    );
+  }
+  // Not a repository sighting — the opposite: the scan ran out of budget with the
+  // question still open. Reporting that as "clear" is how a 67 GB `target/` gets trashed
+  // with a worktree inside it, so an unfinished scan refuses and says so.
+  if (scan.kind === 'unverified') {
+    return refused(
+      'contains-repository',
+      `${deletePath} is too large to verify: read ${scan.visited} directories without ` +
+        'ruling out a git repository inside it, so it is refused rather than risk ' +
+        'trashing history',
+    );
+  }
+  return undefined;
+}
+
+/**
+ * Existence and shape. Not a safety judgement and never a `Refusal` — "it is already gone"
+ * is `failed`, which is why this runs *after* every guard: a path that is both dangerous
+ * and missing must be reported as dangerous.
+ *
+ * It still matters to the screen, though it can never appear in a `Screening`: a
+ * `node_modules` that cannot be trashed because it is not there is a `node_modules` that
+ * was not trashed, and invariant 5 counts it.
+ */
+async function shapeRejection(deletePath: string): Promise<Rejection | undefined> {
+  const stats = await safeLstat(deletePath);
   if (stats === undefined) {
     return { outcome: 'failed', detail: `${deletePath} no longer exists` };
   }
@@ -604,6 +694,157 @@ async function filesystemRejection(
     return { outcome: 'failed', detail: `${deletePath} is not a directory` };
   }
   return undefined;
+}
+
+/** Which tiers to run. See the module header for what each costs. */
+export type ScreeningTier = 'cheap' | 'full';
+
+/**
+ * **The whole vetting for one target, and the only copy of it.** `clean` and
+ * `screenTargets` both go through here; that is what makes "would this be refused?" and
+ * "is this refused?" the same question rather than two implementations that agree until
+ * one of them is edited.
+ *
+ * Everything except the store-prune dependency is decidable from the target alone, so this
+ * is where everything except the store-prune dependency lives (that one is `hardlinkTracker`,
+ * because it is a property of the run).
+ */
+async function rejectionFor(
+  target: CleanTarget,
+  options: ScreeningOptions,
+  tier: ScreeningTier,
+): Promise<Rejection | undefined> {
+  const lexical = lexicalRejection(target, options);
+  if (lexical !== undefined) return lexical;
+
+  const deletePath = deletePathOf(target);
+  const shallow = await shallowFilesystemRejection(deletePath);
+  if (shallow !== undefined) return shallow;
+
+  if (tier === 'full' && nestedScanApplies(target)) {
+    const nested = await nestedRepositoryRejection(
+      deletePath,
+      nestedScanBudget(options.nestedScanMaxDirs),
+    );
+    if (nested !== undefined) return nested;
+  }
+
+  return await shapeRejection(deletePath);
+}
+
+/**
+ * Invariant 5's dependency — the one verdict that is a property of the *run* rather than of
+ * a target — as a small state machine both loops drive.
+ *
+ * `clean` feeds it what actually happened; `screenTargets` feeds it what would happen. The
+ * rule ("a `node_modules` that was not trashed makes every later store prune unsafe") is
+ * written once, so the screen cannot promise a prune the boundary then refuses. `orderTargets`
+ * is what guarantees every `node_modules` is observed before the first store prune is asked
+ * about, which is why both loops order before they iterate.
+ */
+interface HardlinkTracker {
+  /** The refusal for `target` if it is a store prune and a hardlink source will remain. */
+  storePruneRejection(target: CleanTarget): Rejection | undefined;
+  /** Record a target's fate. `undefined` means "trashed", i.e. no longer a hardlink source. */
+  observe(target: CleanTarget, label: string, result: Rejection | undefined): void;
+}
+
+function hardlinkTracker(unselectedNodeModules: readonly string[]): HardlinkTracker {
+  /**
+   * Set by the first `node_modules` that will still be on disk when this run ends.
+   * Seeded from targets the caller never selected — see `unselectedNodeModules` — because
+   * those never reach either loop and so could never set it themselves.
+   */
+  let leftBehind: string | undefined =
+    unselectedNodeModules.length > 0
+      ? `${unselectedNodeModules[0]} is not being cleaned` +
+        (unselectedNodeModules.length > 1
+          ? ` (and ${unselectedNodeModules.length - 1} more)`
+          : '')
+      : undefined;
+
+  return {
+    storePruneRejection(target) {
+      if (!isStorePruneTarget(target) || leftBehind === undefined) return undefined;
+      return refused(
+        'store-prune-unsafe',
+        `${leftBehind}, so pruning the store would orphan the hardlinks ` +
+          'of a project that is still on disk',
+      );
+    },
+    observe(target, label, result) {
+      if (result === undefined || !isNodeModulesTarget(target) || leftBehind !== undefined) return;
+      leftBehind = `${label} was not trashed (${
+        result.outcome === 'refused' ? result.refusal : result.outcome
+      })`;
+    },
+  };
+}
+
+/** One verdict: this target *would* be refused, for this reason, before anything is deleted. */
+export interface Screening {
+  target: CleanTarget;
+  refusal: Refusal;
+  detail: string;
+}
+
+/**
+ * Every target in `targets` that `clean` would refuse, in the order `clean` would reach
+ * them (`orderTargets`), computed without deleting or writing anything.
+ *
+ * Use this before selection and before consent: it answers "is this row deletable?" with
+ * the boundary's own guards instead of a second opinion that can drift from them. Targets
+ * that would be trashed simply do not appear.
+ *
+ * ## Equal to `clean`, with one stated exception
+ *
+ * Same guards, same order, same details — a test pins the two lists against each other. The
+ * exception is what no read-only check can know: whether `TrashFn` will *fail* at the
+ * moment of deletion (EPERM, a vanished directory, a full trash). A `node_modules` that
+ * fails that way makes a later store prune unsafe, so `clean` can produce one
+ * `store-prune-unsafe` that no screen predicted. That is the only direction the two can
+ * differ, and it is the safe one: the screen never promises fewer refusals than it can
+ * prove, and reality can only add.
+ *
+ * Screening is also a snapshot — a symlink created between the screen and the run is caught
+ * by the run, which is exactly why the boundary keeps its own checks rather than trusting
+ * this one.
+ *
+ * @param tier `'full'` (default) matches `clean` exactly; `'cheap'` skips only the
+ * nested-repository scan, for callers that must screen everything they list. See the module
+ * header for the cost of each.
+ */
+export async function screenTargets(
+  targets: readonly CleanTarget[],
+  options: ScreeningOptions,
+  tier: ScreeningTier = 'full',
+): Promise<Screening[]> {
+  const tracker = hardlinkTracker(options.unselectedNodeModules);
+  const screenings: Screening[] = [];
+
+  for (const target of orderTargets(targets)) {
+    const rejection =
+      tracker.storePruneRejection(target) ?? (await rejectionFor(target, options, tier));
+    tracker.observe(target, targetLabel(target), rejection);
+    if (rejection?.outcome === 'refused') {
+      screenings.push({ target, refusal: rejection.refusal, detail: rejection.detail });
+    }
+  }
+
+  return screenings;
+}
+
+/**
+ * `screenTargets` without the nested-repository scan: a handful of `lstat`s per target and
+ * no subtree walk at all, so it can be run over every row of a 133 GB scan on every
+ * keystroke if need be. It can miss only `contains-repository` for something *inside* a
+ * candidate; run the full screen on whatever the user actually selects.
+ */
+export async function screenTargetsCheaply(
+  targets: readonly CleanTarget[],
+  options: ScreeningOptions,
+): Promise<Screening[]> {
+  return await screenTargets(targets, options, 'cheap');
 }
 
 function messageOf(error: unknown): string {
@@ -615,6 +856,10 @@ function messageOf(error: unknown): string {
  * recognise. Returns one outcome per target, in execution order — the order the summary
  * then reports, so what the user reads is what actually happened.
  *
+ * The guards themselves are `rejectionFor` and `hardlinkTracker`, shared verbatim with
+ * `screenTargets`. This function contributes exactly two things they cannot: the call to
+ * `TrashFn`, and what to do when it throws.
+ *
  * Targets are processed **sequentially**. Concurrency would buy little (trashing is a
  * rename) and would break invariant 5 outright: the store prune has to observe the final
  * state of every `node_modules`, which it cannot do while they are still in flight.
@@ -623,64 +868,21 @@ export async function clean(
   targets: readonly CleanTarget[],
   options: CleanOptions,
 ): Promise<CleanOutcome[]> {
-  const ordered = orderTargets(targets);
   const outcomes: CleanOutcome[] = [];
+  const tracker = hardlinkTracker(options.unselectedNodeModules);
 
-  /**
-   * Set by the first `node_modules` that will still be on disk when this run ends.
-   * Invariant 5. Seeded from targets the caller never selected — see `unselectedNodeModules`
-   * — because those never reach the loop below and so could never set it themselves.
-   */
-  let hardlinkSourceLeftBehind: string | undefined =
-    options.unselectedNodeModules.length > 0
-      ? `${options.unselectedNodeModules[0]} is not being cleaned` +
-        (options.unselectedNodeModules.length > 1
-          ? ` (and ${options.unselectedNodeModules.length - 1} more)`
-          : '')
-      : undefined;
-
-  for (const target of ordered) {
+  for (const target of orderTargets(targets)) {
     const label = targetLabel(target);
     const bytes = targetBytes(target);
 
-    const record = (outcome: CleanOutcome): CleanOutcome => {
-      outcomes.push(outcome);
-      // A `node_modules` that was not trashed is still hardlinking into the store, so
-      // every later store prune is unsafe. `orderTargets` guarantees this is known before
-      // any store prune is reached — which is why `clean` orders internally rather than
-      // trusting the caller to have done it.
-      if (
-        isNodeModulesTarget(target) &&
-        outcome.outcome !== 'trashed' &&
-        hardlinkSourceLeftBehind === undefined
-      ) {
-        hardlinkSourceLeftBehind = `${label} was not trashed (${outcome.refusal ?? outcome.outcome})`;
-      }
-      return outcome;
-    };
-
-    if (isStorePruneTarget(target) && hardlinkSourceLeftBehind !== undefined) {
-      record({
-        target,
-        label,
-        bytes,
-        outcome: 'refused',
-        refusal: 'store-prune-unsafe',
-        detail:
-          `${hardlinkSourceLeftBehind}, so pruning the store would orphan the hardlinks ` +
-          'of a project that is still on disk',
-      });
-      continue;
-    }
-
+    // `??` and not a separate branch: a store prune already known to be unsafe must not be
+    // vetted further, exactly as a refused screen would not vet it.
     const rejection =
-      lexicalRejection(target, options) ??
-      (await filesystemRejection(deletePathOf(target), {
-        scan: nestedScanApplies(target),
-        maxDirs: nestedScanBudget(options.nestedScanMaxDirs),
-      }));
+      tracker.storePruneRejection(target) ?? (await rejectionFor(target, options, 'full'));
+
     if (rejection !== undefined) {
-      record(
+      tracker.observe(target, label, rejection);
+      outcomes.push(
         rejection.outcome === 'refused'
           ? {
               target,
@@ -697,9 +899,14 @@ export async function clean(
 
     try {
       await options.trash([deletePathOf(target)]);
-      record({ target, label, bytes, outcome: 'trashed' });
+      // Trashed: no longer a hardlink source, so a later store prune stays permissible.
+      tracker.observe(target, label, undefined);
+      outcomes.push({ target, label, bytes, outcome: 'trashed' });
     } catch (error) {
-      record({ target, label, bytes, outcome: 'failed', detail: messageOf(error) });
+      // The one verdict no screen can predict — see the divergence note on `screenTargets`.
+      const failure: Rejection = { outcome: 'failed', detail: messageOf(error) };
+      tracker.observe(target, label, failure);
+      outcomes.push({ target, label, bytes, outcome: 'failed', detail: failure.detail });
     }
   }
 

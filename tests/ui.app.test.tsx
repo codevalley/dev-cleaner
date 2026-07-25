@@ -8,6 +8,14 @@
  * stalls for three seconds before finishing. Every assertion about the first frame runs
  * inside a budget far shorter than that stall, so an implementation that collected the
  * whole scan before its first render would fail rather than merely feel slow.
+ *
+ * The second property, and the one the last describe block is entirely about: **the question
+ * is screened before it is asked**. The list shows what is selected; `clean.ts` decides what
+ * is deletable, and a confirmation built from the first while the run obeys the second
+ * promises space it then refuses. `onScreen` is the seam the CLI binds to `screenTargets`,
+ * and the tests drive it with a plan (`ScreenPlan`) that can refuse per target, per tier, and
+ * can hold the expensive tier open — so "what does the interface do while a 67 GB directory
+ * is being scanned" is an ordering the tests state rather than a timing they hope for.
  */
 
 import { EventEmitter } from 'node:events';
@@ -19,6 +27,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { App, runApp, type ExitSummary } from '../src/ui/App.js';
 import { CURSOR, MARK_OFF, MARK_ON } from '../src/ui/format.js';
 import type { ScanEvent } from '../src/scan.js';
+import type { Screening, ScreeningTier } from '../src/clean.js';
 import type {
   Artifact,
   CacheEntry,
@@ -27,6 +36,7 @@ import type {
   CleanTarget,
   Preset,
   Project,
+  Refusal,
 } from '../src/types.js';
 
 const KB = 1024;
@@ -192,6 +202,27 @@ function targetPaths(targets: readonly CleanTarget[]): string[] {
     .sort();
 }
 
+/**
+ * A stand-in for the CLI's bound `screenTargets`.
+ *
+ * `block` is asked per target *and per tier*, which is what makes the difference between
+ * the two tiers expressible: a repository nested inside a candidate is invisible to
+ * `'cheap'` (it walks no subtree) and found by `'full'`, so a plan that returns a refusal
+ * only for `'full'` is the real shape of that case. `holdFull` stalls the expensive tier the
+ * way a 67 GB `target/` does.
+ */
+interface ScreenPlan {
+  block?: (target: CleanTarget, tier: ScreeningTier) => Refusal | undefined;
+  holdFull?: Gate;
+  fail?: string;
+}
+
+/** One call the app made to the screen, as tier plus the exact set it asked about. */
+interface ScreenCall {
+  tier: ScreeningTier;
+  paths: string[];
+}
+
 type Instance = ReturnType<typeof render>;
 
 interface Harness {
@@ -200,6 +231,7 @@ interface Harness {
   line(match: string): string;
   lineIndex(match: string): number;
   cleaned: CleanTarget[][];
+  screened: ScreenCall[];
   exits: ExitSummary[];
   press(data: string): Promise<void>;
   waitForText(text: string, timeout?: number): Promise<void>;
@@ -221,10 +253,32 @@ function mount(
     holdClean?: Gate;
     /** Per-target verdict, so a run can mix `trashed` with `refused` and `failed`. */
     outcomeFor?: (target: CleanTarget) => CleanOutcome['outcome'];
+    /** Absent means no `onScreen` prop at all — the unscreened app. */
+    screen?: ScreenPlan;
   } = {},
 ): Harness {
   const cleaned: CleanTarget[][] = [];
+  const screened: ScreenCall[] = [];
   const exits: ExitSummary[] = [];
+
+  const plan = overrides.screen;
+  const onScreen =
+    plan === undefined
+      ? undefined
+      : async (
+          targets: readonly CleanTarget[],
+          tier: ScreeningTier,
+        ): Promise<readonly Screening[]> => {
+          screened.push({ tier, paths: targetPaths(targets) });
+          if (plan.fail !== undefined) throw new Error(plan.fail);
+          if (tier === 'full' && plan.holdFull !== undefined) await plan.holdFull.promise;
+          return targets.flatMap((target) => {
+            const refusal = plan.block?.(target, tier);
+            return refusal === undefined
+              ? []
+              : [{ target, refusal, detail: `${refusal}: refused by the boundary` }];
+          });
+        };
 
   const onClean = async (targets: readonly CleanTarget[]): Promise<CleanOutcome[]> => {
     cleaned.push([...targets]);
@@ -245,6 +299,7 @@ function mount(
       onClean={onClean}
       onExit={(summary) => exits.push(summary)}
       nowMs={NOW}
+      {...(onScreen === undefined ? {} : { onScreen })}
       {...(overrides.preset === undefined ? {} : { preset: overrides.preset })}
     />,
   );
@@ -276,6 +331,7 @@ function mount(
       return frame().split('\n').indexOf(rowLine(match));
     },
     cleaned,
+    screened,
     exits,
     async press(data: string): Promise<void> {
       instance.stdin.write(data);
@@ -968,6 +1024,309 @@ describe('the confirmation is a snapshot', () => {
       '/dev/latecomer/target',
       '/dev/shown/dist',
     ]);
+  });
+});
+
+/**
+ * The question is screened before it is asked.
+ *
+ * The list is built from what is *selected*; `clean.ts` decides what is *deletable*. While
+ * those two are computed by different code the tool promises space it then refuses — a user
+ * reads "80.0G across 4 directories", answers yes, and receives 5.0G with three refusals
+ * scrolling past afterwards. The second time that happens they have learned that refusals
+ * are noise, which is the failure `clean.ts` names from the other side.
+ *
+ * Freezing the snapshot is what makes the fix possible: at that instant the set is fixed,
+ * bounded and about to be consented to, so it is exactly the moment to ask the boundary's
+ * own guards about it. These tests pin all three halves of that — that the screen is run
+ * (both tiers, over exactly the frozen targets), that its verdicts reach the screen the user
+ * answers *and* the work list `clean` receives, and that the wait for it is neither a freeze
+ * nor a window in which a keystroke can do something unintended.
+ */
+describe('the confirmation is screened before it is asked', () => {
+  /** 80.0G selected across four directories, and every one of them a different verdict. */
+  const stream = (): AsyncIterable<ScanEvent> =>
+    fastStream([
+      projectEvent(
+        makeProject('tinysync', 'dormant', [
+          artifact('target', 'build', 67 * GB),
+          artifact('dist', 'build', 3 * GB),
+        ]),
+      ),
+      cacheEvent(makeCache('pnpm store', 8 * GB)),
+      cacheEvent(makeCache('npm cache', 2 * GB)),
+    ]);
+
+  /** The last event in the stream, so its row means everything is on screen. */
+  const ready = (ui: Harness): Promise<void> => ui.waitForText('npm cache');
+
+  const ALL_SELECTED = [
+    '/caches/npm cache',
+    '/caches/pnpm store',
+    '/dev/tinysync/dist',
+    '/dev/tinysync/target',
+  ];
+
+  it('runs both tiers over exactly the frozen targets before showing the question', async () => {
+    const held = gate();
+    const ui = mount(stream(), { screen: { holdFull: held } });
+    await ready(ui);
+
+    await ui.press(ENTER);
+
+    // The expensive tier is still running: the question is not up yet, and the interface
+    // says what it is doing rather than sitting frozen on the list.
+    expect(ui.frame()).toContain('Checking what can be trashed…');
+    expect(ui.frame()).not.toContain('Move to Trash?');
+    expect(ui.cleaned).toEqual([]);
+
+    // Cheap first — it costs a few `lstat`s and can answer at once — then full, which is the
+    // only tier that looks inside a candidate. Both are asked about the frozen set itself.
+    expect(ui.screened.map((call) => call.tier)).toEqual(['cheap', 'full']);
+    expect(ui.screened[0]?.paths).toEqual(ALL_SELECTED);
+    expect(ui.screened[1]?.paths).toEqual(ALL_SELECTED);
+
+    held.open();
+    await ui.waitForText('Move to Trash?');
+    expect(ui.screened.map((call) => call.tier)).toEqual(['cheap', 'full']);
+  });
+
+  /**
+   * The defect itself, stated as a number: what the headline says and what the Trash
+   * receives are the same 5.0G, and the 75.0G that will be refused is named on screen rather
+   * than folded into the total or quietly dropped from it.
+   */
+  it('shows blocked rows with their reason, excludes them from the total, and from the run', async () => {
+    const ui = mount(stream(), {
+      screen: {
+        block: (target) => {
+          if (target.kind === 'cache') {
+            return target.cache.id === 'pnpm store' ? 'store-prune-unsafe' : undefined;
+          }
+          return target.artifact.relPath === 'target' ? 'contains-repository' : undefined;
+        },
+      },
+    });
+    await ready(ui);
+
+    await ui.press(ENTER);
+    await ui.waitForText('Move to Trash?');
+
+    // The headline counts the two survivors and nothing else.
+    expect(ui.frame()).toContain('5.0G across 2 directories');
+    expect(ui.frame()).not.toContain('80.0G across');
+    expect(ui.frame()).not.toContain('4 directories');
+
+    // The 75.0G is stated, itemised, and given a reason — not silently missing.
+    expect(ui.frame()).toContain('Blocked · 2 items · 75.0G');
+    expect(ui.frame()).toContain('tinysync/target');
+    expect(ui.frame()).toContain('holds a git repository');
+    expect(ui.frame()).toContain('pnpm store');
+    expect(ui.frame()).toContain('a node_modules still links into it');
+
+    await ui.press(ENTER);
+    await vi.waitFor(() => expect(ui.cleaned).toHaveLength(1), { timeout: 1_000, interval: 10 });
+
+    // And the promise is kept: the work list is the two directories the headline described.
+    expect(targetPaths(ui.cleaned[0] ?? [])).toEqual(['/caches/npm cache', '/dev/tinysync/dist']);
+
+    await vi.waitFor(() => expect(ui.exits).toHaveLength(1), { timeout: 1_000, interval: 10 });
+    expect(ui.exits[0]?.trashedBytes).toBe(5 * GB);
+  });
+
+  /**
+   * Both tiers earn their place. The cheap one answers immediately and its verdicts are put
+   * on the waiting screen; the expensive one is the only thing that can see a repository
+   * *inside* a 67 GB directory, and the question is built from its answer, not the fast one.
+   */
+  it('shows the cheap verdicts while the expensive tier is still looking inside', async () => {
+    const held = gate();
+    const ui = mount(stream(), {
+      screen: {
+        holdFull: held,
+        block: (target, tier) => {
+          // Known without walking anything: a store whose hardlink sources stay on disk.
+          if (target.kind === 'cache' && target.cache.id === 'pnpm store') {
+            return 'store-prune-unsafe';
+          }
+          // Only a walk of the candidate's contents can find this one.
+          return tier === 'full' && target.kind === 'project' && target.artifact.relPath === 'target'
+            ? 'contains-repository'
+            : undefined;
+        },
+      },
+    });
+    await ready(ui);
+
+    await ui.press(ENTER);
+    expect(ui.frame()).toContain('Checking what can be trashed…');
+    expect(ui.frame()).toContain('1 blocked so far');
+
+    held.open();
+    await ui.waitForText('Move to Trash?');
+
+    // The expensive tier's extra refusal is in the answer, so the total is the smaller one.
+    expect(ui.frame()).toContain('Blocked · 2 items · 75.0G');
+    expect(ui.frame()).toContain('5.0G across 2 directories');
+  });
+
+  /**
+   * The wait is not a window. Every key that means something on the list — and `enter`,
+   * which is the one that spends consent — must do nothing at all while the check is
+   * running, or a held key repeat confirms a question that has not been rendered yet and a
+   * stray `p` re-presets the selection out from under the set being screened.
+   */
+  it('ignores every keystroke while the check runs, and screens the set only once', async () => {
+    const held = gate();
+    const ui = mount(stream(), { screen: { holdFull: held } });
+    await ready(ui);
+    expect(ui.frame()).toContain('selected 3');
+
+    await ui.press(ENTER);
+
+    for (const key of ['j', SPACE, 'k', 'a', 'p', ARROW_DOWN, ARROW_UP, 'x', ENTER]) {
+      await ui.press(key);
+      expect(ui.frame()).toContain('Checking what can be trashed…');
+      expect(ui.frame()).not.toContain('Move to Trash?');
+      expect(ui.cleaned).toEqual([]);
+      expect(ui.exits).toEqual([]);
+    }
+
+    // A stray `enter` that reached the list handler would have started a second screening
+    // run; a stray `space`, `a` or `p` would have edited the selection underneath it.
+    expect(ui.screened.map((call) => call.tier)).toEqual(['cheap', 'full']);
+
+    held.open();
+    await ui.waitForText('Move to Trash?');
+    expect(ui.frame()).toContain('80.0G across 4 directories');
+
+    await ui.press(ESCAPE);
+    expect(ui.frame()).toContain('selected 3');
+    expect(ui.frame()).toContain('preset recommended');
+  });
+
+  /**
+   * Leaving is always allowed — nothing has been touched yet, so `esc` and `q` tell the
+   * truth here in a way they could not mid-clean. What must not happen is the abandoned
+   * check coming back: a verdict that arrives after the user has left would open a
+   * confirmation for a selection they are no longer looking at, which is the freeze defeating
+   * itself.
+   */
+  it('lets esc abandon the check, and drops the verdict that arrives afterwards', async () => {
+    const held = gate();
+    const ui = mount(stream(), { screen: { holdFull: held } });
+    await ready(ui);
+
+    await ui.press(ENTER);
+    expect(ui.frame()).toContain('Checking what can be trashed…');
+
+    await ui.press(ESCAPE);
+    expect(ui.frame()).not.toContain('Checking what can be trashed…');
+    expect(ui.frame()).toContain('space toggle');
+
+    held.open();
+    await delay(100);
+
+    expect(ui.frame()).not.toContain('Move to Trash?');
+    expect(ui.frame()).toContain('space toggle');
+    expect(ui.cleaned).toEqual([]);
+    expect(ui.exits).toEqual([]);
+  });
+
+  it('lets q quit mid-check, reporting the truth: nothing was cleaned', async () => {
+    const held = gate();
+    const ui = mount(stream(), { screen: { holdFull: held } });
+    await ready(ui);
+
+    await ui.press(ENTER);
+    await ui.press('q');
+
+    expect(ui.exits).toEqual([{ cleaned: false, outcomes: [], trashedBytes: 0 }]);
+    expect(ui.cleaned).toEqual([]);
+
+    held.open();
+    await delay(100);
+    expect(ui.exits).toHaveLength(1);
+    expect(ui.cleaned).toEqual([]);
+  });
+
+  /**
+   * A check that cannot run is not permission to skip it. Rendering the question anyway
+   * would put an unverified total in front of the user, which is the exact thing being
+   * fixed — `clean` would still refuse at the boundary, but the promise would already have
+   * been made.
+   */
+  it('returns to the list, with the error, when the check itself fails', async () => {
+    const ui = mount(stream(), { screen: { fail: 'EMFILE: too many open files' } });
+    await ready(ui);
+
+    await ui.press(ENTER);
+    await ui.waitForText('check failed: EMFILE: too many open files');
+
+    expect(ui.frame()).not.toContain('Move to Trash?');
+    expect(ui.frame()).not.toContain('Checking what can be trashed…');
+    expect(ui.frame()).toContain('space toggle');
+    expect(ui.cleaned).toEqual([]);
+  });
+
+  /**
+   * When the screen refuses everything there is nothing left to consent to. The reasons are
+   * still shown — the user has to be able to see why 80 G went nowhere — but `enter` is not
+   * an answer to anything, and a clean of zero targets would exit the app reporting "nothing
+   * was selected" to someone who selected all of it.
+   */
+  it('offers no confirmation when the screen refuses everything', async () => {
+    const ui = mount(stream(), { screen: { block: () => 'worktree-root' } });
+    await ready(ui);
+
+    await ui.press(ENTER);
+    await ui.waitForText('Nothing here can be moved to the Trash.');
+
+    expect(ui.frame()).toContain('0B across 0 directories');
+    expect(ui.frame()).toContain('Blocked · 4 items · 80.0G');
+    expect(ui.frame()).toContain('a linked git worktree');
+    expect(ui.frame()).not.toContain('enter confirm');
+
+    await ui.press(ENTER);
+    await delay(50);
+    expect(ui.cleaned).toEqual([]);
+    expect(ui.exits).toEqual([]);
+
+    await ui.press(ESCAPE);
+    expect(ui.frame()).toContain('space toggle');
+  });
+
+  /**
+   * The screen is of the frozen set, for the same reason the question is: a project that
+   * arrives while the check is running has not been vetted, is not in the work list, and must
+   * not appear in the answer. It is counted and disclosed, exactly as before.
+   */
+  it('screens the frozen set, not the one the scan has grown since', async () => {
+    const source = feed();
+    const held = gate();
+    const ui = mount(source.stream, { screen: { holdFull: held } });
+
+    await source.push(projectEvent(makeProject('shown', 'dormant', [artifact('dist', 'build', 3 * GB)])));
+    await ui.waitForText('shown');
+
+    await ui.press(ENTER);
+    await source.push(
+      projectEvent(makeProject('latecomer', 'dormant', [artifact('target', 'build', 40 * GB)])),
+    );
+    await delay(50);
+
+    expect(ui.screened.map((call) => call.paths)).toEqual([['/dev/shown/dist'], ['/dev/shown/dist']]);
+
+    held.open();
+    await ui.waitForText('Move to Trash?');
+
+    expect(ui.frame()).not.toContain('latecomer');
+    expect(ui.frame()).toContain('3.0G across 1 directory');
+    expect(ui.frame()).toContain('1 more found while confirming');
+
+    await ui.press(ENTER);
+    await vi.waitFor(() => expect(ui.cleaned).toHaveLength(1), { timeout: 1_000, interval: 10 });
+    expect(targetPaths(ui.cleaned[0] ?? [])).toEqual(['/dev/shown/dist']);
   });
 });
 
