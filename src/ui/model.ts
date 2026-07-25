@@ -168,6 +168,17 @@ export function isSelected(selection: Selection, row: Row): boolean {
 /**
  * Dormant projects and caches start selected; active projects do not. Both halves matter:
  * the tool is useless if nothing is preselected, and dangerous if work in progress is.
+ *
+ * A cache carrying a `blocked` reason is the third case, and it is about honesty rather
+ * than safety. `clean.ts` would refuse it anyway; preselecting it would still count its
+ * bytes into the total the user is shown and consents to, and then hand back a refusal for
+ * the largest line in the run. Promising something and then refusing it is how a user
+ * learns that refusals are noise — the same failure `clean.ts` names from the other side
+ * ("a guard nobody can satisfy is a guard that gets switched off").
+ *
+ * Not selecting it is still only a *default*: `toggleRow` treats a blocked row like any
+ * other, exactly as it does a protected project, and the boundary refusal is what makes
+ * that safe.
  */
 export function defaultSelection(rows: readonly Row[]): Selection {
   const projects = new Set<string>();
@@ -175,7 +186,7 @@ export function defaultSelection(rows: readonly Row[]): Selection {
 
   for (const row of rows) {
     if (row.kind === 'project' && row.section === 'projects') projects.add(row.project.root);
-    else if (row.kind === 'cache') caches.add(row.cache.id);
+    else if (row.kind === 'cache' && row.cache.blocked === undefined) caches.add(row.cache.id);
   }
   return { projects, caches };
 }

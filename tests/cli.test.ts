@@ -209,6 +209,44 @@ describe('main', () => {
       expect([...options.categories].sort()).toEqual(['build', 'cache', 'deps']);
     });
 
+    it('also tells the scan which categories the preset will actually clean', async () => {
+      // Two different sets, deliberately. The walk stays widest so pressing `p` never
+      // re-walks a 133 GB tree; the cache table needs the *narrow* one to describe the
+      // package store in terms of the run that is happening. Sending only the wide set is
+      // what let the store's note describe `aggressive` while `recommended` was running.
+      const io = fakeIO(false);
+      const deps = stubDeps(io);
+
+      await main(['/scan', '--preset', 'recommended'], deps);
+
+      const options = deps.scanAll.mock.calls[0]?.[0] as {
+        categories: Set<Category>;
+        presetCategories?: ReadonlySet<Category>;
+      };
+      expect([...options.categories].sort()).toEqual(['build', 'cache', 'deps']);
+      expect(options.presetCategories).toBeDefined();
+      expect([...(options.presetCategories as ReadonlySet<Category>)].sort()).toEqual([
+        'build',
+        'cache',
+      ]);
+    });
+
+    it('narrows the scan’s preset categories when the preset changes', async () => {
+      const io = fakeIO(false);
+      const deps = stubDeps(io);
+
+      await main(['/scan', '--preset', 'aggressive'], deps);
+
+      const options = deps.scanAll.mock.calls[0]?.[0] as {
+        presetCategories?: ReadonlySet<Category>;
+      };
+      expect([...(options.presetCategories as ReadonlySet<Category>)].sort()).toEqual([
+        'build',
+        'cache',
+        'deps',
+      ]);
+    });
+
     it('passes the parsed options through to the scan', async () => {
       const io = fakeIO(false);
       const deps = stubDeps(io);
@@ -257,6 +295,26 @@ describe('main', () => {
       };
       expect(options.roots).toEqual(['/scan']);
       expect(options.allowedCachePaths).toContain(CACHE.path);
+    });
+
+    it('tells the live scan the preset’s categories too, not only the report path', async () => {
+      // The interactive path is the one a user actually sees the store row in, so an
+      // honest note there matters more than in the piped report — and it is the path that
+      // would be easiest to leave behind when wiring only `runStaticReport`.
+      const io = fakeIO(true);
+      const deps = stubDeps(io);
+
+      await main(['/scan', '--preset', 'recommended'], deps);
+
+      const options = deps.scanStream.mock.calls[0]?.[0] as {
+        categories: Set<Category>;
+        presetCategories?: ReadonlySet<Category>;
+      };
+      expect([...options.categories].sort()).toEqual(['build', 'cache', 'deps']);
+      expect([...(options.presetCategories as ReadonlySet<Category>)].sort()).toEqual([
+        'build',
+        'cache',
+      ]);
     });
 
     it('prints the trash disclosure after a clean, and nothing after a quit', async () => {

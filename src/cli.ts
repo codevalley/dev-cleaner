@@ -22,10 +22,10 @@
 
 import { createRequire } from 'node:module';
 import { realpathSync } from 'node:fs';
-import { lstat, readdir } from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
+import { storeHasIncomingHardlinks } from './caches.js';
 import { renderCleanSummary, renderReport } from './report.js';
 import { SafetyError } from './types.js';
 import type { Category, CleanOutcome, CleanTarget, Preset, TrashFn } from './types.js';
@@ -254,12 +254,24 @@ async function resolveRoots(roots: readonly string[], deps: MainDeps): Promise<s
   return resolved;
 }
 
-function scanOptionsFor(options: CliOptions, deps: MainDeps): ScanOptions {
+/**
+ * `presetCategories` is the *narrow* set — what the preset will actually clean — and is
+ * carried alongside the widest walk set, never instead of it. The scan still finds
+ * everything; the cache table needs to know which of it the run will trash, so that the
+ * package store is described in terms of the preset that is running rather than one that
+ * is not.
+ */
+function scanOptionsFor(
+  options: CliOptions,
+  deps: MainDeps,
+  presetCategories: ReadonlySet<Category>,
+): ScanOptions {
   const scan: ScanOptions = {
     roots: options.roots,
     categories: new Set(SCAN_CATEGORIES),
     includeCaches: options.includeCaches,
     nowMs: deps.nowMs ?? Date.now(),
+    presetCategories,
   };
   if (options.concurrency !== undefined) scan.concurrency = options.concurrency;
   return scan;
@@ -323,82 +335,14 @@ function isStorePruneTarget(target: CleanTarget): target is CacheTarget {
 }
 
 /**
- * How many directory entries the probe below will look at before giving up. A store it
- * cannot finish reading is a store it cannot clear, so exhausting this budget *refuses* the
- * prune — the cost of the bound is a missed cleanup, never an orphaned hardlink.
+ * The probe itself now lives in `caches.ts`, where the cache table can run it *before*
+ * offering the store — so the default selection, the report's total and the interface all
+ * describe the same outcome this file's boundary screening would produce. Re-exported here
+ * because it is part of this module's contract with its tests, and because moving a guard
+ * must not quietly change what can be asserted about it. One implementation, two callers:
+ * the upstream one is about honesty, the one below is about safety.
  */
-const STORE_PROBE_BUDGET = 200_000;
-
-/**
- * True when anything on this machine still hardlinks into `storePath` — or when that
- * question could not be answered, which counts the same.
- *
- * **Why the filesystem is asked instead of the scan.** Invariant 5 requires that no project
- * still references the store when it is pruned. `clean.ts` is told which `node_modules` were
- * left behind, but that list can only ever contain what the *scan* saw, and the scan sees
- * one directory tree: `cd ~/work/api && dev-cleaner .` finds one project, trashes its
- * `node_modules` successfully, and hands `clean` an empty left-behind list — while
- * `~/work/web`, `~/dev/*` and every other pnpm project on the machine still hardlink into
- * the very store about to be trashed. Scan scope cannot establish a machine-wide fact.
- * `st_nlink` can: a store file with more than one link *is* a store file some other
- * directory entry still points at, wherever on the volume that entry lives. It asks the
- * real question rather than inferring an answer from how much of the disk was walked.
- *
- * **Why it runs before anything is trashed.** Trashing is a rename (invariant 4), so a
- * `node_modules` moved to the Trash keeps its links into the store — and can be restored
- * from there. There is therefore no later moment at which the count improves, and a store
- * whose only references belong to `node_modules` trashed by this same run stays refused, on
- * purpose: those directories are still on disk until the Trash is emptied (invariant 8).
- *
- * Every uncertainty resolves to `true`: an unreadable directory, a vanished store, a symlink
- * inside it (a store is a flat farm of regular files; a link means this is not the shape the
- * probe knows how to clear), or a budget that ran out. The cost of a false `true` is a store
- * that is not pruned. The cost of a false `false` is the harm invariant 5 exists to prevent.
- */
-export async function storeHasIncomingHardlinks(
-  storePath: string,
-  budget: number = STORE_PROBE_BUDGET,
-): Promise<boolean> {
-  let remaining = budget;
-  const pending: string[] = [storePath];
-
-  while (pending.length > 0) {
-    const directory = pending.pop();
-    if (directory === undefined) break;
-
-    let entries;
-    try {
-      entries = await readdir(directory, { withFileTypes: true });
-    } catch {
-      return true;
-    }
-
-    for (const entry of entries) {
-      if (remaining <= 0) return true;
-      remaining -= 1;
-
-      const child = path.join(directory, entry.name);
-      // Never traversed, never resolved: a symlink is not a hardlink, and following one
-      // would walk out of the store entirely (invariant 2).
-      if (entry.isSymbolicLink()) return true;
-      if (entry.isDirectory()) {
-        pending.push(child);
-        continue;
-      }
-      if (!entry.isFile()) continue;
-
-      try {
-        // `lstat`, not `stat`: the entry is already known not to be a link, and the count
-        // wanted is the one belonging to this inode.
-        if ((await lstat(child)).nlink > 1) return true;
-      } catch {
-        return true;
-      }
-    }
-  }
-
-  return false;
-}
+export { storeHasIncomingHardlinks };
 
 /**
  * Splits the work list into the targets `clean` may proceed with and the store prunes this
@@ -456,14 +400,18 @@ async function runStaticReport(
 ): Promise<number> {
   const scanAll = deps.scanAll ?? (await import('./scan.js')).scanAll;
   const categoriesFor = await loadCategoriesFor(deps);
+  // One set, computed once, handed to both the scan and the report: the note the cache
+  // table writes and the categories the report narrows to cannot then describe different
+  // presets.
+  const categories = categoriesFor(options.preset);
 
-  const result = await scanAll(scanOptionsFor(options, deps));
+  const result = await scanAll(scanOptionsFor(options, deps, categories));
 
   io.write(
     renderReport({
       projects: result.projects,
       caches: result.caches,
-      categories: categoriesFor(options.preset),
+      categories,
       preset: options.preset,
       roots: options.roots,
     }),
@@ -485,7 +433,10 @@ async function runInteractive(options: CliOptions, deps: MainDeps, io: CliIO): P
   // *all* of them — `deps` is not in the preset, so none is ever a target.
   const nodeModulesSeen: string[] = [];
   const stream = recordCaches(
-    recordNodeModules(scanStream(scanOptionsFor(options, deps)), nodeModulesSeen),
+    recordNodeModules(
+      scanStream(scanOptionsFor(options, deps, categoriesFor(options.preset))),
+      nodeModulesSeen,
+    ),
     allowedCachePaths,
   );
 

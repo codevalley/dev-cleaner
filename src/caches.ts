@@ -18,17 +18,43 @@
  * Only its `Caches` subdirectory is offered (spec: "Global caches").
  */
 
-import { lstat } from 'node:fs/promises';
+import { lstat, readdir } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
 import { dirSize } from './size.js';
-import type { CacheEntry } from './types.js';
+import type { CacheBlock, CacheEntry, Category } from './types.js';
 
 export interface CacheEnv {
   platform: NodeJS.Platform;
   home: string;
   env: NodeJS.ProcessEnv;
+}
+
+/**
+ * What the caller knows about the run that the table cannot work out for itself.
+ *
+ * Both fields exist so the store row can be described *truthfully*, which is a property of
+ * the run rather than of the disk layout: what the active preset will actually trash, and
+ * whether anything still hardlinks into the store.
+ */
+export interface CacheListOptions {
+  /**
+   * The categories the active preset cleans — `categoriesForPreset(preset)`. Used only to
+   * word the store's note. Under `recommended` the `deps` category is excluded, so no
+   * `node_modules` is ever trashed; a note that says "those are trashed first" is then
+   * describing `aggressive`, a preset that is not running.
+   *
+   * Omitted when the caller has no preset to speak for, in which case the note states the
+   * fact and claims nothing about what the run will do.
+   */
+  categories?: ReadonlySet<Category> | undefined;
+  /**
+   * The incoming-hardlink probe. Defaults to `storeHasIncomingHardlinks` — the real one,
+   * asking the real filesystem. Injected by tests that need an answer without building a
+   * hardlinked store on disk.
+   */
+  probeStore?: ((storePath: string) => Promise<boolean>) | undefined;
 }
 
 /** A table row before it is checked against the disk: everything but `bytes`. */
@@ -67,7 +93,10 @@ const localAppData = (env: CacheEnv): string =>
   absoluteFromEnv(env, 'LOCALAPPDATA') ?? path.join(env.home, 'AppData', 'Local');
 
 const NOTE = {
-  pnpm: 'hardlink target for project node_modules — those are trashed first',
+  // Deliberately just the *fact*. What follows the dash is decided per run by `storeNote`,
+  // because the rest of the sentence depends on the preset and on the disk, and a constant
+  // cannot be right about either.
+  pnpm: 'hardlink target for project node_modules',
   npm: 'safe — packages are re-downloaded on demand',
   gradle: 're-downloaded on next build',
   cargo: 're-downloaded on next build',
@@ -166,6 +195,145 @@ async function sizeOf(target: string): Promise<number> {
   }
 }
 
+/**
+ * The one row in the table that is a hardlink *farm* rather than a download cache: its
+ * files are the very inodes project `node_modules` point at. Every other cache can be
+ * deleted with no reference to anything outside itself.
+ *
+ * Matched by id, which is safe *here* in a way it is not in `cli.ts` or `clean.ts`: this
+ * module authors the id, so the two cannot drift apart. The downstream guards match on id
+ * *or* path shape precisely because they receive an entry they did not construct.
+ */
+const STORE_ID = 'pnpm-store';
+
+/**
+ * How many directory entries the probe below will look at before giving up. A store it
+ * cannot finish reading is a store it cannot clear, so exhausting this budget reports the
+ * store as referenced — the cost of the bound is a missed cleanup, never an orphaned link.
+ */
+const STORE_PROBE_BUDGET = 200_000;
+
+/**
+ * True when anything on this machine still hardlinks into `storePath` — or when that
+ * question could not be answered, which counts the same.
+ *
+ * **Why the filesystem is asked instead of the scan.** No project may still reference the
+ * store when it is pruned (invariant 5). What the *scan* saw cannot establish that: `cd
+ * ~/work/api && dev-cleaner .` finds one project, and `~/work/web`, `~/dev/*` and every
+ * other pnpm project on the machine still hardlink into the same store. Scan scope cannot
+ * settle a machine-wide fact. `st_nlink` can: a store file with more than one link *is* a
+ * file some other directory entry still points at, wherever on the volume that entry lives.
+ *
+ * **Why it is cheap.** The question is existential — does *any* file under the store have
+ * more than one link — so the walk stops at the first one it finds. On a real 7.5 GB store
+ * that is the first file it stats, which is why this can run during the scan rather than
+ * only at the deletion boundary. It is the equivalent of `find <store> -links +1 -print
+ * -quit`, and it must stay that way: a version that collected every link count before
+ * deciding would be a full second walk of the largest directory on the disk.
+ *
+ * **Why it runs before anything is trashed.** Trashing is a rename (invariant 4), so a
+ * `node_modules` moved to the Trash keeps its links into the store. There is no later
+ * moment at which the count improves, and a store whose only references belong to
+ * `node_modules` trashed by this same run stays referenced, on purpose: those directories
+ * are still on disk until the Trash is emptied (invariant 8).
+ *
+ * Every uncertainty resolves to `true`: an unreadable directory, a vanished store, a
+ * symlink inside it (a store is a flat farm of regular files; a link means this is not the
+ * shape the probe knows how to clear), or a budget that ran out. The cost of a false `true`
+ * is a store that is not pruned. The cost of a false `false` is the harm invariant 5 exists
+ * to prevent.
+ */
+export async function storeHasIncomingHardlinks(
+  storePath: string,
+  budget: number = STORE_PROBE_BUDGET,
+): Promise<boolean> {
+  let remaining = budget;
+  const pending: string[] = [storePath];
+
+  while (pending.length > 0) {
+    const directory = pending.pop();
+    if (directory === undefined) break;
+
+    let entries;
+    try {
+      entries = await readdir(directory, { withFileTypes: true });
+    } catch {
+      return true;
+    }
+
+    for (const entry of entries) {
+      if (remaining <= 0) return true;
+      remaining -= 1;
+
+      const child = path.join(directory, entry.name);
+      // Never traversed, never resolved: a symlink is not a hardlink, and following one
+      // would walk out of the store entirely (invariant 2).
+      if (entry.isSymbolicLink()) return true;
+      if (entry.isDirectory()) {
+        pending.push(child);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+
+      try {
+        // `lstat`, not `stat`: the entry is already known not to be a link, and the count
+        // wanted is the one belonging to this inode. The `return` is the early exit — one
+        // hit is the whole answer, so nothing below this file is ever looked at.
+        if ((await lstat(child)).nlink > 1) return true;
+      } catch {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Why the store cannot be pruned on this run. Worded as the machine-wide fact it is, since
+ * that is what a user has to act on: the fix is to remove the `node_modules` elsewhere, not
+ * to change anything about this run.
+ */
+const STORE_BLOCKED_REASON =
+  'node_modules elsewhere on this machine still hardlink into it (or it could not be ' +
+  'fully checked), so pruning it would orphan those links';
+
+/**
+ * The rest of the store's note, which is a claim about *this run* and so cannot be a
+ * constant. The previous fixed string — "those are trashed first" — described `aggressive`
+ * and was simply false under the default preset, where `deps` is excluded and no
+ * `node_modules` is trashed at all.
+ */
+function storeNote(referenced: boolean, trashesDeps: boolean | undefined): string {
+  if (!referenced) return `${NOTE.pnpm} — nothing on this machine still links into it`;
+  if (trashesDeps === true) {
+    return `${NOTE.pnpm} — this preset trashes those first, but trashing keeps their hardlinks, so the store stays`;
+  }
+  if (trashesDeps === false) {
+    return `${NOTE.pnpm} — this preset does not trash node_modules, so the store stays`;
+  }
+  return `${NOTE.pnpm} — some still link into it, so the store stays`;
+}
+
+/** The store row's note and, when it cannot be pruned, the reason it cannot. */
+async function describeStore(
+  storePath: string,
+  options: CacheListOptions,
+): Promise<{ note: string; blocked?: CacheBlock }> {
+  const probe = options.probeStore ?? storeHasIncomingHardlinks;
+
+  let referenced = true;
+  try {
+    referenced = await probe(storePath);
+  } catch {
+    // Same direction as the probe's own failures: unanswerable is not the same as clear.
+    referenced = true;
+  }
+
+  const note = storeNote(referenced, options.categories?.has('deps'));
+  return referenced ? { note, blocked: { reason: STORE_BLOCKED_REASON } } : { note };
+}
+
 /** The environment of the running process, in the shape `listCaches` consumes. */
 export function currentCacheEnv(): CacheEnv {
   const env = process.env;
@@ -182,8 +350,15 @@ export function currentCacheEnv(): CacheEnv {
  * unique by path: an override such as `CARGO_HOME=$HOME/.cargo` must not produce the same
  * directory twice, since the UI keys selection on `id` and would then offer two rows for
  * one deletion.
+ *
+ * The package store is additionally *screened* here rather than only at the deletion
+ * boundary. Doing it upstream is what lets the default selection, the report's total and
+ * the interface all say the same thing `clean.ts` will do — see `CacheBlock`.
  */
-export async function listCaches(env: CacheEnv): Promise<CacheEntry[]> {
+export async function listCaches(
+  env: CacheEnv,
+  options: CacheListOptions = {},
+): Promise<CacheEntry[]> {
   const seenPaths = new Set<string>();
   const seenIds = new Set<string>();
   const candidates: CacheCandidate[] = [];
@@ -202,6 +377,18 @@ export async function listCaches(env: CacheEnv): Promise<CacheEntry[]> {
   ).filter((candidate): candidate is CacheCandidate => candidate !== undefined);
 
   return Promise.all(
-    present.map(async (candidate) => ({ ...candidate, bytes: await sizeOf(candidate.path) })),
+    present.map(async (candidate): Promise<CacheEntry> => {
+      const bytes = await sizeOf(candidate.path);
+      // Only the store is probed. Every other cache is self-contained, and walking a
+      // 20 GB Gradle cache to learn nothing would make the scan slower for no answer.
+      if (candidate.id !== STORE_ID) return { ...candidate, bytes };
+
+      const { note, blocked } = await describeStore(candidate.path, options);
+      // `blocked` is left absent rather than set to `undefined`, so `'blocked' in entry`
+      // reads truthfully — the same rule `scan.ts` follows for `project.git`.
+      return blocked === undefined
+        ? { ...candidate, bytes, note }
+        : { ...candidate, bytes, note, blocked };
+    }),
   );
 }

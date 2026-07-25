@@ -213,6 +213,14 @@ function mount(
     preset?: Preset;
     /** Called after every attempt is recorded; throw to make that attempt fail. */
     onAttempt?: (attempt: number) => void;
+    /**
+     * Held: `onClean` records the call and then blocks on this gate. The window between
+     * those two moments is a deletion that has started and not finished — the only state
+     * in which the app is holding the user's data and cannot be torn down.
+     */
+    holdClean?: Gate;
+    /** Per-target verdict, so a run can mix `trashed` with `refused` and `failed`. */
+    outcomeFor?: (target: CleanTarget) => CleanOutcome['outcome'];
   } = {},
 ): Harness {
   const cleaned: CleanTarget[][] = [];
@@ -221,11 +229,12 @@ function mount(
   const onClean = async (targets: readonly CleanTarget[]): Promise<CleanOutcome[]> => {
     cleaned.push([...targets]);
     overrides.onAttempt?.(cleaned.length);
+    if (overrides.holdClean !== undefined) await overrides.holdClean.promise;
     return targets.map((target) => ({
       target,
       label: target.kind === 'project' ? target.artifact.relPath : target.cache.label,
       bytes: target.kind === 'project' ? target.artifact.bytes : target.cache.bytes,
-      outcome: 'trashed' as const,
+      outcome: overrides.outcomeFor?.(target) ?? ('trashed' as const),
     }));
   };
 
@@ -451,6 +460,104 @@ describe('selection', () => {
   });
 });
 
+/**
+ * The default is applied once per row, and the "once" is the whole point.
+ *
+ * Rendering is progressive, so rows keep arriving for the entire length of the scan — on a
+ * large tree, for minutes, while the user is already working through the list. The default
+ * that preselects dormant projects has to run for each new arrival, which makes it very
+ * easy to write as "re-apply the default to everything whenever the rows change". That
+ * version silently re-selects the project the user just deselected, and does it again on
+ * the next arrival, and the next: the user's `space` appears to work and then quietly
+ * undoes itself. Nothing on screen says so, and the re-armed project is in the work list
+ * handed to `clean`.
+ *
+ * `seen` is what makes the default a starting position rather than a standing instruction,
+ * and these tests are what say it is still one.
+ */
+describe('the default selection is applied once per row', () => {
+  it('leaves a deselected project deselected as the scan delivers more rows', async () => {
+    const source = feed();
+    const ui = mount(source.stream);
+
+    await source.push(projectEvent(makeProject('dropped', 'dormant', [artifact('target', 'build', 9 * GB)])));
+    await source.push(projectEvent(makeProject('kept', 'dormant', [artifact('dist', 'build', 5 * GB)])));
+    await ui.waitForText('kept');
+
+    expect(ui.line('dropped')).toContain(CURSOR);
+    await ui.press(SPACE);
+    expect(ui.line('dropped')).toContain(MARK_OFF);
+    expect(ui.frame()).toContain('selected 1');
+
+    // The scan is still running. One more project lands, which re-runs the default.
+    await source.push(projectEvent(makeProject('newcomer', 'dormant', [artifact('out', 'build', GB)])));
+    await ui.waitForText('newcomer');
+
+    // The arrival is preselected, as it should be. The user's choice is not overwritten.
+    expect(ui.line('newcomer')).toContain(MARK_ON);
+    expect(ui.line('kept')).toContain(MARK_ON);
+    expect(ui.line('dropped')).toContain(MARK_OFF);
+    expect(ui.frame()).toContain('selected 2');
+
+    // And the deselection reaches the thing that matters: the work list.
+    await ui.press(ENTER);
+    expect(ui.frame()).toContain('Move to Trash?');
+    expect(ui.frame()).not.toContain('dropped');
+
+    await ui.press(ENTER);
+    await vi.waitFor(() => expect(ui.cleaned).toHaveLength(1), { timeout: 1_000, interval: 10 });
+    expect(targetPaths(ui.cleaned[0] ?? [])).toEqual(['/dev/kept/dist', '/dev/newcomer/out']);
+  });
+
+  /**
+   * The same rule for the other half of the default: a cache the user cleared must not be
+   * re-armed either, and neither must a *protected* project the user deliberately opted in
+   * to — re-running `defaultSelection` over every row would strip that one back out.
+   */
+  it('survives repeated arrivals, in both directions', async () => {
+    const source = feed();
+    const ui = mount(source.stream);
+
+    await source.push(projectEvent(makeProject('dropped', 'dormant', [artifact('target', 'build', 9 * GB)])));
+    await source.push(projectEvent(makeProject('busy', 'active', [artifact('dist', 'build', 4 * GB)])));
+    await source.push(cacheEvent(makeCache('npm cache', 2 * GB)));
+    await ui.waitForText('npm cache');
+    expect(ui.frame()).toContain('selected 2'); // dormant project + cache
+
+    await ui.press(SPACE); // clear `dropped`
+    await ui.press('j'); // onto `busy`, protected and unselected
+    await ui.press(SPACE); // opt it in
+    await ui.press('j'); // onto the cache
+    await ui.press(SPACE); // clear it
+    expect(ui.frame()).toContain('selected 1');
+
+    // Three more arrivals, each one another chance to overwrite the three choices above.
+    for (const size of [1, 2, 3]) {
+      await source.push(
+        projectEvent(makeProject(`extra${size}`, 'dormant', [artifact('out', 'build', size * GB)])),
+      );
+      await ui.waitForText(`extra${size}`);
+    }
+
+    expect(ui.line('dropped')).toContain(MARK_OFF);
+    expect(ui.line('busy')).toContain(MARK_ON);
+    // The cleared cache is asserted through the count and the work list below rather than
+    // its glyph: the detail pane prints `/caches/npm cache`, which shares a physical line
+    // with an unrelated list row, so the glyph on that line belongs to someone else.
+    expect(ui.frame()).toContain('selected 4'); // busy + the three arrivals
+
+    await ui.press(ENTER);
+    await ui.press(ENTER);
+    await vi.waitFor(() => expect(ui.cleaned).toHaveLength(1), { timeout: 1_000, interval: 10 });
+    expect(targetPaths(ui.cleaned[0] ?? [])).toEqual([
+      '/dev/busy/dist',
+      '/dev/extra1/out',
+      '/dev/extra2/out',
+      '/dev/extra3/out',
+    ]);
+  });
+});
+
 describe('confirmation and exit', () => {
   const stream = (): AsyncIterable<ScanEvent> =>
     fastStream([
@@ -463,9 +570,20 @@ describe('confirmation and exit', () => {
       cacheEvent(makeCache('npm cache', 2 * GB)),
     ]);
 
+  /**
+   * Ready means *both* events have landed, and waiting for `bump` does not mean that.
+   *
+   * The project paints one event before the cache, so a test that pressed enter on the
+   * first frame would freeze a snapshot holding only `dist` and then assert on a 5 G total
+   * that includes the cache. That is a real race and it does fire: it is the difference
+   * between a 20 ms scheduling slice and a 30 ms one. The cache is the last event in the
+   * stream, so its row appearing is the honest "everything is on screen" signal.
+   */
+  const ready = (ui: Harness): Promise<void> => ui.waitForText('npm cache');
+
   it('q quits without cleaning anything', async () => {
     const ui = mount(stream());
-    await ui.waitForText('bump');
+    await ready(ui);
 
     await ui.press('q');
 
@@ -475,7 +593,7 @@ describe('confirmation and exit', () => {
 
   it('enter asks for a second confirmation before anything is trashed', async () => {
     const ui = mount(stream());
-    await ui.waitForText('bump');
+    await ready(ui);
 
     await ui.press(ENTER);
 
@@ -487,7 +605,7 @@ describe('confirmation and exit', () => {
 
   it('escape returns from the confirmation without cleaning', async () => {
     const ui = mount(stream());
-    await ui.waitForText('bump');
+    await ready(ui);
 
     await ui.press(ENTER);
     await ui.press(ESCAPE);
@@ -499,7 +617,7 @@ describe('confirmation and exit', () => {
 
   it('the second enter cleans, passing the discriminated union through', async () => {
     const ui = mount(stream());
-    await ui.waitForText('bump');
+    await ready(ui);
 
     await ui.press(ENTER);
     await ui.press(ENTER);
@@ -529,6 +647,47 @@ describe('confirmation and exit', () => {
   });
 
   /**
+   * The last gate between the user and the deletion, stated as an equivalence rather than
+   * an example: `enter` spends consent and *nothing else does*.
+   *
+   * The failure this pins is not exotic. A handler written as `if (escape) cancel(); else
+   * clean();` reads like the same thing and is not: it makes every key on the keyboard a
+   * confirmation. The keys below are the ones actually under a user's fingers a moment
+   * earlier — `j`, `k` and the arrows from navigating, `space` from toggling, `a` and `p`
+   * from the hints still printed at the bottom of the screen. Any of them landing on the
+   * confirmation would move the whole selection to the Trash without an answer having been
+   * given. So each key is followed by the same two assertions: nothing was cleaned, and the
+   * question is still the thing on screen.
+   */
+  it('starts the clean on enter and on no other key', async () => {
+    const ui = mount(stream());
+    await ready(ui);
+
+    await ui.press(ENTER);
+    expect(ui.frame()).toContain('Move to Trash?');
+
+    for (const key of ['j', SPACE, 'k', 'a', 'p', ARROW_DOWN, ARROW_UP, 'x']) {
+      await ui.press(key);
+      expect(ui.cleaned).toEqual([]);
+      expect(ui.exits).toEqual([]);
+      // Still asking. `Moving … to the Trash…` is the cleaning phase; it must not appear.
+      expect(ui.frame()).toContain('Move to Trash?');
+      expect(ui.frame()).not.toContain('to the Trash…');
+    }
+
+    // A clean started by a stray key would have called `onClean` by now even if the frame
+    // had not yet repainted, so give it a moment before declaring nothing happened.
+    await delay(50);
+    expect(ui.cleaned).toEqual([]);
+    expect(ui.exits).toEqual([]);
+
+    // And the key that does mean yes, still means yes.
+    await ui.press(ENTER);
+    await vi.waitFor(() => expect(ui.cleaned).toHaveLength(1), { timeout: 1_000, interval: 10 });
+    expect(targetPaths(ui.cleaned[0] ?? [])).toEqual(['/caches/npm cache', '/dev/bump/dist']);
+  });
+
+  /**
    * A confirmation dialog is exactly where a user double-taps or holds the key. Both
    * keystrokes land in the same tick, before React has committed the `cleaning` phase, so
    * both reach the previous render's handler closure while it still reads `confirm`.
@@ -539,7 +698,7 @@ describe('confirmation and exit', () => {
    */
   it('cleans exactly once when two enters land in the same tick', async () => {
     const ui = mount(stream());
-    await ui.waitForText('bump');
+    await ready(ui);
 
     await ui.press(ENTER);
     expect(ui.frame()).toContain('Move to Trash?');
@@ -568,7 +727,7 @@ describe('confirmation and exit', () => {
         if (attempt === 1) throw new Error('trash unavailable');
       },
     });
-    await ui.waitForText('bump');
+    await ready(ui);
 
     await ui.press(ENTER);
     await ui.press(ENTER);
@@ -586,9 +745,107 @@ describe('confirmation and exit', () => {
     expect(ui.exits[0]?.trashedBytes).toBe(5 * GB);
   });
 
+  /**
+   * While the deletion is running the keyboard is dead, and `q` is the key that proves it.
+   *
+   * `q` normally reports `{cleaned: false, trashedBytes: 0}` and tears the app down. Let it
+   * through mid-clean and it does exactly that *while `onClean` is still moving directories
+   * to the Trash*: the CLI receives "nothing was cleaned", skips the invariant-8 disclosure
+   * entirely, and the user is never told what is now sitting in their Trash or that the
+   * space is still spent. The bytes are gone and the only record of them is not printed.
+   *
+   * So the assertion is not "the app ignores the key" but the consequence: no summary is
+   * reported while the clean is in flight, and the one that eventually arrives is the true
+   * one.
+   */
+  it('reports nothing while the clean is in flight, whatever the user presses', async () => {
+    const held = gate();
+    const ui = mount(stream(), { holdClean: held });
+    await ready(ui);
+
+    await ui.press(ENTER);
+    await ui.press(ENTER);
+
+    // In flight: `onClean` has been called and is blocked on the gate.
+    await vi.waitFor(() => expect(ui.cleaned).toHaveLength(1), { timeout: 1_000, interval: 10 });
+    expect(ui.frame()).toContain('to the Trash…');
+    expect(ui.exits).toEqual([]);
+
+    await ui.press('q');
+    await delay(50);
+
+    // The quit summary — `cleaned: false, trashedBytes: 0` — is the lie invariant 8 would
+    // be told. It must not have been reported.
+    expect(ui.exits).toEqual([]);
+
+    // Keys that would have moved, toggled or re-confirmed are equally inert.
+    await ui.press(SPACE);
+    await ui.press('j');
+    await ui.press(ESCAPE);
+    await ui.press(ENTER);
+    await delay(50);
+    expect(ui.exits).toEqual([]);
+    expect(ui.cleaned).toHaveLength(1);
+
+    held.open();
+
+    await vi.waitFor(() => expect(ui.exits).toHaveLength(1), { timeout: 1_000, interval: 10 });
+    expect(ui.exits[0]?.cleaned).toBe(true);
+    expect(ui.exits[0]?.trashedBytes).toBe(5 * GB);
+  });
+
+  /**
+   * Invariant 8's number has to be the number the Trash actually holds.
+   *
+   * `clean` reports a verdict per target, and `refused` and `failed` mean the directory was
+   * left exactly where it was. Summing bytes across every outcome would tell a user who
+   * trashed 2 G and had an 8 G store prune refused that 10 G is waiting in the Trash — so
+   * they empty it, expect 10 G back, and get 2 G. The disclosure has to count what was
+   * moved, not what was attempted.
+   */
+  it('counts only trashed bytes in the summary, never refused or failed ones', async () => {
+    const ui = mount(
+      fastStream([
+        projectEvent(
+          makeProject('bump', 'dormant', [
+            artifact('dist', 'build', 2 * GB),
+            artifact('build', 'build', 3 * GB),
+          ]),
+        ),
+        cacheEvent(makeCache('pnpm store', 8 * GB)),
+      ]),
+      {
+        outcomeFor: (target) => {
+          if (target.kind === 'cache') return 'refused'; // e.g. store-prune-unsafe
+          return target.artifact.relPath === 'build' ? 'failed' : 'trashed';
+        },
+      },
+    );
+
+    await ui.waitForText('pnpm store');
+    await ui.press(ENTER);
+    expect(ui.frame()).toContain('13.0G across 3 directories');
+
+    await ui.press(ENTER);
+    await vi.waitFor(() => expect(ui.exits).toHaveLength(1), { timeout: 1_000, interval: 10 });
+
+    const summary = ui.exits[0];
+    expect(summary?.cleaned).toBe(true);
+    // All three verdicts are reported…
+    expect(summary?.outcomes).toHaveLength(3);
+    expect(summary?.outcomes.map((outcome) => outcome.outcome).sort()).toEqual([
+      'failed',
+      'refused',
+      'trashed',
+    ]);
+    // …but only the one that moved is in the Trash.
+    expect(summary?.trashedBytes).toBe(2 * GB);
+    expect(summary?.trashedBytes).not.toBe(13 * GB);
+  });
+
   it('refuses to open the confirmation with an empty selection', async () => {
     const ui = mount(stream());
-    await ui.waitForText('bump');
+    await ready(ui);
 
     await ui.press('a'); // clear the project section
     await ui.press('j');

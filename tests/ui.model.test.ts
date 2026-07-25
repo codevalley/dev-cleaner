@@ -234,6 +234,75 @@ describe('defaultSelection', () => {
   });
 });
 
+/**
+ * A cache the run has already established it would refuse.
+ *
+ * This is the selection half of the honesty fix. `clean.ts` refuses an unsafe store prune
+ * and that refusal stays — but a refusal is only meaningful if it is rare. Preselecting
+ * 7.5G the tool already knows it will refuse counts those bytes into the total the user
+ * consents to, and then hands back a refusal for the largest line in the run. Do that once
+ * and the user reads the next refusal as noise.
+ */
+describe('defaultSelection and a cache that cannot be cleaned', () => {
+  function blockedCache(id: string, bytes: number, reason: string): CacheEntry {
+    return { ...makeCache(id, bytes), blocked: { reason } };
+  }
+
+  const rows = rowsOf(
+    [makeProject('dormant-one', 'dormant', [artifact('target', 'build', 4 * GB)])],
+    [blockedCache('pnpm-store', 7 * GB, 'node_modules elsewhere still link into it'), makeCache('npm', 1 * GB)],
+  );
+  const selection = defaultSelection(rows);
+  const store = rows.find((row) => row.label === 'pnpm-store') as Row;
+  const npm = rows.find((row) => row.label === 'npm') as Row;
+
+  it('does not preselect it', () => {
+    expect(store).toBeDefined();
+    expect(isSelected(selection, store)).toBe(false);
+  });
+
+  it('still preselects the caches that are actually clean', () => {
+    expect(isSelected(selection, npm)).toBe(true);
+  });
+
+  it('still lists it — it exists and it occupies disk, and hiding it is its own lie', () => {
+    expect(labels(rows)).toContain('pnpm-store');
+    expect(store.bytes).toBe(7 * GB);
+  });
+
+  it('leaves its bytes out of what the run promises to reclaim', () => {
+    // 4G of project + 1G of npm cache. The 7G store is listed but not promised; before the
+    // fix this read 12G, and the run then delivered 5G.
+    expect(selectedBytes(rows, selection)).toBe(5 * GB);
+    expect(selectedCount(rows, selection)).toBe(2);
+  });
+
+  it('still lets the user select it by hand — a default, not a lock', () => {
+    // Exactly as with a protected active project. The boundary refusal in `clean.ts` is
+    // what makes leaving this reachable safe.
+    const toggled = toggleRow(selection, store);
+    expect(isSelected(toggled, store)).toBe(true);
+    expect(selectedBytes(rows, toggled)).toBe(12 * GB);
+  });
+
+  it('is selected by a section toggle like any other row', () => {
+    const all = toggleSection(selection, rows, 'caches');
+    expect(isSelected(all, store)).toBe(true);
+  });
+
+  it('still becomes a clean target once chosen, so the boundary can do its job', () => {
+    // If this row were filtered out of `toTargets`, `clean.ts`'s own invariant-5 check
+    // would be unreachable from the only path a user can invoke — and defence in depth
+    // would quietly become defence in one.
+    const targets = toTargets({
+      rows,
+      selection: toggleRow(selection, store),
+      categories: AGGRESSIVE,
+    });
+    expect(targets).toContainEqual({ kind: 'cache', cache: (store as { cache: CacheEntry }).cache });
+  });
+});
+
 describe('toggleSection', () => {
   const rows = rowsOf([
     makeProject('a', 'dormant', [artifact('dist', 'build', 1 * GB)]),

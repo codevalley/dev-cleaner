@@ -15,7 +15,7 @@
  */
 
 import { gatherSignals, scoreActivity, type ActivitySignals } from './activity.js';
-import { currentCacheEnv, listCaches } from './caches.js';
+import { currentCacheEnv, listCaches, type CacheListOptions } from './caches.js';
 import { discover } from './discover.js';
 import { readGitInfo } from './git.js';
 import { dirSize, type SizeOptions } from './size.js';
@@ -31,10 +31,18 @@ import type {
 
 export interface ScanOptions {
   roots: readonly string[];
+  /** What the *walk* looks for. Always the widest set, so a preset change never re-walks. */
   categories: Set<Category>;
   includeCaches: boolean;
   nowMs: number;
   concurrency?: number;
+  /**
+   * What the active preset will actually *clean* — `categoriesForPreset(preset)`, which is
+   * a subset of `categories` above. Nothing about the walk depends on it; it exists so the
+   * cache table can describe the package store in terms of the run that is happening rather
+   * than a run that is not. Left out by callers with no preset to speak for.
+   */
+  presetCategories?: ReadonlySet<Category>;
 }
 
 export type ScanEvent =
@@ -158,7 +166,12 @@ export async function* scanStream(options: ScanOptions): AsyncGenerator<ScanEven
   }
 
   if (options.includeCaches) {
-    for (const cache of await listCaches(currentCacheEnv())) {
+    // The one place a cache can be marked unsafe *before* it is offered: `listCaches`
+    // screens the package store here, so the default selection, the report total and the
+    // interface all agree with what `clean.ts` would do at the boundary.
+    const cacheOptions: CacheListOptions =
+      options.presetCategories === undefined ? {} : { categories: options.presetCategories };
+    for (const cache of await listCaches(currentCacheEnv(), cacheOptions)) {
       yield { kind: 'cache', cache };
     }
   }

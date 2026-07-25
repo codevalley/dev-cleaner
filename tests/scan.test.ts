@@ -10,7 +10,7 @@
  */
 
 import { execFile } from 'node:child_process';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { link, mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
 
@@ -329,6 +329,136 @@ describe('scanStream', () => {
       }
       Object.assign(process.env, saved);
     }
+  });
+
+  /**
+   * The scan is where the screening has to happen, because the scan is what the user is
+   * shown. A cache that arrives here unscreened gets preselected, counted into the promised
+   * total, and refused at the deletion boundary — the tool promising 18.5G and delivering
+   * 11G. These drive the *real* probe against a real hardlink, not an injected answer.
+   */
+  describe('the package store, screened before it is offered', () => {
+    const RECOMMENDED = new Set<Category>(['build', 'cache']);
+
+    /**
+     * A home directory holding a pnpm store wherever the running platform looks for one —
+     * macOS, Linux and Windows all covered, so the test asserts the same thing on any host
+     * rather than silently becoming a no-op off macOS.
+     */
+    const STORE_DIRS = [
+      'Library/pnpm/store', // darwin
+      '.local/share/pnpm/store', // linux, XDG_DATA_HOME unset
+      'AppData/Local/pnpm/store', // win32, LOCALAPPDATA unset
+    ] as const;
+
+    async function homeWithStore(): Promise<{ f: Fixture; restore: () => void }> {
+      const spec: Record<string, ReturnType<typeof file>> = {
+        'projects/alpha/package.json': file('{ "name": "alpha" }\n'),
+        'projects/alpha/dist/bundle.js': file('d', { size: 1024 }),
+      };
+      for (const store of STORE_DIRS) spec[`home/${store}/files/aa/blob`] = file('p', { size: 4096 });
+      const f = await tree(spec);
+
+      const saved = { ...process.env };
+      process.env['HOME'] = f.path('home');
+      process.env['USERPROFILE'] = f.path('home');
+      for (const key of ['XDG_DATA_HOME', 'XDG_CACHE_HOME', 'CARGO_HOME', 'LOCALAPPDATA']) {
+        delete process.env[key];
+      }
+
+      return {
+        f,
+        restore: () => {
+          for (const key of Object.keys(process.env)) {
+            if (!(key in saved)) delete process.env[key];
+          }
+          Object.assign(process.env, saved);
+        },
+      };
+    }
+
+    const storeOf = (events: readonly ScanEvent[]): CacheEntry | undefined =>
+      cachesOf(events).find((cache) => cache.id === 'pnpm-store');
+
+    it('arrives blocked when a node_modules outside the scan still hardlinks into it', async () => {
+      const { f, restore } = await homeWithStore();
+      try {
+        // The link is deliberately *outside* every scanned root: invariant 5 is a
+        // machine-wide fact, and the scan's own scope can never establish it.
+        for (const [index, store] of STORE_DIRS.entries()) {
+          await link(
+            f.path('home', ...store.split('/'), 'files', 'aa', 'blob'),
+            f.path('home', `outside-node_modules-${index}`),
+          );
+        }
+
+        const events = await collect(
+          options([f.path('projects')], {
+            includeCaches: true,
+            presetCategories: RECOMMENDED,
+          }),
+        );
+
+        const store = storeOf(events);
+        expect(store).toBeDefined();
+        expect(store?.blocked?.reason.length).toBeGreaterThan(0);
+      } finally {
+        restore();
+      }
+    });
+
+    it('arrives clean when nothing links into it', async () => {
+      const { f, restore } = await homeWithStore();
+      try {
+        const events = await collect(
+          options([f.path('projects')], {
+            includeCaches: true,
+            presetCategories: RECOMMENDED,
+          }),
+        );
+
+        const store = storeOf(events);
+        expect(store).toBeDefined();
+        expect(store?.blocked).toBeUndefined();
+      } finally {
+        restore();
+      }
+    });
+
+    it('describes the store in terms of the preset that is actually running', async () => {
+      const { f, restore } = await homeWithStore();
+      try {
+        for (const [index, store] of STORE_DIRS.entries()) {
+          await link(
+            f.path('home', ...store.split('/'), 'files', 'aa', 'blob'),
+            f.path('home', `outside-node_modules-${index}`),
+          );
+        }
+
+        const recommended = storeOf(
+          await collect(
+            options([f.path('projects')], {
+              includeCaches: true,
+              presetCategories: RECOMMENDED,
+            }),
+          ),
+        );
+        const aggressive = storeOf(
+          await collect(
+            options([f.path('projects')], { includeCaches: true, presetCategories: ALL }),
+          ),
+        );
+
+        // `recommended` excludes `deps`, so no node_modules is trashed at all — which is
+        // *why* the prune is refused. The shipped note said "those are trashed first",
+        // describing a preset that was not running.
+        expect(recommended?.note).toContain('does not trash node_modules');
+        expect(recommended?.note).not.toContain('trashed first');
+        expect(aggressive?.note).toContain('trashes those first');
+      } finally {
+        restore();
+      }
+    });
   });
 
   it('scans several roots in one pass', async () => {

@@ -1,9 +1,10 @@
+import { link } from 'node:fs/promises';
 import path from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { currentCacheEnv, listCaches, type CacheEnv } from '../src/caches.js';
-import type { CacheEntry } from '../src/types.js';
+import type { CacheEntry, Category } from '../src/types.js';
 import { dir, file, fixture, symlink, type Fixture } from './fixture.js';
 
 const fixtures: Fixture[] = [];
@@ -311,6 +312,186 @@ describe('listCaches — entry shape', () => {
 
     const entries = await listCaches(envFor(f, 'darwin', { CARGO_HOME: f.path('home', '.cargo') }));
     expect(new Set(pathsOf(entries)).size).toBe(entries.length);
+  });
+});
+
+/**
+ * The screening, done where the entry is *produced*.
+ *
+ * The bug these pin: a first run against a real 133 GB tree offered `pnpm store 7.5G`,
+ * preselected it, promised `18.5G` in the total — and then `clean.ts` refused the prune,
+ * correctly, because 31 `node_modules` on the machine still hardlinked into the store. The
+ * user was promised 18.5G and would have got ~11G. Nothing was ever at risk; what was at
+ * risk was the user's willingness to believe the next refusal.
+ *
+ * So the same question `cli.ts` asks at the deletion boundary is asked here, before the row
+ * is offered. Both remain: the one here is about honesty, the one there is about safety.
+ */
+describe('listCaches — screening the package store before it is offered', () => {
+  const STORE_TREE = {
+    'home/Library/pnpm/store/files/aa/blob': file('p', { size: 8192 }),
+    'home/.npm/_cacache/index-v5/aa/blob': file('n', { size: 2048 }),
+    'home/.gradle/caches/modules-2/blob': file('g', { size: 2048 }),
+  } as const;
+
+  it('marks the store blocked, with a reason, when something still hardlinks into it', async () => {
+    const f = await tree({ ...STORE_TREE });
+
+    const entries = await listCaches(envFor(f, 'darwin'), { probeStore: async () => true });
+    const store = entryFor(entries, 'pnpm-store');
+
+    expect(store.blocked).toBeDefined();
+    expect(store.blocked?.reason.length).toBeGreaterThan(0);
+    // The reason has to name the machine-wide fact, because that is what the user would
+    // have to act on: the fix is to remove a `node_modules` elsewhere, not to re-run.
+    expect(store.blocked?.reason.toLowerCase()).toContain('node_modules');
+    expect(store.blocked?.reason.toLowerCase()).toContain('hardlink');
+  });
+
+  it('leaves it unblocked when nothing on the machine links into it', async () => {
+    const f = await tree({ ...STORE_TREE });
+
+    const entries = await listCaches(envFor(f, 'darwin'), { probeStore: async () => false });
+    const store = entryFor(entries, 'pnpm-store');
+
+    // Absent, not `undefined`: `'blocked' in entry` has to read truthfully.
+    expect('blocked' in store).toBe(false);
+  });
+
+  it('still lists a blocked store, at its real size — it exists and it occupies disk', async () => {
+    const f = await tree({ ...STORE_TREE });
+
+    const entries = await listCaches(envFor(f, 'darwin'), { probeStore: async () => true });
+    const store = entryFor(entries, 'pnpm-store');
+
+    expect(store.path).toBe(f.path('home', 'Library', 'pnpm', 'store'));
+    expect(store.bytes).toBeGreaterThanOrEqual(8192);
+  });
+
+  it('blocks when the probe itself throws, rather than assuming the store is free', async () => {
+    const f = await tree({ ...STORE_TREE });
+
+    const entries = await listCaches(envFor(f, 'darwin'), {
+      probeStore: async () => {
+        throw new Error('permission denied');
+      },
+    });
+
+    expect(entryFor(entries, 'pnpm-store').blocked).toBeDefined();
+  });
+
+  it('probes the store and nothing else', async () => {
+    // Every other cache is self-contained. Walking a 20 GB Gradle cache to learn a fact
+    // that cannot apply to it would make every scan slower for no answer at all.
+    const f = await tree({ ...STORE_TREE });
+    const probed: string[] = [];
+
+    const entries = await listCaches(envFor(f, 'darwin'), {
+      probeStore: async (storePath) => {
+        probed.push(storePath);
+        return false;
+      },
+    });
+
+    expect(probed).toEqual([f.path('home', 'Library', 'pnpm', 'store')]);
+    expect(entries.length).toBeGreaterThan(1);
+    for (const entry of entries) {
+      if (entry.id !== 'pnpm-store') expect(entry.blocked).toBeUndefined();
+    }
+  });
+
+  it('screens with the real filesystem when no probe is injected', async () => {
+    // The default is the shipped behaviour. A default nothing exercises is a default that
+    // can be replaced with `async () => false` without a single test noticing.
+    const f = await tree({ ...STORE_TREE });
+    const blob = f.path('home', 'Library', 'pnpm', 'store', 'files', 'aa', 'blob');
+
+    const clear = await listCaches(envFor(f, 'darwin'));
+    expect(entryFor(clear, 'pnpm-store').blocked).toBeUndefined();
+
+    await link(blob, f.path('home', 'project-node_modules-copy'));
+
+    const linked = await listCaches(envFor(f, 'darwin'));
+    expect(entryFor(linked, 'pnpm-store').blocked).toBeDefined();
+  });
+});
+
+/**
+ * The note is a claim about *this run*, so it cannot be a constant.
+ *
+ * The shipped string was "hardlink target for project node_modules — those are trashed
+ * first". That describes `aggressive`. Under the default `recommended` preset the `deps`
+ * category is excluded, so no `node_modules` is trashed at all — which is precisely why the
+ * prune then gets refused. The note was not merely vague; it named the reason the prune
+ * would succeed, in the one preset where that reason does not hold.
+ */
+describe('listCaches — what the store’s note claims about the run', () => {
+  const STORE = { 'home/Library/pnpm/store/files/aa/blob': file('p', { size: 4096 }) } as const;
+
+  const RECOMMENDED = new Set<Category>(['build', 'cache']);
+  const AGGRESSIVE = new Set<Category>(['build', 'deps', 'cache']);
+
+  async function noteFor(
+    f: Fixture,
+    categories: ReadonlySet<Category> | undefined,
+    referenced: boolean,
+  ): Promise<string> {
+    const entries = await listCaches(envFor(f, 'darwin'), {
+      ...(categories === undefined ? {} : { categories }),
+      probeStore: async () => referenced,
+    });
+    return entryFor(entries, 'pnpm-store').note;
+  }
+
+  it('never claims node_modules are trashed under a preset that does not trash them', async () => {
+    const f = await tree({ ...STORE });
+    const note = await noteFor(f, RECOMMENDED, true);
+
+    expect(note).toContain('does not trash node_modules');
+    // The exact wording that was false: `recommended` excludes `deps`, so nothing is
+    // "trashed first" and the store's fate has nothing to do with the order of anything.
+    expect(note).not.toContain('trashed first');
+    expect(note).not.toContain('trashes those first');
+  });
+
+  it('says what aggressive actually does — trashes them, and the store still stays', async () => {
+    const f = await tree({ ...STORE });
+    const note = await noteFor(f, AGGRESSIVE, true);
+
+    expect(note).toContain('trashes those first');
+    // The half the old note left out, and the reason it read as a promise: trashing is a
+    // rename (invariant 4), so a trashed `node_modules` keeps its links into the store.
+    expect(note.toLowerCase()).toContain('hardlink');
+    expect(note).toContain('store stays');
+  });
+
+  it('claims nothing about a preset when the caller named none', async () => {
+    const f = await tree({ ...STORE });
+    const note = await noteFor(f, undefined, true);
+
+    expect(note).toContain('store stays');
+    expect(note).not.toContain('trashes those first');
+    expect(note).not.toContain('does not trash node_modules');
+  });
+
+  it('says so when the store can in fact be pruned', async () => {
+    const f = await tree({ ...STORE });
+
+    for (const categories of [RECOMMENDED, AGGRESSIVE, undefined]) {
+      const note = await noteFor(f, categories, false);
+      expect(note).toContain('nothing on this machine still links into it');
+      expect(note).not.toContain('store stays');
+    }
+  });
+
+  it('still names the hardlink relationship, whatever the run', async () => {
+    const f = await tree({ ...STORE });
+
+    for (const referenced of [true, false]) {
+      for (const categories of [RECOMMENDED, AGGRESSIVE, undefined]) {
+        expect((await noteFor(f, categories, referenced)).toLowerCase()).toContain('hardlink');
+      }
+    }
   });
 });
 

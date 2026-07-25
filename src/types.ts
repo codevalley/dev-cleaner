@@ -31,8 +31,27 @@ export interface Project {
 export type DiscoveredProject =
   Omit<Project, 'bytes' | 'git' | 'activity'> & { isWorktree: boolean };
 
+/**
+ * Why an entry cannot be cleaned on this run, established where the entry is *produced*
+ * rather than at the deletion boundary.
+ *
+ * `clean.ts` already refuses an unsafe store prune, and that refusal stays. This is the
+ * other half of the same fact: a tool that lists 18.5G, preselects it, promises it in the
+ * total, and then refuses 7.5G of it at the last moment has taught the user that refusals
+ * are noise. The screening has to be visible before consent, not only after it.
+ */
+export interface CacheBlock {
+  reason: string;
+}
 export interface CacheEntry {
   id: string; label: string; path: string; bytes: number; note: string;
+  /**
+   * Present when this cache is known, before anything is selected, not to be safe to clean
+   * right now. A blocked entry is still *listed* — it exists and it occupies disk, and
+   * hiding it would be its own kind of lie — but it is not selected by default and not
+   * counted in what the run promises to reclaim.
+   */
+  blocked?: CacheBlock;
 }
 export type CleanTarget =
   | { kind: 'project'; project: Project; artifact: Artifact }

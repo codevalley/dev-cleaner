@@ -14,8 +14,11 @@
  * that is still sitting in `~/.Trash`. The disclosure is not a nicety — it is the only
  * thing that makes the reported number mean what it appears to mean.
  *
- * Marks are ASCII (`[x]` / `[ ]`) rather than the list's `◉` / `○`: this output is
- * redirected to files and pipes, where the terminal glyphs are noise.
+ * Marks are ASCII (`[x]` / `[ ]` / `[-]`) rather than the list's `◉` / `○`: this output is
+ * redirected to files and pipes, where the terminal glyphs are noise. `[-]` is a cache the
+ * run has already established it would refuse (`CacheEntry.blocked`); it is listed with its
+ * reason and left out of the "selected by default" total, because a total that includes
+ * something the tool will then refuse is a promise it does not keep.
  */
 
 import type { CacheEntry, Category, CleanOutcome, Preset, Project } from './types.js';
@@ -67,10 +70,19 @@ function projectMeta(project: Project): string {
   return [types, age, reason].filter((part) => part.length > 0).join(' · ');
 }
 
+/** The `blocked` reason of a cache row, or `undefined` for anything that can be cleaned. */
+function blockedReason(row: Row): string | undefined {
+  return row.kind === 'cache' ? row.cache.blocked?.reason : undefined;
+}
+
 function itemLines(row: Row, selection: Selection, categories: ReadonlySet<Category>): string[] {
   if (row.kind === 'header') return [];
 
-  const mark = isSelected(selection, row) ? '[x]' : '[ ]';
+  // A third mark, not an empty box: `[ ]` means "you could select this", and a blocked row
+  // is one the run has already established it would refuse. Same reason the mark exists at
+  // all — the report is the only view a piped invocation ever gets.
+  const blocked = blockedReason(row);
+  const mark = blocked !== undefined ? '[-]' : isSelected(selection, row) ? '[x]' : '[ ]';
   const lines = [`  ${mark} ${column(row.label, row.bytes)}`];
 
   if (row.kind === 'project') {
@@ -80,6 +92,7 @@ function itemLines(row: Row, selection: Selection, categories: ReadonlySet<Categ
     }
   } else {
     lines.push(`      ${row.cache.note}`);
+    if (blocked !== undefined) lines.push(`      blocked: ${blocked}`);
   }
   return lines;
 }
@@ -112,12 +125,23 @@ export function renderReport(input: ReportInput): string {
 
   const selected = rows.filter((row) => row.kind !== 'header' && isSelected(selection, row));
   const protectedRows = rows.filter((row) => row.kind === 'project' && row.section === 'active');
+  const blockedRows = rows.filter((row) => blockedReason(row) !== undefined);
   const selectedBytes = selected.reduce((sum, row) => sum + row.bytes, 0);
 
   lines.push(
     '',
     `Selected by default: ${plural(selected.length, 'item')} · ${formatBytes(selectedBytes)}`,
   );
+  // Stated, not merely absent. A total that silently drops 7.5G is a number the user cannot
+  // reconcile with the section header two screens up; naming the shortfall and its size is
+  // what turns "the tool undercounted" into "the tool explained itself".
+  if (blockedRows.length > 0) {
+    const bytes = blockedRows.reduce((sum, row) => sum + row.bytes, 0);
+    lines.push(
+      `Blocked (not safe):  ${plural(blockedRows.length, 'item')} · ${formatBytes(bytes)}` +
+        ' — excluded from the total above; the reason is listed with each.',
+    );
+  }
   if (protectedRows.length > 0) {
     const bytes = protectedRows.reduce((sum, row) => sum + row.bytes, 0);
     lines.push(
