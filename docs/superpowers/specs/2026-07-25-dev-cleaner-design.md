@@ -314,22 +314,68 @@ tested directly.
    except" something. A bug therefore fails closed — something goes uncleaned — rather
    than open.
 
-2. **No symlink traversal.** Symbolic links are never followed, when sizing or when
-   deleting. A symlink encountered during the walk is skipped entirely.
+2. **No symlink traversal — over the whole path, not the last component.** Symbolic links
+   are never followed, when sizing or when deleting. Checking only the terminal component
+   with `lstat` is insufficient: if any *intermediate* component is a link
+   (`~/Library/pnpm -> /`, so `~/Library/pnpm/store` stats as the real `/store`), a
+   terminal-only check passes and the delete escapes the intended tree. Every delete
+   target — project artifact and global cache alike — must be validated across its entire
+   ancestor chain, and refused when `realpath` differs from the lexical path.
 
-3. **Root guards.** The scan refuses to run when a root resolves to `/`, the user's home
-   directory, or any path at depth ≤ 1 from the filesystem root.
+3. **Root guards operate on the real path.** The scan refuses to run when a root resolves
+   to `/`, the user's home directory, or any path at depth ≤ 1 from the filesystem root.
+   `path.resolve` alone is not sufficient — it normalises `..` lexically but does not
+   follow links, so `~/develop/projects -> /` presents as depth 3 and passes. Guards
+   apply to `realpath(root)`, and the resolved value becomes the scan root.
 
 4. **Trash, not unlink.** Deletion goes through the `trash` package, which uses the
    platform's native recycle facility. On the same volume this is a rename, so it is
    fast regardless of file count.
 
-5. **Ordering.** Project `node_modules` are trashed *before* any pnpm store prune, so
-   store hardlinks are never orphaned while projects still reference them. `clean.ts`
-   enforces this by sorting the work list, not by convention.
+5. **Ordering, and the dependency it encodes.** Project `node_modules` are trashed
+   *before* any pnpm store prune, so store hardlinks are never orphaned while projects
+   still reference them. `clean.ts` enforces this by sorting the work list, not by
+   convention.
 
-6. **Post-run disclosure.** Trash does not reclaim space until emptied. After cleaning,
+   Sorting alone is necessary but not sufficient. If a `node_modules` delete *fails*
+   (EPERM) or is *refused* (symlink, missing), a sorted loop still proceeds to prune the
+   store — orphaning the hardlinks of a project that is still on disk, which is precisely
+   what the ordering exists to prevent. The store prune is therefore **conditional on all
+   `node_modules` targets having succeeded**, and is refused with an explanatory reason
+   otherwise. Ordering is a dependency, not merely a sequence.
+
+6. **Worktree detection precedes artifact matching.** A directory is tested for being a
+   linked worktree *before* its basename is tested against the artifact table. The reverse
+   order is catastrophic: `git worktree add build feature` creates a worktree at `build/`,
+   which a basename-first check captures as an artifact and deletes — destroying real
+   source and any uncommitted work, and leaving a phantom git registration. This is the
+   single operation the "Worktrees" section forbids, reachable through pure ordering.
+
+   Because ordering bugs are easy to reintroduce, this is enforced **twice**: once in the
+   walk, and again independently at the deletion boundary, where any candidate whose
+   `.git` is a file is refused outright. Fixtures must include worktrees named `build`,
+   `target`, and `dist` — a fixture named `namespace-foundation` passes while the
+   invariant is broken, which is exactly how this defect survives review.
+
+7. **Git subprocesses are hardened.** `gitInfo` runs `git` with `cwd` set to directories
+   the walk discovered, which may be repositories the user merely downloaded rather than
+   authored. A repository's own `.git/config` can set `core.fsmonitor` to an arbitrary
+   command, which `git status` executes during index refresh — arbitrary code execution
+   during what the user believes is a read-only disk survey. `core.hooksPath` is a second
+   vector.
+
+   Every invocation is therefore prefixed with `-c core.fsmonitor= -c
+   core.hooksPath=/dev/null -c protocol.ext.allow=never` and run with
+   `GIT_CONFIG_NOSYSTEM=1`, `GIT_TERMINAL_PROMPT=0`, `GIT_ASKPASS=true`. A fixture whose
+   `.git/config` sets `core.fsmonitor` to a sentinel-writing script must leave no sentinel.
+
+8. **Post-run disclosure.** Trash does not reclaim space until emptied. After cleaning,
    the tool reports the total now sitting in Trash and offers to empty it.
+
+Invariants 2, 3, 5, 6 and 7 were each found by adversarial review of a draft that had
+already been written against invariants 1–4. They are recorded here because every one of
+them is a case where a plausible implementation satisfies the *wording* of an earlier
+invariant while defeating its purpose.
 
 ---
 
