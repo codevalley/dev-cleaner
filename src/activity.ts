@@ -203,19 +203,80 @@ export async function gatherSignals(
  * The stub below derives `idleMs` honestly — it is arithmetic, not judgement, and the display
  * needs it — and hard-codes only the parts that are yours: `status` and `reason`.
  */
+const DAY = 86_400_000;
+
+/**
+ * How recently a person must have touched a project for it to count as active.
+ *
+ * Thirty days spans a holiday, a sprint on something else, or a month of meetings without
+ * declaring the work abandoned. Below this the answer is "you are still on this"; above it,
+ * "you would not notice a rebuild".
+ */
+const ACTIVE_DAYS = 30;
+
+/**
+ * The extra grace a project gets for having uncommitted changes.
+ *
+ * Case 1 from the contract above. Cleaning artifacts can never destroy uncommitted source —
+ * artifacts are not source, and the allowlist cannot name `src/` — so a dirty tree is not a
+ * data-loss risk. It is evidence that you stopped mid-thought, and the cost of clearing its
+ * `target/` is that you lose your place. That is worth a longer benefit of the doubt, but not
+ * permanent immunity: a tree left dirty three years ago is abandoned, not paused, and
+ * indefinite protection would let one forgotten `git stash`-worth of edits hold 30 GB forever.
+ */
+const DIRTY_GRACE_DAYS = 90;
+
 export function scoreActivity(signals: ActivitySignals, nowMs: number): ActivityScore {
-  const newest = Math.max(
+  // Case 2. Only *authoring* counts. `newestArtifactMs` is deliberately absent from this max:
+  // a watch build, a dev server, a CI checkout or an `npm install` touches artifacts without
+  // anyone deciding anything, so admitting it would mark every project you once ran as
+  // permanently active — which is precisely how a cleaner ends up finding nothing to clean.
+  const authoredMs = Math.max(
     signals.lastCommitMs ?? 0,
     signals.newestSourceMs,
-    signals.newestArtifactMs,
     signals.lockfileMs ?? 0,
   );
-  // A tree with no measurable timestamp at all is 0 idle, not 56 years idle.
-  const idleMs = newest > 0 ? Math.max(0, nowMs - newest) : 0;
 
-  return {
-    status: 'active',
-    idleMs,
-    reason: 'unscored: protected until scoreActivity is authored',
-  };
+  // Case 3, and any unreadable tree: no measurable human signal at all. Report zero idle and
+  // protect, because "I cannot tell" must never render as "eight months dormant" — the reason
+  // string is the user's only insight, and a confident wrong number is worse than an
+  // admission of ignorance.
+  if (authoredMs <= 0) {
+    return { status: 'active', idleMs: 0, reason: 'no dates to score — protected' };
+  }
+
+  const idleMs = Math.max(0, nowMs - authoredMs);
+  const limitDays = signals.hasUncommittedChanges ? DIRTY_GRACE_DAYS : ACTIVE_DAYS;
+  const status = idleMs < limitDays * DAY ? 'active' : 'dormant';
+
+  // The reason names the signal that actually decided it, so a surprising verdict is
+  // debuggable from the interface alone.
+  const committed = signals.lastCommitMs ?? 0;
+  const edited = signals.newestSourceMs;
+  const what =
+    authoredMs === committed && committed >= edited
+      ? 'committed'
+      : authoredMs === edited
+        ? 'edited'
+        : 'dependencies changed';
+
+  const ago = `${what} ${humanize(idleMs)} ago`;
+  const reason = signals.hasUncommittedChanges
+    ? status === 'active'
+      ? `uncommitted changes, ${ago}`
+      : `uncommitted but ${ago} — past the ${DIRTY_GRACE_DAYS}-day grace`
+    : ago;
+
+  return { status, idleMs, reason };
+}
+
+/** Coarse, human-facing duration for the reason string. `ui/format.ts` owns the list column. */
+function humanize(ms: number): string {
+  const days = Math.floor(ms / DAY);
+  if (days < 1) return 'today';
+  if (days === 1) return '1 day';
+  if (days < 30) return `${days} days`;
+  if (days < 365) return `${Math.floor(days / 30)}mo`;
+  const years = Math.floor(days / 365);
+  return years === 1 ? '1 year' : `${years} years`;
 }
