@@ -7,24 +7,46 @@
     "disk-space",
     "node_modules",
     "build-artifacts",
-    "tui"
+    "tui",
+    "cli",
+    "trash",
+    "monorepo",
+    "ink"
   ],
   "license": "MIT",
+  "author": "Narayan <codevalley@live.com>",
+  "homepage": "https://github.com/codevalley/dev-cleaner#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/codevalley/dev-cleaner.git"
+  },
+  "bugs": {
+    "url": "https://github.com/codevalley/dev-cleaner/issues"
+  },
   "type": "module",
   "bin": {
     "dev-cleaner": "dist/cli.js"
   },
-  "main": "dist/cli.js",
+  "exports": {
+    "./package.json": "./package.json"
+  },
   "files": [
-    "dist"
+    "dist/**/*.js",
+    "dist/**/*.js.map",
+    "CHANGELOG.md",
+    "docs/*.md"
   ],
   "engines": {
     "node": ">=20"
   },
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "vitest run",
-    "typecheck": "tsc -p tsconfig.test.json"
+    "typecheck": "tsc -p tsconfig.test.json",
+    "prepack": "npm run build"
   },
   "dependencies": {
     "ink": "^5.0.1",

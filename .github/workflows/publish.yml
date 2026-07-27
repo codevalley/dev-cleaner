@@ -1,0 +1,109 @@
+# Publish dev-cleaner to npm.
+#
+# TRIGGER: a pushed version tag, and nothing else. This workflow does not run on pushes to
+# a branch, does not run on pull requests, and has no `workflow_dispatch` button — there is
+# no way to publish by accident, and a failed run is re-run from the Actions UI rather than
+# by adding a manual trigger.
+#
+# ── SECRET REQUIRED ───────────────────────────────────────────────────────────────────────
+#   NPM_TOKEN   an npm **Automation** token for the account that owns `dev-cleaner`.
+#               Automation, not Publish: an automation token bypasses 2FA, which a CI run
+#               cannot answer.
+#               Create:  npmjs.com → avatar → Access Tokens → Generate New Token →
+#                        Classic → Automation   (or a Granular token scoped to this package)
+#               Add:     GitHub repo → Settings → Secrets and variables → Actions →
+#                        New repository secret → name NPM_TOKEN
+#               Until that secret exists this workflow will fail at the publish step with
+#               ENEEDAUTH, after the tests have already passed.
+#
+# ── PROVENANCE ────────────────────────────────────────────────────────────────────────────
+#   `npm publish --provenance` attaches a signed statement linking the published tarball to
+#   this repository, this commit and this workflow run, which npm then displays on the
+#   package page. It needs three things, all of which are satisfied here:
+#     1. `id-token: write` permission (below);
+#     2. a public repository on a GitHub-hosted runner;
+#     3. a `repository` field in package.json pointing at this repo — it does.
+#   Provenance is requested with the flag rather than `publishConfig.provenance`, so that a
+#   manual emergency publish from a laptop still works instead of failing on an
+#   unsupported-environment error.
+
+name: Publish
+
+on:
+  push:
+    tags:
+      # v1.2.3 and v1.2.3-rc.1. A tag that is not a version does not publish.
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: publish to npm
+    # macOS because that is the platform the whole test suite is known to pass on; the
+    # suite runs here as the last gate before anything is published.
+    runs-on: macos-latest
+    timeout-minutes: 30
+
+    permissions:
+      contents: read
+      id-token: write # provenance
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+          cache: npm
+
+      # Same reasoning as ci.yml: the fixtures set their own identity, this is the belt to
+      # that pair of braces.
+      - name: Configure git identity for the fixtures
+        run: |
+          git config --global user.name 'dev-cleaner CI'
+          git config --global user.email 'ci@dev-cleaner.invalid'
+          git config --global init.defaultBranch main
+          git config --global commit.gpgsign false
+
+      - name: Install
+        run: npm ci
+
+      - name: Typecheck (src + tests)
+        run: npx tsc -p tsconfig.test.json
+
+      - name: Build
+        run: npm run build
+
+      - name: Smoke-test the built binary
+        run: node dist/cli.js --help
+
+      # A red suite means no publish. This tool deletes user data; the gate is not optional.
+      - name: Test
+        run: npm test
+
+      # Fail closed on a mistyped tag: v0.2.0 must not publish a package.json that still
+      # says 0.1.0. TAG_NAME goes through the environment rather than being interpolated
+      # into the script, so a tag name can never be shell.
+      - name: Refuse to publish unless the tag matches package.json
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          tagged="${TAG_NAME#v}"
+          declared="$(node -p 'require("./package.json").version')"
+          if [ "$tagged" != "$declared" ]; then
+            echo "tag is v$tagged but package.json declares $declared — refusing to publish" >&2
+            exit 1
+          fi
+          echo "tag v$tagged matches package.json $declared"
+
+      # `npm publish` runs the `prepack` script, which rebuilds dist from source, so the
+      # tarball is compiled from the tagged commit rather than from whatever happens to be
+      # sitting in the working directory.
+      - name: Publish
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

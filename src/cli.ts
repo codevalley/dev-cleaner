@@ -36,6 +36,10 @@ import type { EmptyTrashResult, TrashSummary } from './trash.js';
 import type { ExitSummary, RunOptions } from './ui/App.js';
 import type { DiskUsage } from './ui/diskbar.js';
 import { formatBytes } from './ui/format.js';
+// `ui/glyphs.js` is the one display module this file may import statically: it is the block
+// font and the wordmark with no React above them, so the goodbye can be drawn in the same face
+// the interface used without `--help` paying for a renderer it never mounts.
+import { WORDMARK, bigBytes } from './ui/glyphs.js';
 
 export const EXIT_OK = 0;
 export const EXIT_FAILURE = 1;
@@ -432,31 +436,128 @@ async function runStaticReport(
 }
 
 /**
- * One line on the way out, or nothing at all.
+ * Where the goodbye gets its geometry and its colour.
+ *
+ * Both default to the real terminal, because by this point there is nothing else to ask: Ink has
+ * unmounted, the component tree is gone, and the only thing left that knows how wide the screen
+ * is is `process.stdout`. Tests pass them explicitly so a rendering is reproducible on a
+ * machine whose terminal is 92 columns and on a CI worker whose stdout is a pipe.
+ */
+export interface ClosingLineOptions {
+  /** Columns available. Anything non-positive, or absent, means "no terminal to draw into". */
+  width?: number | undefined;
+  /** Whether ANSI colour may be emitted at all. */
+  color?: boolean | undefined;
+}
+
+/** Two columns, the same indent the round summary and the confirmation draw their banners at. */
+const CLOSING_INDENT = '  ';
+
+const ANSI = {
+  figure: '\u001B[1;32m',
+  mark: '\u001B[1;36m',
+  dim: '\u001B[2m',
+  reset: '\u001B[0m',
+} as const;
+
+/**
+ * Colour is a hint and never the carrier. Every line below says what it says with words and
+ * glyph shapes; `paint` only ever adds emphasis on top, and adds nothing at all when stdout is
+ * redirected — a log file full of escape sequences is a worse artefact than a plain one.
+ */
+function paint(text: string, code: string, color: boolean): string {
+  return color ? `${code}${text}${ANSI.reset}` : text;
+}
+
+/** The terminal's width, or `undefined` when there is no terminal to measure. */
+function closingWidth(width: number | undefined): number | undefined {
+  const columns = width ?? process.stdout.columns;
+  if (typeof columns !== 'number' || !Number.isFinite(columns) || columns <= 0) return undefined;
+  return Math.floor(columns);
+}
+
+/**
+ * The last thing the tool says, or nothing at all.
  *
  * The full per-target report used to be printed here, after the interface had already been
  * torn off the screen — which meant the moment the user most wanted to read carefully was the
  * moment the tool switched to a wall of plain text below a shell prompt. That report now
  * renders *inside* the interface, one round at a time, where it can be read next to the list
  * it describes and where the user can act on it. What is left for stdout is the thing a
- * terminal is genuinely good at: a single durable line that survives scrollback.
+ * terminal is genuinely good at: something short and durable that survives scrollback.
  *
- * It still carries invariant 8's disclosure, because the disclosure is the point: the bytes
- * are in the Trash, not back on the disk, until the Trash is emptied. When the user emptied it
- * from inside the interface that sentence would be false, so it is replaced rather than
- * softened.
+ * # The figure is the point
+ *
+ * This is the only part of the session that is still on the screen after the interface is gone,
+ * and the one number in it that a person actually wants is how much they got back. So it is
+ * drawn in the same block face the round summary and the confirmation use — `bigBytes`, one
+ * font for all three, because a tool that renders `47.2M` in three different shapes on three
+ * consecutive screens reads as three programs.
+ *
+ * The digits are then repeated as ordinary text on the caption line. That is not redundancy: a
+ * block glyph cannot be grepped out of scrollback, copied into a commit message, or read by
+ * anything that is not a pair of eyes, and the caption is what makes the number survive all
+ * three.
+ *
+ * # What it degrades to, and when
+ *
+ * A single plain line — the one this function used to return, unchanged — whenever the tall
+ * form cannot be drawn honestly:
+ *
+ * - **stdout is redirected.** No columns, no colour, no block face. `dev-cleaner … | tee log`
+ *   should put one greppable sentence in the log, not nine lines and an escape sequence.
+ * - **the terminal is too narrow** for the banner, or for either of the two sentences under it.
+ *   A banner that wraps is not a bigger number, it is a broken one, and the same goes for a
+ *   caption that folds onto a second line beneath it.
+ * - **nothing actually reached the Trash** — a round in which every target was refused still
+ *   counts as a round, and a five-row `0B` celebrating it would be grotesque.
+ *
+ * # What it may never say
+ *
+ * The headline is `trashedBytes`: what `applyRound` counted as *trashed*, never what was
+ * refused or failed. And it carries invariant 8's disclosure, because the disclosure is the
+ * point — the bytes are in the Trash, not back on the disk, until the Trash is emptied. When
+ * the user emptied it from inside the interface that sentence would be false, so it is replaced
+ * rather than softened.
  *
  * A session that cleaned nothing prints nothing. `dev-cleaner` used as a viewer must be as
  * quiet as `ls`.
  */
-export function renderClosingLine(summary: ExitSummary): string {
+export function renderClosingLine(
+  summary: ExitSummary,
+  options: ClosingLineOptions = {},
+): string {
   if (!summary.cleaned) return '';
 
+  const figure = formatBytes(summary.trashedBytes);
   const rounds = summary.rounds === 1 ? '1 round' : `${summary.rounds} rounds`;
   const tail = summary.trashEmptied
     ? 'The Trash was emptied, so that space is back.'
     : 'Trashed files still occupy the disk until you empty the Trash.';
-  return `dev-cleaner: ${formatBytes(summary.trashedBytes)} moved to the Trash in ${rounds}. ${tail}\n`;
+  const plain = `dev-cleaner: ${figure} moved to the Trash in ${rounds}. ${tail}\n`;
+
+  const width = closingWidth(options.width);
+  if (width === undefined || summary.trashedBytes <= 0) return plain;
+
+  const banner = bigBytes(summary.trashedBytes, width);
+  if (banner === undefined) return plain;
+
+  // The wordmark stands in for the `dev-cleaner:` prefix the plain line uses: after a
+  // full-screen interface has vanished, the scrollback still has to say which command left this
+  // behind.
+  const caption = `${WORDMARK} · ${figure} moved to the Trash in ${rounds}`;
+  const fits = (line: string): boolean => CLOSING_INDENT.length + line.length <= width;
+  if (!fits(caption) || !fits(tail)) return plain;
+
+  const color = options.color ?? process.stdout.isTTY === true;
+  return [
+    '',
+    ...banner.map((row) => paint(`${CLOSING_INDENT}${row}`, ANSI.figure, color)),
+    '',
+    `${paint(`${CLOSING_INDENT}${WORDMARK}`, ANSI.mark, color)}${caption.slice(WORDMARK.length)}`,
+    paint(`${CLOSING_INDENT}${tail}`, ANSI.dim, color),
+    '',
+  ].join('\n');
 }
 
 async function runInteractive(options: CliOptions, deps: MainDeps, io: CliIO): Promise<number> {

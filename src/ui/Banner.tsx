@@ -38,6 +38,7 @@ import { Box, Text } from 'ink';
 import React from 'react';
 
 import { formatBytes, truncateLabel } from './format.js';
+import { WORDMARK } from './glyphs.js';
 
 /**
  * The compact wordmark, for the workspace.
@@ -46,8 +47,12 @@ import { formatBytes, truncateLabel } from './format.js';
  * does in three characters, and a terminal that cannot draw them still prints the name. A tall
  * ASCII banner here would cost three rows of the list on every frame of a session; the tall
  * version lives on `Logo`, which is only ever drawn on a screen with nothing to compete with.
+ *
+ * The constant itself sits in `glyphs.ts`, with the block font, so that the closing line
+ * `cli.ts` prints after Ink has unmounted can sign itself with the same mark without importing
+ * React. Re-exported here because this is the module its callers know it by.
  */
-export const WORDMARK = '▓▒░ dev-cleaner';
+export { WORDMARK } from './glyphs.js';
 
 /** What `Logo` spells. Uppercase because the face has no lowercase. */
 export const LOGO_TEXT = 'DEV-CLEANER';

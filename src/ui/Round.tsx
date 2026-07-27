@@ -61,6 +61,7 @@ import { Box, Text } from 'ink';
 import React from 'react';
 
 import { BYTES_WIDTH, formatBytes, formatBytesPadded, padLabel, truncateLabel } from './format.js';
+import { bigBytes } from './glyphs.js';
 
 /** Beyond this the list is summarised; a report nobody can read is not one. */
 const MAX_PROBLEMS = 6;
@@ -70,88 +71,17 @@ const GIB = 1024 ** 3;
 /* ------------------------------------------------------------------------ *
  * Shared display primitives
  *
- * `bigBytes` and `promptBox` are used by this pane *and* by `Confirm`, which asks the
- * question this pane answers. They live here, next to the celebration they were written for,
- * and `Confirm` imports them rather than keeping a second copy of the font: two block fonts
- * that drift apart would show the same 107 G in two different shapes on two consecutive
- * screens, which is precisely the "half-TUI" incoherence this file exists to end.
+ * The block font is used by this pane, by `Confirm` — which asks the question this pane
+ * answers — and by the closing line `cli.ts` prints once Ink has gone. Two block fonts that
+ * drifted apart would show the same 107 G in two different shapes on two consecutive screens,
+ * which is precisely the "half-TUI" incoherence this file exists to end, so there is one.
+ *
+ * It lives in `glyphs.ts` rather than here only because `cli.ts` must be able to reach it
+ * without pulling React and Ink into `--help`; it is re-exported from this module because this
+ * is where its callers and its tests have always found it.
  * ------------------------------------------------------------------------ */
 
-/** Rows in the block font. Five is the smallest height at which 6, 8 and 0 stay distinct. */
-export const BIG_ROWS = 5;
-
-/**
- * A block font covering exactly the characters `formatBytes` can emit: the ten digits, the
- * decimal point, and the six unit letters. Nothing else — a glyph table that silently accepts
- * an unknown character would render it as a hole in the middle of the only number on screen.
- * `bigTextLines` returns `undefined` instead, and the caller falls back to plain text.
- *
- * Only `█` and the space are used. Half-blocks and box-drawing corners render at different
- * widths in enough terminals that a banner built from them can come out ragged, and a ragged
- * 107 G is worse than a blocky one.
- */
-const GLYPHS: Record<string, readonly string[]> = {
-  '0': ['███', '█ █', '█ █', '█ █', '███'],
-  '1': [' █ ', '██ ', ' █ ', ' █ ', '███'],
-  '2': ['███', '  █', '███', '█  ', '███'],
-  '3': ['███', '  █', '███', '  █', '███'],
-  '4': ['█ █', '█ █', '███', '  █', '  █'],
-  '5': ['███', '█  ', '███', '  █', '███'],
-  '6': ['███', '█  ', '███', '█ █', '███'],
-  '7': ['███', '  █', '  █', '  █', '  █'],
-  '8': ['███', '█ █', '███', '█ █', '███'],
-  '9': ['███', '█ █', '███', '  █', '███'],
-  // One column wide, so "3.4G" does not read as "3 4G" with a gap where the point should be.
-  '.': [' ', ' ', ' ', ' ', '█'],
-  B: ['██ ', '█ █', '██ ', '█ █', '██ '],
-  K: ['█ █', '██ ', '█  ', '██ ', '█ █'],
-  M: ['█ █', '███', '███', '█ █', '█ █'],
-  G: ['███', '█  ', '█ █', '█ █', '███'],
-  T: ['███', ' █ ', ' █ ', ' █ ', ' █ '],
-  P: ['███', '█ █', '███', '█  ', '█  '],
-};
-
-/**
- * `text` in the block font, one string per row, or `undefined` if any character is not in the
- * table. Rows are right-trimmed: they are drawn into a column-oriented layout, and trailing
- * blanks would only make the measured width disagree with the drawn one.
- *
- * Exactly one blank column separates every glyph, including the decimal point. Setting the
- * point tight against its neighbours was tried and is worse: `67.0G` comes out with the 7's
- * stem and the point fused into a single bar on the bottom row, which is a misread of the
- * tenths rather than merely an ugly one.
- */
-export function bigTextLines(text: string): readonly string[] | undefined {
-  const characters = [...text];
-  if (characters.length === 0) return undefined;
-
-  const rows: string[] = [];
-  for (let row = 0; row < BIG_ROWS; row += 1) {
-    const cells: string[] = [];
-    for (const character of characters) {
-      const glyph = GLYPHS[character];
-      if (glyph === undefined) return undefined;
-      cells.push(glyph[row] ?? '');
-    }
-    rows.push(cells.join(' ').trimEnd());
-  }
-  return rows;
-}
-
-/**
- * The banner for a byte count, or `undefined` when it will not fit in `width` — at which
- * point the caller shows the same figure as ordinary text. A banner that wraps is not a
- * bigger number, it is a broken one, so the fit is checked against the *drawn* width
- * including the two-column indent every caller uses.
- */
-export function bigBytes(bytes: number, width: number): readonly string[] | undefined {
-  const lines = bigTextLines(formatBytes(bytes));
-  if (lines === undefined) return undefined;
-
-  const drawn = lines.reduce((widest, line) => Math.max(widest, line.length), 0);
-  if (drawn === 0 || drawn + 2 > width) return undefined;
-  return lines;
-}
+export { BIG_ROWS, bigBytes, bigTextLines } from './glyphs.js';
 
 /**
  * A label and its size on one line, the size right-aligned into a fixed column.

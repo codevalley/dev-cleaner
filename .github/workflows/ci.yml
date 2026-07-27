@@ -1,0 +1,113 @@
+# Install, typecheck, build, test. Runs on every push to main and every pull request.
+#
+# The suite is not a set of mocks: it builds real temporary trees, runs the real `git`
+# binary, and measures real allocated bytes with `du`. So the runner needs `git` and `du`
+# on PATH (both are present on GitHub-hosted runners) and enough scratch space in the
+# temp directory for a few hundred megabytes of fixture files.
+#
+# Git identity: the fixtures already set it twice over — `GIT_AUTHOR_*`/`GIT_COMMITTER_*`
+# in the environment they hand to `execFile`, and a repo-local `git config user.name` /
+# `user.email` right after `git init`. The global config below is therefore redundant by
+# design, not load-bearing; it is here so that a future fixture that forgets one of those
+# does not fail on a clean runner while passing on the author's machine.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: node ${{ matrix.node }} · ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    # The ubuntu job is allowed to fail. See the comment on `required` below.
+    continue-on-error: ${{ !matrix.required }}
+    timeout-minutes: 20
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS is where dev-cleaner is developed and where the whole suite is known to
+        # pass; it is also the platform whose Trash the tool drives through Finder.
+        #
+        # `required: false` on Linux is an honest label, not pessimism. The package claims
+        # macOS, Linux and Windows in its cache table, but the suite has only ever been run
+        # green on macOS, and several tests touch things that differ by platform: `du`'s
+        # block accounting on ext4/overlayfs, case-sensitive path comparison, and the
+        # `trash` package's XDG implementation. This job exists to find out. The first time
+        # it goes green, delete `required` here and from the `continue-on-error` expression
+        # above, and Linux becomes a supported platform that CI actually defends.
+        include:
+          - { os: macos-latest, node: '20', required: true }
+          - { os: macos-latest, node: '22', required: true }
+          - { os: macos-latest, node: '24', required: true }
+          - { os: ubuntu-latest, node: '22', required: false }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Configure git identity for the fixtures
+        run: |
+          git config --global user.name 'dev-cleaner CI'
+          git config --global user.email 'ci@dev-cleaner.invalid'
+          git config --global init.defaultBranch main
+          git config --global commit.gpgsign false
+
+      - name: Install
+        run: npm ci
+
+      - name: Typecheck (src + tests)
+        run: npx tsc -p tsconfig.test.json
+
+      - name: Build
+        run: npm run build
+
+      # The packaged binary is the deliverable, so prove it runs from the compiled output
+      # before trusting a suite that imports TypeScript sources.
+      - name: Smoke-test the built binary
+        run: node dist/cli.js --help
+
+      - name: Test
+        run: npm test
+
+  # Fails if the tarball would ship sources, tests, or the internal design scaffolding in
+  # docs/superpowers/ — which is a packaging regression that no unit test can catch.
+  pack:
+    name: package contents
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      # `npm pack` runs the `prepack` script, so this builds dist as a side effect and
+      # exercises exactly the path `npm publish` will take.
+      - name: Pack
+        run: npm pack --dry-run --json > pack.json
+
+      - name: Assert the tarball contains what it should and nothing it should not
+        run: node .github/scripts/check-package.mjs pack.json

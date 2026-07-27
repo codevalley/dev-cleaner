@@ -20,8 +20,11 @@ import {
 } from '../src/cli.js';
 import { SafetyError } from '../src/types.js';
 import type { CacheEntry, Category, CleanOutcome, Preset, Project } from '../src/types.js';
+import { BIG_ROWS, WORDMARK, bigTextLines } from '../src/ui/glyphs.js';
 
+const MB = 1024 ** 2;
 const GB = 1024 ** 3;
+const TB = 1024 ** 4;
 const DAY = 24 * 60 * 60 * 1000;
 
 const CATEGORIES: Record<Preset, Set<Category>> = {
@@ -363,8 +366,11 @@ describe('main', () => {
       expect(io.out()).toContain('8.0G');
       expect(io.out()).toMatch(/empty/i);
 
-      // One line, not a report: the round's detail lives in the interface now.
-      expect(io.out().trimEnd().split('\n')).toHaveLength(1);
+      // A goodbye, not a report: the per-target detail lives in the interface now. Asserted as
+      // the absence of the outcome's own label rather than as a line count, because the shape
+      // of the goodbye depends on the terminal it is printed into and this test has no terminal.
+      expect(io.out()).not.toContain('pnpm store');
+      expect(io.out().trimEnd().split('\n').length).toBeLessThanOrEqual(9);
 
       const quitIO = fakeIO(true);
       const quit = stubDeps(quitIO);
@@ -372,28 +378,55 @@ describe('main', () => {
       expect(quitIO.out()).toBe('');
     });
 
+    /**
+     * The goodbye has two shapes and they are not alternatives: one is what a person reads and
+     * one is what a log file keeps, and every claim either of them makes has to be true in both.
+     *
+     * So each fact below is asserted against `plain` (stdout redirected — no width, no colour)
+     * *and* against `drawn` (a terminal with room for the block face). A property that only
+     * held in the shape a test happened to pick would be a property the tool does not have.
+     */
     describe('the closing line', () => {
-      const summary = (over: Partial<Parameters<typeof renderClosingLine>[0]> = {}) =>
-        renderClosingLine({
-          cleaned: true,
-          outcomes: [],
-          trashedBytes: 8 * GB,
-          rounds: 1,
-          trashEmptied: false,
-          ...over,
-        });
+      type Summary = Parameters<typeof renderClosingLine>[0];
+
+      const SESSION: Summary = {
+        cleaned: true,
+        outcomes: [],
+        trashedBytes: 8 * GB,
+        rounds: 1,
+        trashEmptied: false,
+      };
+
+      /** Redirected stdout: a width of zero is "there is no terminal to draw into". */
+      const plain = (over: Partial<Summary> = {}): string =>
+        renderClosingLine({ ...SESSION, ...over }, { width: 0, color: false });
+
+      /** A terminal with room. Colour off by default so the text can be asserted directly. */
+      const drawn = (over: Partial<Summary> = {}, width = 92): string =>
+        renderClosingLine({ ...SESSION, ...over }, { width, color: false });
+
+      /** Both shapes, for the facts that must not depend on which one is printed. */
+      const both = (over: Partial<Summary> = {}): string[] => [plain(over), drawn(over)];
+
+      const lines = (text: string): string[] => text.trimEnd().split('\n');
 
       it('says nothing at all when the session cleaned nothing', () => {
-        // `dev-cleaner` used as a viewer must be as quiet as `ls`.
-        expect(summary({ cleaned: false })).toBe('');
-        expect(summary({ cleaned: false, trashedBytes: 8 * GB })).toBe('');
+        // `dev-cleaner` used as a viewer must be as quiet as `ls`. Not even in a terminal wide
+        // enough to draw a banner, and not even when bytes are somehow sitting in the field.
+        expect(plain({ cleaned: false })).toBe('');
+        expect(drawn({ cleaned: false })).toBe('');
+        expect(drawn({ cleaned: false, trashedBytes: 8 * GB })).toBe('');
       });
 
       it('counts the session, not the round, and pluralises what it counts', () => {
-        expect(summary({ trashedBytes: 12 * GB, rounds: 3 })).toContain('12.0G');
-        expect(summary({ trashedBytes: 12 * GB, rounds: 3 })).toContain('3 rounds');
-        expect(summary({ rounds: 1 })).toContain('1 round');
-        expect(summary({ rounds: 1 })).not.toContain('1 rounds');
+        for (const text of both({ trashedBytes: 12 * GB, rounds: 3 })) {
+          expect(text).toContain('12.0G');
+          expect(text).toContain('3 rounds');
+        }
+        for (const text of both({ rounds: 1 })) {
+          expect(text).toContain('1 round');
+          expect(text).not.toContain('1 rounds');
+        }
       });
 
       /**
@@ -402,14 +435,175 @@ describe('main', () => {
        * to empty an empty Trash looking for bytes they already have.
        */
       it('drops the disclosure exactly when the user has already emptied the Trash', () => {
-        expect(summary()).toMatch(/empty the Trash/i);
-        expect(summary({ trashEmptied: true })).not.toMatch(/until you empty/i);
-        expect(summary({ trashEmptied: true })).toMatch(/emptied/i);
+        for (const text of both()) expect(text).toMatch(/empty the Trash/i);
+        for (const text of both({ trashEmptied: true })) {
+          expect(text).not.toMatch(/until you empty/i);
+          expect(text).toMatch(/emptied/i);
+        }
       });
 
-      it('is one line, terminated, so it cannot run into a shell prompt', () => {
-        expect(summary()).toMatch(/\n$/);
-        expect(summary().trimEnd().split('\n')).toHaveLength(1);
+      it('is one terminated line when stdout is redirected, so a log gets one grep', () => {
+        expect(plain()).toBe(
+          'dev-cleaner: 8.0G moved to the Trash in 1 round. ' +
+            'Trashed files still occupy the disk until you empty the Trash.\n',
+        );
+        expect(lines(plain())).toHaveLength(1);
+      });
+
+      it('draws the figure in the interface’s own block face when there is room for it', () => {
+        // The same `bigTextLines` the round summary and the confirmation draw with — one font,
+        // so `8.0G` is the same shape on the screen before this one and on this one.
+        const glyphs = bigTextLines('8.0G') ?? [];
+        expect(glyphs).toHaveLength(BIG_ROWS);
+
+        const rendered = lines(drawn());
+        for (const row of glyphs) expect(rendered).toContain(`  ${row}`);
+        expect(rendered.filter((line) => line.includes('█'))).toHaveLength(BIG_ROWS);
+      });
+
+      it('repeats the figure as text, because a glyph cannot be grepped or copied', () => {
+        expect(drawn()).toContain('8.0G moved to the Trash in 1 round');
+      });
+
+      it('signs itself, so scrollback says which command left this behind', () => {
+        expect(drawn()).toContain(WORDMARK);
+        expect(plain()).toContain('dev-cleaner:');
+      });
+
+      /**
+       * Invariant 8 in the tall shape. The disclosure is a whole line of its own there rather
+       * than a clause at the end of a sentence, and a banner with no caveat under it is exactly
+       * the overstatement the invariant exists to prevent.
+       */
+      it('keeps the Trash disclosure on its own line under the banner', () => {
+        expect(lines(drawn())).toContain(
+          '  Trashed files still occupy the disk until you empty the Trash.',
+        );
+        expect(lines(drawn({ trashEmptied: true }))).toContain(
+          '  The Trash was emptied, so that space is back.',
+        );
+      });
+
+      /**
+       * The headline is `trashedBytes` and nothing else. A session that trashed 2 G while an
+       * 8 G store prune was refused must not put 10 G — or 8 G — anywhere near the figure.
+       */
+      it('never reads the outcomes: the headline is the trashed figure it was handed', () => {
+        const withRefusal: Partial<Summary> = {
+          trashedBytes: 2 * GB,
+          outcomes: [
+            {
+              target: { kind: 'cache' as const, cache: CACHE },
+              label: 'pnpm store',
+              bytes: 8 * GB,
+              outcome: 'refused' as const,
+              refusal: 'store-prune-unsafe',
+            },
+          ],
+        };
+        for (const text of both(withRefusal)) {
+          expect(text).toContain('2.0G');
+          expect(text).not.toContain('8.0G');
+          expect(text).not.toContain('10.0G');
+          expect(text).not.toContain('pnpm store');
+        }
+      });
+
+      it('falls back to the single line rather than wrap a banner in a narrow terminal', () => {
+        for (const width of [1, 10, 20, 40, 60]) {
+          expect(drawn({}, width), `width ${width}`).toBe(plain());
+        }
+      });
+
+      it('falls back when a round happened but nothing reached the Trash', () => {
+        // `cleaned` is `rounds > 0`, so a round in which every target was refused arrives here
+        // with a zero figure. Five rows of `0B` would be a celebration of nothing.
+        const nothing = drawn({ trashedBytes: 0 });
+        expect(nothing).toBe(plain({ trashedBytes: 0 }));
+        expect(nothing).not.toContain('█');
+      });
+
+      it('never draws a line wider than the terminal it was given', () => {
+        for (const bytes of [512, 47.2 * MB, 8 * GB, 107 * GB, 3 * TB]) {
+          for (let width = 20; width <= 120; width += 1) {
+            for (const rounds of [1, 12]) {
+              const text = drawn({ trashedBytes: bytes, rounds }, width);
+              // The plain fallback is one sentence and is allowed to wrap; the tall shape is a
+              // drawing, and a drawing that wraps is broken.
+              if (!text.includes('█')) continue;
+              for (const line of lines(text)) {
+                expect(line.length, `${bytes} bytes at ${width} columns: ${line}`).toBeLessThanOrEqual(width);
+              }
+            }
+          }
+        }
+      });
+
+      it('ends with exactly one newline, so it cannot run into the shell prompt', () => {
+        for (const text of [plain(), drawn()]) {
+          expect(text.endsWith('\n')).toBe(true);
+          expect(text.endsWith('\n\n')).toBe(false);
+        }
+      });
+
+      /**
+       * Colour is a hint. Strip every escape sequence and the rendering has to be identical to
+       * the one a redirected stdout gets — nothing may be said in colour alone — and a
+       * redirected stdout must never see an escape sequence at all.
+       */
+      it('adds colour only as emphasis, and only when it is allowed to', () => {
+        const colored = renderClosingLine(SESSION, { width: 92, color: true });
+        const stripped = colored.replace(/\u001B\[[0-9;]*m/g, '');
+
+        expect(colored).toContain('\u001B[');
+        expect(stripped).toBe(drawn());
+        expect(drawn()).not.toContain('\u001B[');
+        expect(plain()).not.toContain('\u001B[');
+      });
+
+      /**
+       * The shipped call site passes no options at all — there is no component tree left to ask
+       * by then — so the defaults are the behaviour, and they are what this asserts.
+       */
+      describe('when it is not told, it asks the real terminal', () => {
+        const withStdout = (
+          columns: number | undefined,
+          isTTY: boolean | undefined,
+          run: () => void,
+        ): void => {
+          const target = process.stdout as unknown as Record<string, unknown>;
+          const saved = {
+            columns: Object.getOwnPropertyDescriptor(target, 'columns'),
+            isTTY: Object.getOwnPropertyDescriptor(target, 'isTTY'),
+          };
+          const restore = (key: 'columns' | 'isTTY'): void => {
+            const descriptor = saved[key];
+            if (descriptor === undefined) delete target[key];
+            else Object.defineProperty(target, key, descriptor);
+          };
+          Object.defineProperty(target, 'columns', { value: columns, configurable: true });
+          Object.defineProperty(target, 'isTTY', { value: isTTY, configurable: true });
+          try {
+            run();
+          } finally {
+            restore('columns');
+            restore('isTTY');
+          }
+        };
+
+        it('draws the tall shape, in colour, into a real terminal', () => {
+          withStdout(100, true, () => {
+            const text = renderClosingLine(SESSION);
+            expect(text).toContain('█');
+            expect(text).toContain('\u001B[');
+          });
+        });
+
+        it('prints the one plain line into a pipe, with no escape sequences', () => {
+          withStdout(undefined, undefined, () => {
+            expect(renderClosingLine(SESSION)).toBe(plain());
+          });
+        });
       });
     });
   });
