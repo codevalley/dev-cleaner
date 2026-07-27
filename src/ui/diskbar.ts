@@ -62,7 +62,26 @@ export interface BarSegment {
  */
 export const TRASH_CAVEAT = 'Trashed files still occupy the disk until you empty the Trash.';
 
-/** Glyphs for the three segments, left to right. Exported so tests need not hard-code them. */
+/**
+ * The three segments, in the order they are drawn — the single source of that order.
+ *
+ * `barSegments` builds its result from this, and `BAR_LEGEND` reads the legend off it, so the
+ * legend cannot end up describing the segments in an order the bar does not use.
+ */
+export const SEGMENT_ORDER: readonly BarKind[] = ['used', 'reclaim', 'free'];
+
+/**
+ * Glyphs for the three segments, left to right. Exported so tests need not hard-code them.
+ *
+ * These are a *monotone ink ramp*: FULL BLOCK is 100% coverage, DARK SHADE about 75%, LIGHT
+ * SHADE about 25%. That ordering is the load-bearing part, not the specific characters. It is
+ * what makes the bar readable with colour stripped entirely — on a terminal with no colour, in
+ * a greyscale screenshot, or to a reader who cannot separate the hues — and it is why the
+ * three segments must never be unified onto one glyph and told apart by colour alone. The
+ * ramp is asserted in `ui.diskbar.test.ts` against the Unicode block elements' nominal
+ * coverage, so a "tidy-up" that flattens it fails rather than quietly removing the only
+ * channel that always works.
+ */
 export const SEGMENT_GLYPHS: Record<BarKind, string> = {
   used: '█',
   reclaim: '▓',
@@ -175,7 +194,7 @@ function apportion(parts: readonly number[], whole: number, width: number): numb
  */
 export function barSegments(usage: DiskUsage, reclaiming: number, width: number): BarSegment[] {
   const cells = Math.max(0, Number.isFinite(width) ? Math.floor(width) : 0);
-  const kinds: readonly BarKind[] = ['used', 'reclaim', 'free'];
+  const kinds = SEGMENT_ORDER;
   if (cells === 0) return kinds.map((kind) => ({ kind, width: 0 }));
 
   const total = Math.max(0, finite(usage.total));

@@ -17,7 +17,7 @@ import { promisify } from 'node:util';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { currentCacheEnv, listCaches } from '../src/caches.js';
-import { scanAll, scanStream, type ScanEvent, type ScanOptions } from '../src/scan.js';
+import { countNodeModules, scanAll, scanStream, type ScanEvent, type ScanOptions } from '../src/scan.js';
 import type { CacheEntry, Category, Project } from '../src/types.js';
 import { dir, file, fixture, type Fixture } from './fixture.js';
 
@@ -425,6 +425,91 @@ describe('scanStream', () => {
       }
     });
 
+    /**
+     * The count, threaded from the walk to the table.
+     *
+     * `listCaches` can establish *that* the store is still held — it asks the filesystem —
+     * but it has never walked a project and cannot know how many `node_modules` are sitting
+     * there holding it. This is the one place both facts are in scope, and without the
+     * hand-off the refusal a user reads is "a node_modules still links into it": which rule
+     * fired, and nothing they can act on. (The real report was 31 of them, and a "why?".)
+     */
+    it('tells the cache table how many node_modules the walk found', async () => {
+      const { f, restore } = await homeWithStore();
+      try {
+        for (const [index, store] of STORE_DIRS.entries()) {
+          await link(
+            f.path('home', ...store.split('/'), 'files', 'aa', 'blob'),
+            f.path('home', `outside-node_modules-${index}`),
+          );
+        }
+        // Three projects, three node_modules — and one `dist`, so the count is of
+        // node_modules rather than of artifacts or of projects.
+        for (const name of ['beta', 'gamma', 'delta']) {
+          await mkdir(f.path('projects', name, 'node_modules', 'dep'), { recursive: true });
+          await writeFile(f.path('projects', name, 'package.json'), `{ "name": "${name}" }\n`);
+          await writeFile(
+            f.path('projects', name, 'node_modules', 'dep', 'index.js'),
+            Buffer.alloc(512),
+          );
+        }
+
+        const store = storeOf(
+          await collect(
+            options([f.path('projects')], {
+              includeCaches: true,
+              presetCategories: RECOMMENDED,
+            }),
+          ),
+        );
+
+        // `alpha` has no node_modules, so this is 3 and not 4.
+        expect(store?.blocked?.reason).toContain('3 node_modules found in this scan');
+        expect(store?.note).toContain('3 found in this scan');
+      } finally {
+        restore();
+      }
+    });
+
+    /**
+     * Counted whatever the preset, because the count is a fact about the disk rather than
+     * about the run. Under `recommended` the `deps` category is off and no `node_modules` is
+     * a target at all — which is precisely when the store is refused, and precisely when the
+     * user needs to know how many are holding it. Counting only what this run would trash
+     * would report zero in the one configuration nearly every user runs.
+     */
+    it('counts node_modules the active preset will not touch', async () => {
+      const { f, restore } = await homeWithStore();
+      try {
+        for (const [index, store] of STORE_DIRS.entries()) {
+          await link(
+            f.path('home', ...store.split('/'), 'files', 'aa', 'blob'),
+            f.path('home', `outside-node_modules-${index}`),
+          );
+        }
+        await mkdir(f.path('projects', 'alpha', 'node_modules', 'dep'), { recursive: true });
+        await writeFile(
+          f.path('projects', 'alpha', 'node_modules', 'dep', 'index.js'),
+          Buffer.alloc(512),
+        );
+
+        const reasons = await Promise.all(
+          [RECOMMENDED, ALL].map(
+            async (presetCategories) =>
+              storeOf(
+                await collect(
+                  options([f.path('projects')], { includeCaches: true, presetCategories }),
+                ),
+              )?.blocked?.reason,
+          ),
+        );
+
+        for (const reason of reasons) expect(reason).toContain('1 node_modules found in this scan');
+      } finally {
+        restore();
+      }
+    });
+
     it('describes the store in terms of the preset that is actually running', async () => {
       const { f, restore } = await homeWithStore();
       try {
@@ -475,6 +560,54 @@ describe('scanStream', () => {
       [f.path('one/alpha'), f.path('two/beta')].sort(),
     );
     for (const project of projects) expectComplete(project);
+  });
+});
+
+/**
+ * The same count, for a consumer that already holds the projects.
+ *
+ * The interface needs it on the confirmation screen — "31 node_modules still link into it"
+ * rather than "a node_modules still links into it" — and by then the scan has finished and
+ * the number it handed the cache table is long gone. Exported rather than re-derived at the
+ * call site because three modules already spell out what a `node_modules` is, and a fourth
+ * spelling is a fourth chance to disagree with the one invariant 5 reasons about.
+ */
+describe('countNodeModules', () => {
+  it('counts them across projects, and counts nothing else', async () => {
+    const f = await tree({
+      'projects/alpha/package.json': '{ "name": "alpha" }\n',
+      'projects/alpha/node_modules/dep/index.js': file('n', { size: 512 }),
+      'projects/alpha/dist/bundle.js': file('d', { size: 512 }),
+      'projects/beta/package.json': '{ "name": "beta" }\n',
+      'projects/beta/node_modules/dep/index.js': file('n', { size: 512 }),
+      'projects/gamma/Cargo.toml': '[package]\nname = "gamma"\n',
+      'projects/gamma/target/debug/gamma': file('t', { size: 512 }),
+    });
+
+    const projects = projectsOf(await collect(options([f.path('projects')])));
+
+    expect(projects).toHaveLength(3);
+    // Two node_modules among five artifacts: `dist` and `target` are build output, and a
+    // count of artifacts or of projects would be three.
+    expect(countNodeModules(projects)).toBe(2);
+    expect(countNodeModules([])).toBe(0);
+  });
+
+  it('agrees with the number the stream hands the cache table', async () => {
+    const f = await tree({
+      'projects/alpha/package.json': '{ "name": "alpha" }\n',
+      'projects/alpha/node_modules/dep/index.js': file('n', { size: 512 }),
+      'projects/beta/package.json': '{ "name": "beta" }\n',
+      'projects/beta/node_modules/dep/index.js': file('n', { size: 512 }),
+      'projects/delta/package.json': '{ "name": "delta" }\n',
+      'projects/delta/node_modules/dep/index.js': file('n', { size: 512 }),
+    });
+
+    const result = await scanAll(options([f.path('projects')]));
+
+    // Three projects, three node_modules — the same 3 `scanStream` puts in the store's
+    // reason. Two numbers for one fact, on two screens, is how they come to disagree.
+    expect(countNodeModules(result.projects)).toBe(3);
   });
 });
 

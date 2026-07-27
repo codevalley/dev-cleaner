@@ -14,6 +14,8 @@
  * non-TTY report path and for tests.
  */
 
+import path from 'node:path';
+
 import { gatherSignals, scoreActivity, type ActivitySignals } from './activity.js';
 import { currentCacheEnv, listCaches, type CacheListOptions } from './caches.js';
 import { discover } from './discover.js';
@@ -153,6 +155,40 @@ async function enrich(discovered: DiscoveredProject, options: ScanOptions): Prom
 }
 
 /**
+ * How many `node_modules` this project contributes to the count the store row is described
+ * with.
+ *
+ * By basename, exactly as `clean.ts`, `cli.ts` and `report.ts` identify one — the four have
+ * to agree about what a `node_modules` is or the number shown to the user is not the number
+ * invariant 5 is reasoning about.
+ *
+ * Deliberately *not* filtered by the preset's categories. The walk always looks for the
+ * widest set, and under `recommended` no `node_modules` is cleaned at all — which is
+ * precisely when the store is refused and precisely when the user needs to be told how many
+ * of them are holding it. Counting only what this run would trash would report zero in the
+ * one configuration nearly every user runs.
+ */
+function nodeModulesIn(project: Project): number {
+  return project.artifacts.filter(
+    (artifact) => path.basename(artifact.path) === 'node_modules',
+  ).length;
+}
+
+/**
+ * The same count over a set of projects already in hand.
+ *
+ * `scanStream` accumulates it as the walk goes and hands it to the cache table, which is
+ * what puts the number into the store's note and its blocked reason. A consumer holding the
+ * finished projects — the TUI, which needs it for the confirmation screen's store refusal —
+ * asks here rather than re-deriving it, because "what counts as a `node_modules`" is already
+ * spelled out in three modules and a fourth spelling is a fourth chance to disagree with the
+ * one invariant 5 reasons about.
+ */
+export function countNodeModules(projects: readonly Project[]): number {
+  return projects.reduce((total, project) => total + nodeModulesIn(project), 0);
+}
+
+/**
  * Yields each project as soon as it is fully enriched, then the global caches when asked
  * for, then exactly one `done`. `done` is always last and always present, including on an
  * empty scan, so a consumer can drive a spinner off it without special-casing.
@@ -161,16 +197,27 @@ async function enrich(discovered: DiscoveredProject, options: ScanOptions): Prom
  * deliberately: refusing to scan `/` or `$HOME` is not a per-project failure to swallow.
  */
 export async function* scanStream(options: ScanOptions): AsyncGenerator<ScanEvent> {
+  // Accumulated as projects go by rather than by re-walking: the caches are listed after the
+  // last project, so by then this is a complete count of what the walk saw.
+  let nodeModulesFound = 0;
+
   for await (const discovered of discover(options.roots, options.categories)) {
-    yield { kind: 'project', project: await enrich(discovered, options) };
+    const project = await enrich(discovered, options);
+    nodeModulesFound += nodeModulesIn(project);
+    yield { kind: 'project', project };
   }
 
   if (options.includeCaches) {
     // The one place a cache can be marked unsafe *before* it is offered: `listCaches`
     // screens the package store here, so the default selection, the report total and the
     // interface all agree with what `clean.ts` would do at the boundary.
-    const cacheOptions: CacheListOptions =
-      options.presetCategories === undefined ? {} : { categories: options.presetCategories };
+    //
+    // The count goes with it. `listCaches` can establish *that* the store is still held —
+    // it asks the filesystem — but only the walk knows how many `node_modules` are sitting
+    // there holding it, and "a node_modules still links into it" is a refusal a user cannot
+    // act on. This is the one place both facts are in scope at once.
+    const cacheOptions: CacheListOptions = { nodeModulesFound };
+    if (options.presetCategories !== undefined) cacheOptions.categories = options.presetCategories;
     for (const cache of await listCaches(currentCacheEnv(), cacheOptions)) {
       yield { kind: 'cache', cache };
     }

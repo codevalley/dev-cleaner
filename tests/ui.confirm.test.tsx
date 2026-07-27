@@ -65,6 +65,9 @@ interface Props {
   bytes?: number;
   blockedBytes?: number;
   width?: number;
+  height?: number;
+  nodeModulesFound?: number;
+  trashesNodeModules?: boolean;
 }
 
 /** Renders with the totals derived from the lists, so a test states only what it varies. */
@@ -81,6 +84,13 @@ function show(props: Props = {}): string {
         props.blockedBytes ?? blockedEntries.reduce((sum, item) => sum + item.bytes, 0)
       }
       width={props.width ?? WIDTH}
+      {...(props.height === undefined ? {} : { height: props.height })}
+      {...(props.nodeModulesFound === undefined
+        ? {}
+        : { nodeModulesFound: props.nodeModulesFound })}
+      {...(props.trashesNodeModules === undefined
+        ? {}
+        : { trashesNodeModules: props.trashesNodeModules })}
     />,
   );
   rendered.push(instance);
@@ -213,6 +223,327 @@ describe('blocked rows are shown, not merely subtracted', () => {
     expect(frame).toContain('…and 8 more');
     expect(frame).not.toContain('kept-13');
     expect(frame).toContain('14.0G across 14 directories');
+  });
+});
+
+/**
+ * The refusal a real user actually hit, and asked about.
+ *
+ * They selected the pnpm store — 7.5 G, the biggest single row on their machine — and the
+ * confirmation answered "Blocked · 1 item · 7.5G — not in the total above / a node_modules
+ * still links into it". The verdict was right: 31 `node_modules` were still on disk and the
+ * store still held files with a link count above one, so pruning it would have orphaned
+ * hardlinks across every one of those projects. Invariant 5, working exactly as intended.
+ *
+ * The *message* was the defect. It named the rule that fired and nothing a person can do:
+ * not how many, not what to do about it, and — the part the interface had never explained —
+ * not that cleaning `node_modules` is insufficient on its own, because this tool trashes
+ * rather than deletes and a trashed directory keeps its hardlinks. Their reply was "why?",
+ * which is one step from deciding the tool is broken.
+ *
+ * So these hold the three properties a refusal needs to survive being read by the person it
+ * refuses: a number they can picture, a sequence they can follow, and a first step that is
+ * true of the preset they are actually running.
+ */
+describe('the store refusal says how many, and what to do', () => {
+  const store = (bytes = 8 * GB): BlockedEntry =>
+    blocked('pnpm store', bytes, 'store-prune-unsafe');
+
+  /** The reason line: the one directly under the row it explains. */
+  const reasonUnder = (frame: string, label: string): string => {
+    const body = lines(frame);
+    return (body[body.findIndex((line) => line.includes(label)) + 1] ?? '').trim();
+  };
+
+  it('states the number of node_modules the scan found', () => {
+    const frame = show({
+      entries: [entry('npm cache', 2 * GB)],
+      blocked: [store(7.5 * GB)],
+      nodeModulesFound: 31,
+    });
+
+    expect(reasonUnder(frame, 'pnpm store')).toBe('31 node_modules still link into it');
+    // The singular implied one directory somebody could go and find. There were 31.
+    expect(frame).not.toContain('a node_modules still links into it');
+  });
+
+  it('invents no number when the scan counted none', () => {
+    for (const found of [undefined, 0]) {
+      const frame = show({
+        entries: [entry('npm cache', 2 * GB)],
+        blocked: [store()],
+        ...(found === undefined ? {} : { nodeModulesFound: found }),
+      });
+
+      // A store the probe reports as held is held by *something*, so a count of zero is a
+      // count from outside the scanned roots — not a contradiction to print on screen. What
+      // is left is the phrase this line carried before the count existed, and the advice
+      // below it, which needs no count to be true.
+      expect(reasonUnder(frame, 'pnpm store')).toBe('a node_modules still links into it');
+      expect(frame).not.toContain('0 node_modules');
+      expect(frame).toContain('clean node_modules');
+    }
+  });
+
+  /**
+   * The subtlety the interface had never stated. Trashing is a rename (invariant 4): the
+   * `node_modules` is in the Trash and its hardlinks into the store are exactly as they
+   * were. Advice that stops at "clean node_modules" sends the user round the loop a second
+   * time to be refused again for a reason they were never told about.
+   */
+  it('names emptying the Trash as a step, in every preset', () => {
+    for (const trashesNodeModules of [true, false, undefined]) {
+      const frame = show({
+        entries: [entry('npm cache', 2 * GB)],
+        blocked: [store()],
+        ...(trashesNodeModules === undefined ? {} : { trashesNodeModules }),
+      });
+
+      expect(frame, `preset deps=${String(trashesNodeModules)}`).toMatch(/empty the Trash|empty Trash/);
+      expect(frame, `preset deps=${String(trashesNodeModules)}`).toMatch(/run again|rerun/);
+    }
+  });
+
+  it('tells a recommended-preset user to switch preset first, since deps are excluded', () => {
+    const frame = show({
+      entries: [entry('npm cache', 2 * GB)],
+      blocked: [store()],
+      nodeModulesFound: 31,
+      trashesNodeModules: false,
+    });
+
+    // They have not asked for node_modules to be cleaned at all yet, so that is step one —
+    // and `p` is the key that does it, after `esc`, because this screen takes only
+    // `enter`, `esc` and `q`.
+    expect(frame).toContain('esc, p for aggressive');
+    expect(frame).toContain('node_modules');
+    expect(frame).toContain('empty the Trash');
+  });
+
+  it('never tells an aggressive-preset user to switch to the preset they are on', () => {
+    const frame = show({
+      entries: [entry('npm cache', 2 * GB)],
+      blocked: [store()],
+      nodeModulesFound: 31,
+      trashesNodeModules: true,
+    });
+
+    // Advice a user has already followed reads as the tool not knowing what it is doing —
+    // strictly worse than saying nothing.
+    expect(frame).not.toContain('aggressive');
+    expect(frame).not.toContain('esc, p');
+    // What is actually left to do: the hardlinks their trashed node_modules still hold.
+    expect(frame).toContain('Trashing keeps their hardlinks');
+    expect(frame).toContain('empty the Trash (t), then run again.');
+  });
+
+  it('claims nothing about a preset it was not told', () => {
+    const frame = show({
+      entries: [entry('npm cache', 2 * GB)],
+      blocked: [store()],
+      nodeModulesFound: 31,
+    });
+
+    expect(frame).toContain('clean node_modules');
+    expect(frame).not.toContain('aggressive');
+    expect(frame).not.toContain('this preset');
+  });
+
+  it('says none of it when no store is blocked', () => {
+    const frame = show({
+      entries: [entry('npm cache', 2 * GB)],
+      blocked: [blocked('tinysync/target', 67 * GB, 'contains-repository')],
+      nodeModulesFound: 31,
+      trashesNodeModules: false,
+    });
+
+    expect(frame).toContain('holds a git repository');
+    expect(frame).not.toContain('node_modules');
+    expect(frame).not.toContain('empty the Trash (t)');
+  });
+
+  it('costs the pane nothing when no store is blocked', () => {
+    // Not merely unsaid: unreserved. The rows the advice would have taken are taken from the
+    // banner first, so a refusal with nothing to advise about must not cost the figure its
+    // block font on a terminal that could still hold it. (24 rows is the size where the two
+    // answers differ; below it the banner is gone either way.)
+    const frame = show({
+      entries: [entry('npm cache', 2 * GB)],
+      blocked: [blocked('tinysync/target', 67 * GB, 'contains-repository')],
+      nodeModulesFound: 31,
+      trashesNodeModules: false,
+      height: 24,
+    });
+
+    expect(bannerRowsOn(frame, '2.0G')).toBe(BIG_ROWS);
+  });
+
+  it('is never on screen without the row it explains', () => {
+    // Five refusals, the store last: the blocked list is capped, so the row it is about is
+    // behind "…and 1 more blocked". Advice hanging under a summary line is advice about
+    // something the user cannot see.
+    const frame = show({
+      entries: [entry('npm cache', 2 * GB)],
+      blocked: [
+        ...Array.from({ length: 4 }, (_, index) =>
+          blocked(`blocked-${index}`, GB, 'symlink'),
+        ),
+        store(),
+      ],
+      nodeModulesFound: 31,
+      trashesNodeModules: false,
+    });
+
+    expect(frame).toContain('…and 1 more blocked');
+    expect(frame).not.toContain('pnpm store');
+    expect(frame).not.toContain('aggressive');
+    expect(frame).not.toContain('clean node_modules');
+  });
+
+  /**
+   * Half an instruction is not an instruction. This pane clips every line it draws, which is
+   * right for a directory name — the user can still tell which one it is — and wrong for a
+   * sentence telling them which keys to press: `empty the Tra…` is a puzzle on a screen
+   * whose next keystroke deletes things.
+   */
+  it('drops the advice whole rather than clip it', () => {
+    /** Anything only the advice says — the words a clipped instruction would end mid-way. */
+    const ADVICE = /aggressive|Trash \(t\)|run again|hardlinks/;
+
+    for (const width of [16, 24, 36, 56]) {
+      const frame = show({
+        entries: [entry('npm cache', 2 * GB)],
+        blocked: [store()],
+        nodeModulesFound: 31,
+        trashesNodeModules: false,
+        width,
+      });
+
+      for (const line of lines(frame)) {
+        expect(line.length, `"${line}" at ${width} columns`).toBeLessThanOrEqual(width + 2);
+        // Half an instruction is not an instruction: `esc, p for aggres…` is a puzzle on the
+        // screen whose next keystroke deletes things.
+        if (ADVICE.test(line)) {
+          expect(line.endsWith('…'), `"${line}" at ${width} columns`).toBe(false);
+        }
+      }
+    }
+  });
+
+  it('says nothing at all in a pane too narrow to say it in', () => {
+    const narrow = (refusal: Refusal): string =>
+      show({
+        entries: [entry('npm cache', 2 * GB)],
+        blocked: [blocked('pnpm store', 8 * GB, refusal)],
+        nodeModulesFound: 31,
+        trashesNodeModules: false,
+        width: 16,
+      });
+
+    // Dropped, not clipped — and the difference is *rows*, which is the only way to tell a
+    // dropped instruction from one truncated into an unreadable stub. The control is the
+    // same pane refused for a reason that has nothing to advise.
+    expect(lines(narrow('store-prune-unsafe')).length).toBe(lines(narrow('symlink')).length);
+    expect(narrow('store-prune-unsafe')).not.toContain('aggressive');
+    // The refusal itself still survives — it is the row's own second line, and it is short.
+    expect(narrow('store-prune-unsafe')).toContain('31 node_m');
+  });
+
+  it('falls back to a shorter form before it falls back to silence', () => {
+    const frame = show({
+      entries: [entry('npm cache', 2 * GB)],
+      blocked: [store()],
+      nodeModulesFound: 31,
+      trashesNodeModules: false,
+      width: 36,
+    });
+
+    // Too narrow for the sentence, wide enough for the steps. Each line is whole.
+    expect(frame).toContain('esc, p for aggressive;');
+    expect(frame).toContain('empty the Trash;');
+    expect(frame).toContain('then run again.');
+  });
+
+  /**
+   * The advice is rows, and rows are what the duplicated-header defect was made of: Ink
+   * redraws by clearing the lines it previously wrote, so a pane one line taller than its
+   * terminal leaves that line on screen for good.
+   */
+  it('takes its rows out of the pane rather than adding them to it', () => {
+    /** The same pane, blocked by something that has nothing to advise about. */
+    const control = (height: number): string =>
+      show({
+        entries: Array.from({ length: 9 }, (_, index) => entry(`kept-${index}`, GB)),
+        blocked: [
+          blocked('other-cache', 8 * GB, 'symlink'),
+          blocked('tinysync/target', 67 * GB, 'contains-repository'),
+        ],
+        height,
+      });
+
+    for (const height of [12, 16, 20, 24, 30, 40]) {
+      const frame = show({
+        entries: Array.from({ length: 9 }, (_, index) => entry(`kept-${index}`, GB)),
+        blocked: [store(), blocked('tinysync/target', 67 * GB, 'contains-repository')],
+        nodeModulesFound: 31,
+        trashesNodeModules: false,
+        height,
+      });
+
+      // Never taller than the budget, and never taller than the same pane without a word of
+      // advice in it: whatever rows it occupies come out of the list, the way the banner's
+      // do. (The pane has a floor of its own — a question, a figure and a framed choice —
+      // below which no allocation here can take it, which is what the second bound allows
+      // for on the shortest terminals.)
+      expect(lines(frame).length, `${height} rows`).toBeLessThanOrEqual(
+        Math.max(height, lines(control(height)).length),
+      );
+      // And it never wins its rows by evicting the question or the answer.
+      expect(frame, `${height} rows`).toContain('Move to Trash?');
+      expect(frame, `${height} rows`).toMatch(/enter\s+yes/);
+    }
+  });
+
+  it('is shown when the terminal can seat it, and dropped when it cannot', () => {
+    const at = (height: number): string =>
+      show({
+        entries: Array.from({ length: 9 }, (_, index) => entry(`kept-${index}`, GB)),
+        blocked: [store(), blocked('tinysync/target', 67 * GB, 'contains-repository')],
+        nodeModulesFound: 31,
+        trashesNodeModules: false,
+        height,
+      });
+
+    // Room to spare: the advice is there, and so is every blocked row it is about.
+    expect(at(30)).toContain('esc, p for aggressive');
+    expect(at(30)).toContain('pnpm store');
+    // No room at all: the refusal and its size survive, the advice does not. A pane already
+    // down to one entry and one blocked row has nothing left for the advice to displace.
+    expect(at(12)).not.toContain('aggressive');
+    expect(at(12)).toContain('pnpm store');
+  });
+
+  /**
+   * The advice explains a row. An earlier draft reserved its rows before the blocked list
+   * was allocated, which on a short terminal pushed the store row itself off the pane — two
+   * rows spent explaining something the user could no longer see, under "…and 1 more
+   * blocked".
+   */
+  it('never costs the store row its own place on the screen', () => {
+    const frame = show({
+      entries: Array.from({ length: 9 }, (_, index) => entry(`kept-${index}`, GB)),
+      blocked: [blocked('tinysync/target', 67 * GB, 'contains-repository'), store()],
+      nodeModulesFound: 31,
+      trashesNodeModules: false,
+      height: 20,
+    });
+
+    // Both refusals are still named — which is what this pane rendered before there was any
+    // advice to fit, and what it must still render now that there is.
+    expect(frame).toContain('pnpm store');
+    expect(frame).toContain('tinysync/target');
+    // And whichever way the budget fell, the advice is never on screen without its row.
+    expect(frame.includes('aggressive') && !frame.includes('pnpm store')).toBe(false);
   });
 });
 

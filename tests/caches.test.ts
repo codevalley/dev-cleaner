@@ -495,6 +495,111 @@ describe('listCaches — what the store’s note claims about the run', () => {
   });
 });
 
+/**
+ * A refusal a user cannot act on reads as the tool being broken.
+ *
+ * The shipped refusal was "node_modules elsewhere on this machine still hardlink into it …
+ * so pruning it would orphan those links". True, and the verdict behind it is invariant 5
+ * working exactly as designed — but a user who had selected 7.5 G of pnpm store read the
+ * short form of it on the confirmation screen and replied "why?". It says which rule fired.
+ * It does not say how many, and it does not say what to do.
+ *
+ * Both halves are added here, and both are worded to stay *true* under the thing that makes
+ * this hard: the probe's fact is machine-wide (some file under the store has a link count
+ * above one, wherever its other name lives) while the count is scoped to the roots that were
+ * walked. They are stated side by side, attributed, rather than merged into one claim
+ * neither can support.
+ */
+describe('listCaches — a store refusal the user can act on', () => {
+  const STORE = { 'home/Library/pnpm/store/files/aa/blob': file('p', { size: 4096 }) } as const;
+  const RECOMMENDED_CATEGORIES = new Set<Category>(['build', 'cache']);
+  const AGGRESSIVE_CATEGORIES = new Set<Category>(['build', 'deps', 'cache']);
+
+  async function storeFor(
+    f: Fixture,
+    options: { found?: number; categories?: ReadonlySet<Category>; referenced?: boolean } = {},
+  ): Promise<CacheEntry> {
+    const entries = await listCaches(envFor(f, 'darwin'), {
+      ...(options.found === undefined ? {} : { nodeModulesFound: options.found }),
+      ...(options.categories === undefined ? {} : { categories: options.categories }),
+      probeStore: async () => options.referenced ?? true,
+    });
+    return entryFor(entries, 'pnpm-store');
+  }
+
+  it('says how many node_modules the scan found, and whose count it is', async () => {
+    const f = await tree({ ...STORE });
+    const store = await storeFor(f, { found: 31 });
+
+    expect(store.blocked?.reason).toContain('31 node_modules found in this scan');
+    expect(store.note).toContain('31 found in this scan');
+  });
+
+  it('states no count when the scan supplied none, rather than inventing a zero', async () => {
+    const f = await tree({ ...STORE });
+
+    for (const found of [undefined, 0]) {
+      const store = await storeFor(f, found === undefined ? {} : { found });
+
+      // A store the probe reports as held is held by *something*. "0 node_modules" beside it
+      // would be a contradiction; the uncounted wording already says "elsewhere".
+      expect(store.blocked?.reason).not.toContain('0 node_modules');
+      expect(store.note).not.toContain('0 found');
+      expect(store.blocked?.reason).toContain('node_modules elsewhere on this machine');
+    }
+  });
+
+  /**
+   * The step the interface had never explained, and the reason "just delete node_modules"
+   * does not work: trashing is a rename (invariant 4), so a `node_modules` in the Trash
+   * still holds every hardlink it held before. Advice that stops at "clean node_modules"
+   * sends the user round the loop to be refused a second time for a reason nobody told them.
+   */
+  it('names emptying the Trash as a step, and says why it is one', async () => {
+    const f = await tree({ ...STORE });
+    const reason = (await storeFor(f, { found: 31 })).blocked?.reason ?? '';
+
+    expect(reason).toContain('clean node_modules');
+    expect(reason).toContain('empty the Trash');
+    expect(reason).toContain('a trashed node_modules keeps its hardlinks');
+    expect(reason).toContain('pruned on the next run');
+  });
+
+  it('gives the same advice whatever the preset, since the fix does not depend on it', async () => {
+    const f = await tree({ ...STORE });
+    const reasons = await Promise.all(
+      [RECOMMENDED_CATEGORIES, AGGRESSIVE_CATEGORIES, undefined].map(async (categories) =>
+        (await storeFor(f, { found: 31, ...(categories === undefined ? {} : { categories }) }))
+          .blocked?.reason,
+      ),
+    );
+
+    expect(new Set(reasons).size).toBe(1);
+    for (const reason of reasons) expect(reason).toContain('empty the Trash');
+  });
+
+  it('says nothing to act on when there is nothing to act on', async () => {
+    const f = await tree({ ...STORE });
+    const store = await storeFor(f, { found: 31, referenced: false });
+
+    // Unblocked. Advice attached to a row that is not refused is noise, and the count is
+    // beside the point once nothing links into the store.
+    expect('blocked' in store).toBe(false);
+    expect(store.note).toContain('nothing on this machine still links into it');
+    expect(store.note).not.toContain('empty the Trash');
+  });
+
+  it('adds the Trash step to the note of the one preset that trashes node_modules', async () => {
+    const f = await tree({ ...STORE });
+
+    const aggressive = await storeFor(f, { found: 31, categories: AGGRESSIVE_CATEGORIES });
+    // `aggressive` does trash them — and the old note stopped there, which reads as a
+    // promise that this run frees the store. It does not: the links go to the Trash intact.
+    expect(aggressive.note).toContain('trashes those first');
+    expect(aggressive.note).toContain('store stays until you empty the Trash');
+  });
+});
+
 describe('currentCacheEnv', () => {
   it('reports the running platform, home directory and process environment', async () => {
     const f = await tree({ 'home/.npm/_cacache/blob': file('n', { size: 1024 }) });

@@ -55,6 +55,24 @@ export interface CacheListOptions {
    * hardlinked store on disk.
    */
   probeStore?: ((storePath: string) => Promise<boolean>) | undefined;
+  /**
+   * How many `node_modules` the scan just found on disk, threaded in by `scan.ts`.
+   *
+   * The probe answers *whether* the store is still held; this answers *how much there is to
+   * do about it*. "A node_modules still links into it" tells a user which rule fired and
+   * nothing they can act on — they cannot picture it, cannot estimate the work, and the one
+   * report of this refusal from a real session was a question ("why?"), which is what a
+   * refusal nobody can act on always produces.
+   *
+   * Attributed to the scan wherever it is printed, never asserted as a machine-wide census:
+   * the probe's fact is machine-wide (some file under the store has `st_nlink > 1`, wherever
+   * its other name lives) and this count is scoped to the roots that were walked. The two
+   * are stated side by side rather than merged into one claim neither can support.
+   *
+   * Omitted by callers with no scan to speak for. Zero reads the same as omitted — a store
+   * demonstrably still linked from *somewhere* is not explained by printing "0".
+   */
+  nodeModulesFound?: number | undefined;
 }
 
 /** A table row before it is checked against the disk: everything but `bytes`. */
@@ -290,13 +308,48 @@ export async function storeHasIncomingHardlinks(
 }
 
 /**
+ * The scan's `node_modules` count, when it is one worth stating.
+ *
+ * Zero and a missing count collapse to the same thing on purpose. A store the probe reports
+ * as held is held by *something*, and printing "0 node_modules" beside it would state a
+ * contradiction — the honest reading of a zero is "nothing in the roots I walked", which the
+ * uncounted wording already says.
+ */
+function countedNodeModules(found: number | undefined): number | undefined {
+  if (found === undefined || !Number.isFinite(found) || found < 1) return undefined;
+  return Math.floor(found);
+}
+
+/**
  * Why the store cannot be pruned on this run. Worded as the machine-wide fact it is, since
  * that is what a user has to act on: the fix is to remove the `node_modules` elsewhere, not
  * to change anything about this run.
  */
-const STORE_BLOCKED_REASON =
+const STORE_BLOCKED_CAUSE =
   'node_modules elsewhere on this machine still hardlink into it (or it could not be ' +
   'fully checked), so pruning it would orphan those links';
+
+/**
+ * The half the refusal was missing: what to do about it.
+ *
+ * The sequence is not obvious and the interface had never stated it. Cleaning `node_modules`
+ * is *not* sufficient on its own, because this tool trashes rather than deletes (invariant
+ * 4) and a trashed directory keeps every hardlink it had — the files are in the Trash, still
+ * pointing at the same store inodes. So emptying the Trash is a step, not an afterthought,
+ * and the store cannot be pruned until it has happened.
+ */
+const STORE_BLOCKED_FIX =
+  'clean node_modules, then empty the Trash — a trashed node_modules keeps its hardlinks ' +
+  '— and the store can be pruned on the next run';
+
+function storeBlockedReason(found: number | undefined): string {
+  const counted = countedNodeModules(found);
+  const cause =
+    counted === undefined
+      ? STORE_BLOCKED_CAUSE
+      : `${STORE_BLOCKED_CAUSE} (${counted} node_modules found in this scan)`;
+  return `${cause}; ${STORE_BLOCKED_FIX}`;
+}
 
 /**
  * The rest of the store's note, which is a claim about *this run* and so cannot be a
@@ -304,15 +357,25 @@ const STORE_BLOCKED_REASON =
  * and was simply false under the default preset, where `deps` is excluded and no
  * `node_modules` is trashed at all.
  */
-function storeNote(referenced: boolean, trashesDeps: boolean | undefined): string {
+function storeNote(
+  referenced: boolean,
+  trashesDeps: boolean | undefined,
+  found: number | undefined,
+): string {
   if (!referenced) return `${NOTE.pnpm} — nothing on this machine still links into it`;
+
+  const counted = countedNodeModules(found);
+  // Parenthesised rather than joined with a second dash: the clause after the dash is the
+  // claim about the run, and a sentence with two dashes reads as two claims of equal rank.
+  const head = counted === undefined ? NOTE.pnpm : `${NOTE.pnpm} (${counted} found in this scan)`;
+
   if (trashesDeps === true) {
-    return `${NOTE.pnpm} — this preset trashes those first, but trashing keeps their hardlinks, so the store stays`;
+    return `${head} — this preset trashes those first, but trashing keeps their hardlinks, so the store stays until you empty the Trash`;
   }
   if (trashesDeps === false) {
-    return `${NOTE.pnpm} — this preset does not trash node_modules, so the store stays`;
+    return `${head} — this preset does not trash node_modules, so the store stays`;
   }
-  return `${NOTE.pnpm} — some still link into it, so the store stays`;
+  return `${head} — some still link into it, so the store stays`;
 }
 
 /** The store row's note and, when it cannot be pruned, the reason it cannot. */
@@ -330,8 +393,10 @@ async function describeStore(
     referenced = true;
   }
 
-  const note = storeNote(referenced, options.categories?.has('deps'));
-  return referenced ? { note, blocked: { reason: STORE_BLOCKED_REASON } } : { note };
+  const note = storeNote(referenced, options.categories?.has('deps'), options.nodeModulesFound);
+  return referenced
+    ? { note, blocked: { reason: storeBlockedReason(options.nodeModulesFound) } }
+    : { note };
 }
 
 /** The environment of the running process, in the shape `listCaches` consumes. */

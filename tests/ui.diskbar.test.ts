@@ -23,6 +23,7 @@ import { describe, expect, it } from 'vitest';
 import {
   SEGMENT_GLYPHS,
   SEGMENT_LABELS,
+  SEGMENT_ORDER,
   TRASH_CAVEAT,
   barSegments,
   diskLabels,
@@ -240,6 +241,67 @@ describe('the projection, and its caveat', () => {
     expect(SEGMENT_LABELS.free).toBe('free');
     expect(SEGMENT_LABELS.reclaim).toBe('this selection');
     for (const glyph of Object.values(SEGMENT_GLYPHS)) expect([...glyph]).toHaveLength(1);
+  });
+});
+
+/**
+ * The glyphs are the channel that always works, so the ramp is checked, not assumed.
+ *
+ * Colour is an accelerant here and nothing more: a terminal may have none, a screenshot may be
+ * greyscale, and a reader may not separate the hues the gauge picks. What remains in all three
+ * cases is ink coverage, and it only remains useful while the three glyphs differ in it. The
+ * coverage figures below are the Unicode block elements' own definitions, not dev-cleaner's,
+ * which is what makes this a check rather than a restatement.
+ */
+describe('the glyph ramp, which is what survives when colour does not', () => {
+  const INK: Record<string, number> = {
+    '█': 1.0, // U+2588 FULL BLOCK
+    '▓': 0.75, // U+2593 DARK SHADE
+    '▒': 0.5, // U+2592 MEDIUM SHADE
+    '░': 0.25, // U+2591 LIGHT SHADE
+  };
+
+  it('draws every segment with a block element of known coverage', () => {
+    for (const kind of SEGMENT_ORDER) {
+      expect(Object.keys(INK), `${kind} uses ${SEGMENT_GLYPHS[kind]}`).toContain(SEGMENT_GLYPHS[kind]);
+    }
+  });
+
+  it('falls monotonically from solid to sparse across the three segments', () => {
+    // Used is the densest and free the sparsest, so a fuller disk is a heavier line even with
+    // the colour switched off. Flatten this ramp — unify the glyphs and separate the segments
+    // by hue alone — and the bar becomes unreadable for everyone the ramp exists for.
+    const coverage = SEGMENT_ORDER.map((kind) => INK[SEGMENT_GLYPHS[kind]] ?? 0);
+    for (let index = 1; index < coverage.length; index += 1) {
+      expect(coverage[index], `${SEGMENT_ORDER.join(' → ')} is not a descending ramp`).toBeLessThan(
+        coverage[index - 1] ?? 0,
+      );
+    }
+  });
+
+  it('separates every pair of segments by coverage, not only neighbours', () => {
+    for (const a of SEGMENT_ORDER) {
+      for (const b of SEGMENT_ORDER) {
+        if (a === b) continue;
+        expect(SEGMENT_GLYPHS[a], `${a} and ${b} render identically`).not.toBe(SEGMENT_GLYPHS[b]);
+      }
+    }
+  });
+});
+
+describe('SEGMENT_ORDER is the one source of the draw order', () => {
+  it('is the order barSegments returns, so a legend built from it cannot desync', () => {
+    const segments = barSegments(usage(100 * GB, 50 * GB), 10 * GB, 20);
+    expect(segments.map((segment) => segment.kind)).toEqual([...SEGMENT_ORDER]);
+    expect(barSegments(usage(100 * GB, 50 * GB), 0, 0).map((segment) => segment.kind)).toEqual([
+      ...SEGMENT_ORDER,
+    ]);
+  });
+
+  it('covers every segment kind exactly once', () => {
+    expect(new Set(SEGMENT_ORDER).size).toBe(SEGMENT_ORDER.length);
+    expect(Object.keys(SEGMENT_GLYPHS).sort()).toEqual([...SEGMENT_ORDER].sort());
+    expect(Object.keys(SEGMENT_LABELS).sort()).toEqual([...SEGMENT_ORDER].sort());
   });
 });
 
