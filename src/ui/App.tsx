@@ -1021,6 +1021,12 @@ export function App({
             selection={selection}
             width={listWidth - 4}
             view={view}
+            // Without this the network/offline pair — 2 of the 6 chip kinds — can never
+            // appear in the list, the surface they were built for. `chipsOf` drops them
+            // when `categories` is undefined, because "needs network" is false under a
+            // preset that does not clean node_modules and a chip that guesses is worse
+            // than no chip. The value was already computed and already handed to Detail.
+            categories={categories}
           />
         </Box>
         {/* Narrow terminals get the list at full width rather than two squeezed panes.

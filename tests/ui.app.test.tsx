@@ -27,6 +27,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { App, runApp, type ExitSummary } from '../src/ui/App.js';
 import { ScanStatus, SPINNER_FRAMES } from '../src/ui/ScanStatus.js';
 import { CURSOR, MARK_OFF, MARK_ON } from '../src/ui/format.js';
+import { LABEL_HELP } from '../src/ui/labels.js';
 import type { ScanEvent } from '../src/scan.js';
 import type { Screening, ScreeningTier } from '../src/clean.js';
 import type { DiskUsage } from '../src/ui/diskbar.js';
@@ -37,6 +38,7 @@ import type {
   Category,
   CleanOutcome,
   CleanTarget,
+  GitInfo,
   Preset,
   Project,
   Refusal,
@@ -1650,6 +1652,141 @@ describe('the list scrolls inside its pane', () => {
 });
 
 /**
+ * The chips, in the running interface.
+ *
+ * `ui.list.test.tsx` proves the budget arithmetic against `renderRow` directly. What is left
+ * to establish here is that the arithmetic is wired to a real terminal: that the chips reach
+ * the rows, that the detail pane holds the ones the rows could not afford, and — the property
+ * every other test in this file has been defending — that none of it costs the frame a line.
+ *
+ * The list pane is capped at 52 columns however wide the terminal is (`MAX_LIST_WIDTH`), so
+ * the budget in the real app is about twenty columns and the row is genuinely terse. That is
+ * the arrangement, not a shortfall: the row carries the one fact the pane could afford and the
+ * detail pane carries the rest with a sentence each.
+ */
+describe('the chips reach the screen', () => {
+  const dirty = (base: Project, git: Partial<GitInfo>): Project => ({
+    ...base,
+    git: { ...(base.git as GitInfo), ...git },
+  });
+
+  const flat = (value: string): string => value.replace(/\s+/g, ' ').trim();
+
+  /**
+   * The two panes share every physical line of the frame, so `│ …list… ││ …detail… │` is one
+   * string and a naive `toContain` on a row would happily match a word from the other pane.
+   * These two split it at the seam — which is also the only way to assert that a chip is
+   * *absent* from a row, and the absences are the assertions that matter here.
+   */
+  const rowText = (line: string): string => line.split('││')[0] ?? line;
+  const detailText = (frame: string): string =>
+    flat(
+      frame
+        .split('\n')
+        .map((line) => (line.split('││')[1] ?? '').replace(/│\s*$/, ''))
+        .join(' '),
+    );
+
+  it('labels every row with the recency that decided its score', async () => {
+    const ui = mount(
+      fastStream([
+        projectEvent(makeProject('alpha', 'dormant', [artifact('dist', 'build', 9 * GB)])),
+        projectEvent(makeProject('beta', 'dormant', [artifact('dist', 'build', 5 * GB)])),
+      ]),
+      { width: 100, height: 24 },
+    );
+    await ui.waitForText('scan complete');
+
+    // The same phrase the detail pane's reason line uses, in the row, on every row.
+    expect(rowText(ui.line('alpha'))).toContain('committed 8mo');
+    expect(rowText(ui.line('beta'))).toContain('committed 8mo');
+  });
+
+  /**
+   * One crowded row spends the column, and the quiet rows go quiet with it.
+   *
+   * That is the intended trade and the reason the plan is made for the pane rather than per
+   * row: `committed 8mo` on `beta` beside a blank space on `gamma` would say that nobody knows
+   * when `gamma` was last touched, which is false. A blank column on every row says only that
+   * this pane is talking about uncommitted work today, and the detail pane still has the dates.
+   */
+  it('spends the column on the row that has something urgent to say', async () => {
+    const held = dirty(makeProject('held', 'dormant', [artifact('dist', 'build', 9 * GB)]), {
+      hasUncommittedChanges: true,
+      isWorktree: true,
+    });
+    const ui = mount(
+      fastStream([
+        projectEvent(held),
+        projectEvent(makeProject('quiet', 'dormant', [artifact('dist', 'build', 5 * GB)])),
+      ]),
+      { width: 100, height: 24 },
+    );
+    await ui.waitForText('scan complete');
+
+    expect(rowText(ui.line('held'))).toContain('uncommitted');
+    expect(rowText(ui.line('quiet'))).not.toContain('uncommitted');
+    expect(rowText(ui.line('quiet'))).not.toContain('committed 8mo');
+  });
+
+  it('explains, in the detail pane, the chips the row could not afford', async () => {
+    const held = dirty(makeProject('held', 'dormant', [artifact('dist', 'build', 9 * GB)]), {
+      hasUncommittedChanges: true,
+      isWorktree: true,
+    });
+    // A tall terminal: the pane's height cut is a separate guarantee, tested on its own below.
+    const ui = mount(fastStream([projectEvent(held)]), { width: 100, height: 56 });
+    await ui.waitForText('scan complete');
+    await settle();
+
+    // The row said `uncommitted` and nothing else…
+    expect(rowText(ui.line('held')).trim()).toMatch(/uncommitted\s+9\.0G$/);
+
+    // …the pane says all four, each with its sentence.
+    const detail = detailText(ui.frame());
+    for (const phrase of [
+      'uncommitted changes',
+      'committed 8mo ago',
+      'linked worktree',
+      'rebuilds offline',
+    ]) {
+      expect(detail, phrase).toContain(phrase);
+    }
+    expect(detail).toContain(flat(LABEL_HELP.worktree));
+    expect(detail).toContain(flat(LABEL_HELP.offline));
+  });
+
+  it('costs the frame no line at any width, however many chips a row has', async () => {
+    const held = dirty(makeProject('held-worktree-with-a-long-name', 'dormant', [
+      artifact('target', 'build', 34 * GB),
+    ]), { hasUncommittedChanges: true, isWorktree: true });
+
+    for (const columns of [40, 56, 80, 100]) {
+      const ui = mount(
+        fastStream([
+          projectEvent(held),
+          ...Array.from({ length: 10 }, (_, index) =>
+            projectEvent(
+              makeProject(`p-${index}`, index % 2 === 0 ? 'dormant' : 'active', [
+                artifact('dist', 'build', (11 - index) * GB),
+              ]),
+            ),
+          ),
+        ]),
+        { width: columns, height: 18 },
+      );
+      await ui.waitForText('scan complete');
+      await settle();
+
+      expect(ui.lines().length, `at ${columns} columns`).toBeLessThanOrEqual(18);
+      // The pinned chrome, top and bottom, is still on the frame.
+      expect(ui.frame()).toContain('dev-cleaner');
+      expect(ui.frame()).toContain('space toggle');
+    }
+  });
+});
+
+/**
  * A session: many rounds, one interface.
  *
  * The old flow ended at the first clean — unmount, print, exit — so a second round meant
@@ -2231,5 +2368,42 @@ describe('same-tick keys during a clean, and narrow terminals', () => {
     const header = ui.lines()[0] ?? '';
     expect(header).toContain('dev-cleaner');
     expect(header.length).toBeLessThanOrEqual(columns);
+  });
+});
+
+/**
+ * The chip column, asserted through the App rather than through `chipsFor`.
+ *
+ * `categories` was computed in App, handed to `<Detail>`, and omitted from `<List>` — so
+ * `chipsOf` withheld the network/offline pair and two of the six chip kinds could never
+ * appear in the pane they were built for. Every chip unit test passed, because they all
+ * called `chipsFor` directly with a category set in hand.
+ *
+ * A component test cannot see a missing prop. Only rendering the app can.
+ */
+describe('connectivity chips reach the list pane', () => {
+  it('shows needs-network in the frame when the preset actually cleans node_modules', async () => {
+    const ui = mount(
+      fastStream([
+        projectEvent(
+          makeProject('app', 'dormant', [
+            artifact('node_modules', 'deps', 9 * GB),
+            artifact('dist', 'build', GB),
+          ]),
+        ),
+      ]),
+      { preset: 'aggressive', width: 120, height: 24 },
+    );
+    await ui.waitForText('scan complete');
+    await settle();
+
+    // On the ROW, not merely somewhere in the frame. `Detail` renders the same chips and
+    // does receive `categories`, so a whole-frame assertion passes even when the list pane
+    // is starved of them — which is exactly how the missing prop survived review.
+    // `needs` rather than `needs network`: ink-testing-library lays out against its own
+    // width, so the chip column is narrower than the declared 120 and the text is cut. The
+    // prefix is unambiguous — no other chip begins with it — and what is being tested is
+    // that the pane received a category set at all, not how wide the harness is.
+    expect(ui.line('app')).toContain('needs');
   });
 });

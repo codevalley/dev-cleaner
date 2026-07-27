@@ -20,6 +20,21 @@
  * "selected by default" total, because a total that includes something the tool will then
  * refuse is a promise it does not keep.
  *
+ * ## Why the report carries the interface's chips
+ *
+ * Every project row prints the labels `ui/labels.ts` derives — why the row is being held back
+ * and what clearing it would cost. Not because the report needs decoration, but because a
+ * piped report and an interactive session disagreeing about a row is the exact divergence
+ * class this file's header already complains about twice: the report is built from the same
+ * `buildRows`, the same `defaultSelection`, and now the same `labelsFor`, so there is no
+ * second opinion for the two views to differ on. The static report is also the mode a cautious
+ * user reaches for first, because it cannot delete; sending them the *less* informative view
+ * would be exactly backwards.
+ *
+ * The chips are rendered in their `long` form and the activity reason they duplicate is
+ * dropped — see `residualReason`. Anything else and the row would state one fact three times
+ * in three registers, which is how a label row stops being read at all.
+ *
  * ## Where the `[-]` rows come from
  *
  * Two screens, and only one of them is written here. `CacheEntry.blocked` arrives with the
@@ -43,6 +58,8 @@ import { screenTargets, screenTargetsCheaply } from './clean.js';
 import type { Screening, ScreeningOptions } from './clean.js';
 import type { CacheEntry, Category, CleanOutcome, CleanTarget, Preset, Project } from './types.js';
 import { formatBytes, formatIdle } from './ui/format.js';
+import { LABEL_SEPARATOR, labelsFor } from './ui/labels.js';
+import type { Label } from './ui/labels.js';
 import {
   buildRows,
   defaultSelection,
@@ -106,11 +123,118 @@ function plural(count: number, noun: string): string {
   return `${count} ${noun}${count === 1 ? '' : 's'}`;
 }
 
-function projectMeta(project: Project): string {
+/**
+ * The word `scoreActivity` uses for a dirty tree, in both of the sentences it builds around it:
+ * `uncommitted changes, edited 8 days ago` while the grace still applies, and
+ * `uncommitted but edited 100 days ago — past the 90-day grace` once it has run out. The chip
+ * says `uncommitted changes` in either case, so both spellings have to come out.
+ */
+const UNCOMMITTED_PHRASE = /\buncommitted(?: changes)?\b/;
+
+/** Punctuation and conjunctions left stranded when a clause is lifted out of the middle. */
+const STRANDED_HEAD = /^[\s,;·—–-]*(?:but|and)?[\s,;·—–-]*/;
+const STRANDED_TAIL = /[\s,;·—–-]*$/;
+
+/**
+ * What `activity.reason` still has to say once the chips have said their part.
+ *
+ * The reason and two of the chips are renderings of one fact: `labels.ts` builds the recency
+ * chip's `long` by copying the phrase *verbatim* out of this very string, and the `uncommitted`
+ * chip out of the word in front of it. Printing both would put `uncommitted changes, edited 8
+ * days ago` on one line and `uncommitted changes · edited 8 days ago` on the next — the same
+ * sentence twice, one line apart, which teaches the eye that this part of the row is filler.
+ *
+ * So the duplicated clauses are removed and whatever the scorer said *beyond* them is kept.
+ * Removing rather than suppressing the whole line is the load-bearing choice: the residue is
+ * not always empty, and when it is not, it is the most decision-relevant thing on the row.
+ *
+ * - `uncommitted changes, edited 8 days ago` → nothing left; the chips said all of it.
+ * - `uncommitted but edited 100 days ago — past the 90-day grace` → `past the 90-day grace`,
+ *   which is the answer to "why is this dirty project checked?" and no chip carries it.
+ * - `dependencies changed 5 days ago` → kept whole. There is deliberately no lockfile chip
+ *   (`labels.ts` explains why), so this line is the only place that signal is ever stated.
+ * - `no dates to score — protected` → kept whole. "I cannot tell" is not a chip and must not
+ *   silently become one.
+ */
+function residualReason(reason: string, labels: readonly Label[]): string {
+  let rest = reason;
+  for (const label of labels) {
+    if (label.kind === 'uncommitted') rest = rest.replace(UNCOMMITTED_PHRASE, '');
+    // `long` is the matched phrase itself, so this is a literal removal of literal duplication.
+    else if (label.kind === 'recency') rest = rest.replace(label.long, '');
+  }
+  return rest
+    .replace(STRANDED_HEAD, '')
+    .replace(STRANDED_TAIL, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
+/**
+ * Type, verdict, and whatever the reason still adds.
+ *
+ * The age survives the chips on purpose. `dormant 8mo` is the *verdict and its magnitude* —
+ * the thing that decided which section this row is in and whether it starts checked — while
+ * `edited 8mo ago` names *which signal* produced it. They share a number and assert different
+ * facts, and the one that would be dropped is the one the preselection turns on.
+ */
+function projectMeta(project: Project, labels: readonly Label[]): string {
   const types = [...project.types].sort().join(', ');
   const { status, idleMs, reason } = project.activity;
   const age = status === 'dormant' ? `dormant ${formatIdle(idleMs)}` : 'active';
-  return [types, age, reason].filter((part) => part.length > 0).join(' · ');
+  const rest = residualReason(reason, labels);
+  return [types, age, rest].filter((part) => part.length > 0).join(' · ');
+}
+
+/**
+ * The width a chip line must stay inside, and the indent it starts at.
+ *
+ * 80 because that is what a pager and a redirected-to-a-file report are read at, and because a
+ * chip that wraps where the terminal happens to end is a chip that cannot be compared down the
+ * column — which is the entire reason the labels are in a fixed order. The report's two closing
+ * sentences already run past 80; they are prose, read once, and nothing lines up under them.
+ * A chip line is a column, so it is the one that has to hold the line.
+ */
+const CHIP_INDENT = '      ';
+const CHIP_WIDTH = 80;
+
+/** A wrapped chip line ends on the separator, so a continuation reads as one. */
+const CHIP_CONTINUATION = LABEL_SEPARATOR.trimEnd();
+
+/**
+ * The chips, `long`, wrapped at chip boundaries.
+ *
+ * `long` rather than `text` because the report has the room the list pane does not, and because
+ * the long form of the recency chip *is* the phrase this row used to print as prose — so the
+ * decomposition into chips loses no wording the report already promised, it only adds.
+ *
+ * Wrapped rather than truncated: a chip is a fact, and half a fact is worse than the same fact
+ * on a second line. The budget subtracts the continuation marker so that adding it can never
+ * itself push a line past `CHIP_WIDTH`. A single chip longer than the budget still gets its own
+ * line rather than being cut — nothing `labels.ts` can produce comes close, and if a future
+ * reason phrase does, an over-long line is a far smaller failure than a silently clipped one.
+ */
+function chipLines(labels: readonly Label[]): string[] {
+  const budget = CHIP_WIDTH - CHIP_INDENT.length - CHIP_CONTINUATION.length;
+  const lines: string[] = [];
+  let current = '';
+
+  for (const label of labels) {
+    if (current.length === 0) {
+      current = label.long;
+      continue;
+    }
+    const candidate = `${current}${LABEL_SEPARATOR}${label.long}`;
+    if (candidate.length <= budget) {
+      current = candidate;
+      continue;
+    }
+    lines.push(`${CHIP_INDENT}${current}${CHIP_CONTINUATION}`);
+    current = label.long;
+  }
+  if (current.length > 0) lines.push(`${CHIP_INDENT}${current}`);
+
+  return lines;
 }
 
 /** The one reason this row cannot be cleaned, whichever screen established it. */
@@ -134,7 +258,12 @@ function itemLines(
   const lines = [`  ${mark} ${column(row.label, row.bytes)}`];
 
   if (row.kind === 'project') {
-    lines.push(`      ${projectMeta(row.project)}`);
+    // The preset's categories, not every artifact the scan found: under `recommended` no
+    // `node_modules` is cleaned, so clearing this row needs no network and saying otherwise
+    // would be false. `enabledArtifacts` below narrows by the same set.
+    const labels = labelsFor(row.project, categories);
+    lines.push(`      ${projectMeta(row.project, labels)}`);
+    lines.push(...chipLines(labels));
     // Printed before the artifact breakdown, which is what the reason usually names: the
     // user reads "why not" next to the mark, then which directory provoked it.
     if (blocked !== undefined) lines.push(`      blocked: ${blocked}`);

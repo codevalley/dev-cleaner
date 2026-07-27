@@ -14,6 +14,7 @@ import type {
   CacheEntry,
   Category,
   CleanOutcome,
+  GitInfo,
   Project,
   ProjectType,
 } from '../src/types.js';
@@ -38,6 +39,18 @@ interface ProjectSpec {
   reason?: string;
   types?: ProjectType[];
   artifacts?: ArtifactSpec[];
+  /** Absent means "not a repository", which is a distinct state from "clean repository". */
+  git?: Partial<GitInfo>;
+}
+
+function makeGit(overrides: Partial<GitInfo>): GitInfo {
+  return {
+    branch: 'main',
+    lastCommitMs: 1_700_000_000_000,
+    hasUncommittedChanges: false,
+    isWorktree: false,
+    ...overrides,
+  };
 }
 
 function makeProject(spec: ProjectSpec): Project {
@@ -58,6 +71,7 @@ function makeProject(spec: ProjectSpec): Project {
     types: new Set<ProjectType>(spec.types ?? ['node']),
     artifacts,
     bytes: artifacts.reduce((sum, artifact) => sum + artifact.bytes, 0),
+    ...(spec.git === undefined ? {} : { git: makeGit(spec.git) }),
     activity: {
       status: spec.status ?? 'dormant',
       idleMs: spec.idleMs ?? 240 * DAY,
@@ -313,6 +327,311 @@ describe('renderReport', () => {
       expect(marked).toHaveLength(1);
       expect(marked[0]).toContain('11.0G');
     });
+  });
+});
+
+/**
+ * The row labels, in the one view that cannot delete anything.
+ *
+ * `dev-cleaner ~/develop | less` is the mode a cautious user reaches for first, and the mode a
+ * CI log preserves. If it carries fewer labels than the interactive list, then the piped report
+ * and the session disagree about a row — the divergence class this codebase keeps finding, and
+ * the reason the report is built from the same `buildRows`, `defaultSelection` and now the same
+ * `labelsFor` rather than from a second opinion computed here.
+ *
+ * What is asserted is the *report's* half of that: that the chips reach the text output, that
+ * they are asked the preset (not the disk) about connectivity, that they stay plain and inside
+ * the width a pager reads at, and — the part that is easy to get wrong — that decomposing the
+ * activity reason into chips did not leave the row stating one fact three times.
+ *
+ * The chip vocabulary itself is `ui/labels.ts`'s to define and `ui.labels.test.ts`'s to pin.
+ */
+describe('row labels in the static report', () => {
+  /** Every chip `labelsFor` can render, in its long form — the report's form. */
+  const CHIPS = [
+    'uncommitted changes',
+    'linked worktree',
+    'slow rebuild',
+    'needs network to rebuild',
+    'rebuilds offline',
+  ];
+
+  /** The indented lines that carry chips, which are the lines this feature added. */
+  function chipLines(out: string): string[] {
+    return out
+      .split('\n')
+      .filter((line) => /^ {6}\S/.test(line))
+      .filter((line) => CHIPS.some((chip) => line.includes(chip)));
+  }
+
+  function occurrences(out: string, phrase: string): number {
+    return out.split(phrase).length - 1;
+  }
+
+  const dirtyWorktree = makeProject({
+    name: 'tinysync-wt',
+    types: ['rust'],
+    idleMs: 100 * DAY,
+    reason: 'uncommitted but edited 100 days ago — past the 90-day grace',
+    git: { hasUncommittedChanges: true, isWorktree: true },
+    artifacts: [{ relPath: 'target', category: 'build', bytes: 34 * GB }],
+  });
+
+  it('says why a row is held back and what clearing it would cost', () => {
+    const out = renderReport({
+      projects: [dirtyWorktree],
+      caches: [],
+      categories: RECOMMENDED,
+      preset: 'recommended',
+    });
+
+    // Uncommitted work is not at risk — the allowlist cannot name `src/` — but it is the
+    // reason you may want to commit before you clear the row.
+    expect(out).toContain('uncommitted changes');
+    // The 34.6G worktree the user had forgotten they were keeping.
+    expect(out).toContain('linked worktree');
+    // The new information: what the rebuild costs, which the tool has never shown.
+    expect(out).toContain('slow rebuild');
+    expect(out).toContain('rebuilds offline');
+  });
+
+  it('labels the recently-used rows, which are the ones the request was about', () => {
+    const out = renderReport({
+      projects: [
+        makeProject({
+          name: 'notchpad',
+          status: 'active',
+          idleMs: 8 * DAY,
+          reason: 'uncommitted changes, edited 8 days ago',
+          git: { hasUncommittedChanges: true },
+          artifacts: [{ relPath: '.next', category: 'build', bytes: 6 * GB }],
+        }),
+      ],
+      caches: [],
+      categories: RECOMMENDED,
+    });
+
+    const line = chipLines(out)[0] ?? '';
+    expect(line).toContain('uncommitted changes');
+    expect(line).toContain('edited 8 days ago');
+    // The section header claims a convenience default, and this is the row saying what the
+    // default would actually cost: a `.next` rebuild, no network, seconds.
+    expect(line).toContain('rebuilds offline');
+    expect(line).not.toContain('slow rebuild');
+  });
+
+  it('asks the preset, not the disk, whether the rebuild needs the network', () => {
+    // The same project both ways. Under `recommended` its `node_modules` is not cleaned, so
+    // clearing this row touches `dist/` alone and the rebuild needs no connectivity at all;
+    // saying `needs network` there would be false, and false in the direction that costs a
+    // user a rebuild they could have done on the plane.
+    const projects = [
+      makeProject({
+        name: 'bump',
+        artifacts: [
+          { relPath: 'dist', category: 'build', bytes: GB },
+          { relPath: 'node_modules', category: 'deps', bytes: 3 * GB },
+        ],
+      }),
+    ];
+
+    const recommended = renderReport({ projects, caches: [], categories: RECOMMENDED });
+    expect(recommended).toContain('rebuilds offline');
+    expect(recommended).not.toContain('needs network');
+
+    const aggressive = renderReport({ projects, caches: [], categories: AGGRESSIVE });
+    expect(aggressive).toContain('needs network to rebuild');
+    expect(aggressive).not.toContain('rebuilds offline');
+  });
+
+  it('measures rebuild cost by ecosystem, not by size', () => {
+    // The inversion is the whole content of the chip, and a size-sorted report invites
+    // exactly the wrong rule: the 6G `.next` is back in seconds, the 200M `target/` is a
+    // from-scratch compile of every dependency in the graph.
+    const out = renderReport({
+      projects: [
+        makeProject({
+          name: 'huge-node',
+          types: ['node'],
+          artifacts: [{ relPath: '.next', category: 'build', bytes: 6 * GB }],
+        }),
+        makeProject({
+          name: 'tiny-rust',
+          types: ['rust'],
+          artifacts: [{ relPath: 'target', category: 'build', bytes: 200 * MB }],
+        }),
+      ],
+      caches: [],
+      categories: RECOMMENDED,
+    });
+
+    const slow = chipLines(out).filter((line) => line.includes('slow rebuild'));
+    expect(slow).toHaveLength(1);
+    // The report is size-ordered, so the only way to tell which row wears the chip is to
+    // find it relative to the two names.
+    expect(out.indexOf('slow rebuild')).toBeGreaterThan(out.indexOf('tiny-rust'));
+    expect(out.indexOf('slow rebuild')).toBeGreaterThan(out.indexOf('huge-node'));
+  });
+
+  it('has no answer, rather than a reassuring one, where there is no repository', () => {
+    const out = renderReport({
+      projects: [makeProject({ name: 'no-repo', reason: 'edited 8mo ago' })],
+      caches: [],
+      categories: RECOMMENDED,
+    });
+
+    expect(out).not.toContain('uncommitted');
+    expect(out).not.toContain('worktree');
+    // The connectivity answer is always present, so "no chip" can never be confused with
+    // "nobody worked out whether it needs the network".
+    expect(out).toContain('rebuilds offline');
+  });
+
+  it('does not state one fact three times in three formats', () => {
+    // `scoreActivity` writes `uncommitted changes, edited 8 days ago`, and `labelsFor` builds
+    // two of its chips by copying that string apart. Printing both would put the same sentence
+    // on two consecutive lines, one comma-separated and one dot-separated, which is how a
+    // label row stops being read at all.
+    const out = renderReport({
+      projects: [
+        makeProject({
+          name: 'notchpad',
+          status: 'active',
+          idleMs: 8 * DAY,
+          reason: 'uncommitted changes, edited 8 days ago',
+          git: { hasUncommittedChanges: true },
+        }),
+      ],
+      caches: [],
+      categories: RECOMMENDED,
+    });
+
+    expect(out).toContain('uncommitted changes · edited 8 days ago');
+    expect(occurrences(out, 'uncommitted changes')).toBe(1);
+    expect(occurrences(out, 'edited 8 days ago')).toBe(1);
+    // The prose form is gone entirely: the chips say every word it said.
+    expect(out).not.toContain('uncommitted changes, edited 8 days ago');
+  });
+
+  it('keeps the part of the reason no chip carries', () => {
+    const out = renderReport({
+      projects: [dirtyWorktree],
+      caches: [],
+      categories: RECOMMENDED,
+    });
+
+    // Why is a project with uncommitted changes checked by default? Because the 90-day grace
+    // ran out — and no chip says that, so dropping the reason wholesale would lose the answer
+    // to the one question this row provokes.
+    expect(out).toContain('past the 90-day grace');
+    expect(out).toMatch(/\[x\]\s+tinysync-wt/);
+    // ...without the word the chip already carries being stranded in front of it twice.
+    expect(occurrences(out, 'uncommitted')).toBe(1);
+    expect(occurrences(out, 'edited 100 days ago')).toBe(1);
+    expect(out).not.toContain('uncommitted but');
+    // Whole line, because lifting a clause out of the middle of a sentence leaves punctuation
+    // and a conjunction behind, and `· but — past the 90-day grace` reads as a bug.
+    expect(out).toContain('      rust · dormant 3mo · past the 90-day grace\n');
+  });
+
+  it('keeps a reason whole when no chip can carry it at all', () => {
+    // There is deliberately no lockfile chip and no "I cannot tell" chip. These two reasons
+    // are therefore the only place those signals are ever stated, and a rule that dropped the
+    // reason line whenever chips were present would silently delete both.
+    const out = renderReport({
+      projects: [
+        makeProject({ name: 'deps-only', reason: 'dependencies changed 5 days ago' }),
+        makeProject({
+          name: 'unscorable',
+          status: 'active',
+          idleMs: 0,
+          reason: 'no dates to score — protected',
+        }),
+      ],
+      caches: [],
+      categories: RECOMMENDED,
+    });
+
+    expect(out).toContain('dependencies changed 5 days ago');
+    expect(out).toContain('no dates to score — protected');
+  });
+
+  it('stays plain text, because this output is piped into files and pagers', () => {
+    const out = renderReport({
+      projects: [dirtyWorktree],
+      caches: [makeCache()],
+      categories: AGGRESSIVE,
+    });
+
+    // No colour, no cursor moves. An ANSI escape survives a redirect into a file and turns
+    // up as `ESC[32m` in whatever reads it next; built from a char code so this assertion
+    // cannot itself smuggle a control character into the source.
+    expect(out).not.toContain(String.fromCharCode(0x1b));
+    // Neither the list's selection glyphs nor any box drawing: a report is read through
+    // `less` and committed to CI logs, where terminal furniture is noise.
+    expect(out).not.toMatch(/[◉○▸─│┌┐└┘├┤┬┴┼]/u);
+  });
+
+  it('never lets a chip push a line past the width a pager reads at', () => {
+    // The worst case the vocabulary can produce: every chip at once, all five in long form.
+    const out = renderReport({
+      projects: [
+        makeProject({
+          name: 'everything',
+          types: ['rust'],
+          idleMs: 100 * DAY,
+          reason: 'uncommitted but edited 100 days ago — past the 90-day grace',
+          git: { hasUncommittedChanges: true, isWorktree: true },
+          artifacts: [
+            { relPath: 'target', category: 'build', bytes: 34 * GB },
+            { relPath: 'node_modules', category: 'deps', bytes: 3 * GB },
+          ],
+        }),
+      ],
+      caches: [],
+      categories: AGGRESSIVE,
+    });
+
+    const lines = chipLines(out);
+    // It really does take more than one line, so this is a wrap and not a coincidence.
+    expect(lines.length).toBeGreaterThan(1);
+    for (const line of lines) expect(line.length).toBeLessThanOrEqual(80);
+    // Wrapped, never truncated: half a fact is worse than the same fact on a second line.
+    // (`rebuilds offline` is the other half of an exclusive pair, so it is not in this set.)
+    for (const chip of [
+      'uncommitted changes',
+      'edited 100 days ago',
+      'linked worktree',
+      'slow rebuild',
+      'needs network to rebuild',
+    ]) {
+      expect(out).toContain(chip);
+    }
+  });
+
+  it('leaves the name and size columns exactly where they were', () => {
+    const out = renderReport({
+      projects: [dirtyWorktree],
+      caches: [],
+      categories: RECOMMENDED,
+    });
+
+    const row = out.split('\n').find((line) => line.includes('] tinysync-wt')) ?? '';
+    // `  ` + `[x] ` + 34-wide name + 7-wide right-aligned size. A chip appended to this line
+    // would have moved the size column and broken the one alignment the report has.
+    expect(row).toBe(`  [x] ${'tinysync-wt'.padEnd(34)}${'34.0G'.padStart(7)}`);
+    expect(row).toHaveLength(47);
+  });
+
+  it('does not label cache rows, which have no repository and no rebuild', () => {
+    const out = renderReport({
+      projects: [],
+      caches: [makeCache()],
+      categories: RECOMMENDED,
+    });
+
+    expect(out).toContain('pnpm store');
+    for (const chip of CHIPS) expect(out).not.toContain(chip);
   });
 });
 

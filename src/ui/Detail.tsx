@@ -23,6 +23,21 @@
  * line taller than the list pane makes the whole frame one line taller, and a frame taller
  * than the terminal scrolls the footer off the screen. A project with fifteen artifacts is
  * ordinary. The cut is what keeps it from breaking the layout.
+ *
+ * # The chips, twice
+ *
+ * The list pane can afford one or two chips per row and gives up the rest (`chipPlan` in
+ * `List.tsx`). This pane is where the ones it gave up live, and it draws them twice on
+ * purpose:
+ *
+ * - **as a line**, directly under the name, so the highlighted row's full answer is one glance
+ *   away and survives the height cut even on a short terminal;
+ * - **as a block at the bottom**, one `LABEL_HELP` sentence per chip, for the user who has
+ *   read `needs network` and wants to know what it is asking of them.
+ *
+ * The explanations go last for the same reason the reassurance does: they are read once, when
+ * a chip is new, and putting them above the sizes would push the actual contents of the pane
+ * down on every pass where they are not.
  */
 
 import { Box, Text } from 'ink';
@@ -36,6 +51,7 @@ import {
   formatIdle,
   padLabel,
 } from './format.js';
+import { LABEL_HELP, joinLabels, labelsFor, type Label, type LabelTone } from './labels.js';
 import { SAFE_TO_CHECK, SECTION_NOTES, enabledArtifacts, type Row } from './model.js';
 import type { Category } from '../types.js';
 
@@ -52,7 +68,25 @@ interface Line {
   text: string;
   dim?: boolean;
   bold?: boolean;
+  color?: string;
 }
+
+/**
+ * `LabelTone` as an amount of emphasis, with one hue in the whole scheme.
+ *
+ * Three steps — bright, normal, dim — that a terminal with no colour at all still renders as
+ * two, and that a user who has turned colour off loses nothing by: the chip says
+ * `uncommitted changes` in words either way. The hue is spent only on `warn`, the single tone
+ * that means *do something before you clean this* rather than *this is what cleaning costs*.
+ * Spending it on `cost` as well would put the two on the same footing, which is the exact
+ * confusion `labels.ts` refuses to encode by not handing components a colour in the first
+ * place.
+ */
+const TONE_STYLE: Record<LabelTone, { color?: string; dim?: boolean }> = {
+  warn: { color: 'yellow' },
+  cost: {},
+  info: { dim: true },
+};
 
 /**
  * Greedy word wrap. Ink can wrap a `<Text>` itself, but only by producing however many lines
@@ -92,12 +126,31 @@ function blank(): Line {
   return { text: ' ' };
 }
 
+/**
+ * One entry per chip: the phrase, then what it means for a decision.
+ *
+ * Every chip the row has, not the ones the list pane had room for — this is the pane the list
+ * defers to, so a chip that appears nowhere else must appear here.
+ */
+function labelLines(labels: readonly Label[], width: number): Line[] {
+  if (labels.length === 0) return [];
+  const inner = Math.max(8, width - 4);
+  return [
+    blank(),
+    ...labels.flatMap((label) => [
+      { text: padLabel(`  ${label.long}`, width), ...TONE_STYLE[label.tone] },
+      ...wrapText(LABEL_HELP[label.kind], inner).map((text) => ({ text: `    ${text}`, dim: true })),
+    ]),
+  ];
+}
+
 function projectLines(row: Extract<Row, { kind: 'project' }>, categories: ReadonlySet<Category>, width: number): Line[] {
   const { project } = row;
   const artifacts = enabledArtifacts(project, categories);
   const total = artifacts.reduce((sum, artifact) => sum + artifact.bytes, 0);
   const labelWidth = Math.max(10, width - BYTES_WIDTH - 3);
   const { git, activity } = project;
+  const labels = labelsFor(project, categories);
 
   const lines: Line[] = [
     { text: padLabel(project.name, width), bold: true },
@@ -108,6 +161,9 @@ function projectLines(row: Extract<Row, { kind: 'project' }>, categories: Readon
       ),
       dim: true,
     },
+    // Wrapped rather than truncated: this line is the list pane's overflow, so the chip it
+    // could not afford is precisely the one that must not be cut off the end here.
+    ...wrapText(joinLabels(labels, 'long'), width).map((text) => ({ text })),
     blank(),
     ...artifacts.map((artifact) => ({
       text: `  ${padLabel(artifact.relPath, labelWidth)} ${formatBytesPadded(artifact.bytes)}`,
@@ -135,6 +191,7 @@ function projectLines(row: Extract<Row, { kind: 'project' }>, categories: Readon
 
   lines.push(blank());
   lines.push({ text: padLabel(`  ${activity.reason}`, width), dim: true });
+  lines.push(...labelLines(labels, width));
   return lines;
 }
 
@@ -183,7 +240,12 @@ export function Detail({ row, categories, width, height }: DetailProps): React.R
     <Box flexDirection="column">
       {shown.map((line, index) => (
         // eslint-disable-next-line react/no-array-index-key -- lines are positional by nature
-        <Text key={index} dimColor={line.dim === true} bold={line.bold === true}>
+        <Text
+          key={index}
+          dimColor={line.dim === true}
+          bold={line.bold === true}
+          {...(line.color === undefined ? {} : { color: line.color })}
+        >
           {line.text}
         </Text>
       ))}
