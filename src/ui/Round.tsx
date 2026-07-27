@@ -19,12 +19,34 @@
  *    still exactly where it was. Summing all three would tell a user who trashed 2 G and had
  *    an 8 G store prune refused that 10 G is waiting in the Trash — so they empty it, expect
  *    10 G back, and get 2 G. The figure comes from `applyRound`, which counts `trashed` and
- *    nothing else.
+ *    nothing else. The block-font banner is drawn from that same figure and no other, which is
+ *    the whole reason it is computed here from `reclaimedBytes` rather than passed in as text.
  * 2. **What did not happen is named, not omitted.** A round that quietly reported only its
  *    successes would let a refusal go unread forever; the user selected those directories and
- *    is owed the reason. They are shown separately, below the total, never inside it.
+ *    is owed the reason. They are shown separately, below the total, never inside it. A round
+ *    that trashed 2 G and refused 8 G celebrates 2 G and says so.
  * 3. **The session total is stated in the same breath.** It is the answer to "have I actually
  *    got anywhere", which is the question a second and third round are asked in service of.
+ *
+ * # Why this screen celebrates, and how far
+ *
+ * The first user to run this for real reclaimed 107 GB and got a terse list of outcomes for
+ * it. That is a failure of the interface: the single most satisfying number the tool will ever
+ * produce was rendered in the same weight as the word "directories". So the freshly trashed
+ * figure is drawn in a block font, big enough to read from across the room, and the decoration
+ * around it scales with the achievement — `celebrationFor` gives 107 G three marks and a rule,
+ * and 200 M a plain sentence.
+ *
+ * Two constraints keep the celebration honest, and both are load-bearing:
+ *
+ * - **It celebrates trashing, never freeing.** The bytes are still on the volume. Nothing on
+ *   this screen may imply otherwise, which is why the phrases name the *round* ("An enormous
+ *   round.") and never the disk. Emptying the Trash is what frees them, and that is offered
+ *   here as the obvious next thing to do — invariant 8, discharged inside the affordance that
+ *   performs it rather than as a footnote under it.
+ * - **It is instant and dismissable.** There is no animation, no timer and no state: the pane
+ *   renders its final content on its first frame. A celebration you have to sit through is an
+ *   obstacle the second time you see it, and this is a tool people run repeatedly.
  *
  * # Why `enter` does nothing here
  *
@@ -42,6 +64,131 @@ import { BYTES_WIDTH, formatBytes, formatBytesPadded, padLabel, truncateLabel } 
 
 /** Beyond this the list is summarised; a report nobody can read is not one. */
 const MAX_PROBLEMS = 6;
+
+const GIB = 1024 ** 3;
+
+/* ------------------------------------------------------------------------ *
+ * Shared display primitives
+ *
+ * `bigBytes` and `promptBox` are used by this pane *and* by `Confirm`, which asks the
+ * question this pane answers. They live here, next to the celebration they were written for,
+ * and `Confirm` imports them rather than keeping a second copy of the font: two block fonts
+ * that drift apart would show the same 107 G in two different shapes on two consecutive
+ * screens, which is precisely the "half-TUI" incoherence this file exists to end.
+ * ------------------------------------------------------------------------ */
+
+/** Rows in the block font. Five is the smallest height at which 6, 8 and 0 stay distinct. */
+export const BIG_ROWS = 5;
+
+/**
+ * A block font covering exactly the characters `formatBytes` can emit: the ten digits, the
+ * decimal point, and the six unit letters. Nothing else — a glyph table that silently accepts
+ * an unknown character would render it as a hole in the middle of the only number on screen.
+ * `bigTextLines` returns `undefined` instead, and the caller falls back to plain text.
+ *
+ * Only `█` and the space are used. Half-blocks and box-drawing corners render at different
+ * widths in enough terminals that a banner built from them can come out ragged, and a ragged
+ * 107 G is worse than a blocky one.
+ */
+const GLYPHS: Record<string, readonly string[]> = {
+  '0': ['███', '█ █', '█ █', '█ █', '███'],
+  '1': [' █ ', '██ ', ' █ ', ' █ ', '███'],
+  '2': ['███', '  █', '███', '█  ', '███'],
+  '3': ['███', '  █', '███', '  █', '███'],
+  '4': ['█ █', '█ █', '███', '  █', '  █'],
+  '5': ['███', '█  ', '███', '  █', '███'],
+  '6': ['███', '█  ', '███', '█ █', '███'],
+  '7': ['███', '  █', '  █', '  █', '  █'],
+  '8': ['███', '█ █', '███', '█ █', '███'],
+  '9': ['███', '█ █', '███', '  █', '███'],
+  // One column wide, so "3.4G" does not read as "3 4G" with a gap where the point should be.
+  '.': [' ', ' ', ' ', ' ', '█'],
+  B: ['██ ', '█ █', '██ ', '█ █', '██ '],
+  K: ['█ █', '██ ', '█  ', '██ ', '█ █'],
+  M: ['█ █', '███', '███', '█ █', '█ █'],
+  G: ['███', '█  ', '█ █', '█ █', '███'],
+  T: ['███', ' █ ', ' █ ', ' █ ', ' █ '],
+  P: ['███', '█ █', '███', '█  ', '█  '],
+};
+
+/**
+ * `text` in the block font, one string per row, or `undefined` if any character is not in the
+ * table. Rows are right-trimmed: they are drawn into a column-oriented layout, and trailing
+ * blanks would only make the measured width disagree with the drawn one.
+ *
+ * Exactly one blank column separates every glyph, including the decimal point. Setting the
+ * point tight against its neighbours was tried and is worse: `67.0G` comes out with the 7's
+ * stem and the point fused into a single bar on the bottom row, which is a misread of the
+ * tenths rather than merely an ugly one.
+ */
+export function bigTextLines(text: string): readonly string[] | undefined {
+  const characters = [...text];
+  if (characters.length === 0) return undefined;
+
+  const rows: string[] = [];
+  for (let row = 0; row < BIG_ROWS; row += 1) {
+    const cells: string[] = [];
+    for (const character of characters) {
+      const glyph = GLYPHS[character];
+      if (glyph === undefined) return undefined;
+      cells.push(glyph[row] ?? '');
+    }
+    rows.push(cells.join(' ').trimEnd());
+  }
+  return rows;
+}
+
+/**
+ * The banner for a byte count, or `undefined` when it will not fit in `width` — at which
+ * point the caller shows the same figure as ordinary text. A banner that wraps is not a
+ * bigger number, it is a broken one, so the fit is checked against the *drawn* width
+ * including the two-column indent every caller uses.
+ */
+export function bigBytes(bytes: number, width: number): readonly string[] | undefined {
+  const lines = bigTextLines(formatBytes(bytes));
+  if (lines === undefined) return undefined;
+
+  const drawn = lines.reduce((widest, line) => Math.max(widest, line.length), 0);
+  if (drawn === 0 || drawn + 2 > width) return undefined;
+  return lines;
+}
+
+/**
+ * A label and its size on one line, the size right-aligned into a fixed column.
+ *
+ * The label's budget is whatever `width` has left after the indent and the size column, with
+ * no floor under it: a floor is how the old rows came to be 21 columns wide inside a 16-column
+ * pane, and an overflowing row is not a wider row — Ink wraps it, and one directory becomes
+ * two lines in a list whose whole job is one line per directory. The finished row is clipped
+ * as well, so even a pane too narrow to hold the size column costs the frame one line and not
+ * two.
+ */
+export function sizeRow(indent: string, label: string, bytes: number, width: number): string {
+  const labelWidth = Math.max(1, width - indent.length - BYTES_WIDTH - 1);
+  return truncateLabel(
+    `${indent}${padLabel(label, labelWidth)} ${formatBytesPadded(bytes)}`,
+    width,
+  );
+}
+
+/**
+ * A framed prompt: the choice on offer, drawn as a box so it cannot be mistaken for the dim
+ * key hints it used to be. Degrades to bare truncated lines when the pane is too narrow to
+ * hold a frame — at that width the border costs more columns than it buys.
+ */
+export function promptBox(lines: readonly string[], width: number): readonly string[] {
+  const inner = width - 4;
+  if (inner < 12) return lines.map((line) => truncateLabel(line, Math.max(1, width)));
+
+  const rule = '─'.repeat(inner + 2);
+  return [
+    `╭${rule}╮`,
+    ...lines.map((line) => `│ ${padLabel(line, inner)} │`),
+    `╰${rule}╯`,
+  ];
+}
+
+/* ------------------------------------------------------------------------ */
 
 /** A target that was selected, consented to, and did not move. */
 export interface ProblemEntry {
@@ -78,6 +225,42 @@ export interface RoundSummaryProps {
 }
 
 /**
+ * How loudly a round is worth celebrating. Four steps, because the difference between 200 M
+ * and 107 G is the difference between "tidied up" and "got a tenth of the disk back", and one
+ * fixed fanfare for both makes the big one feel routine and the small one feel oversold.
+ *
+ * No phrase claims the space is free — it is in the Trash. `big` gates the banner rather than
+ * the whole pane: a sub-gigabyte round still says exactly what it did, in words.
+ */
+export interface Celebration {
+  /** Draw the block-font banner. */
+  big: boolean;
+  /** Rules above and below it — reserved for the largest step. */
+  rule: boolean;
+  /** Zero to three marks, scaling with the figure. */
+  sparks: string;
+  /** The one-line verdict, absent below a gigabyte. */
+  phrase: string | undefined;
+}
+
+const TIERS: readonly { readonly min: number; readonly celebration: Celebration }[] = [
+  {
+    min: 100 * GIB,
+    celebration: { big: true, rule: true, sparks: '✦ ✦ ✦', phrase: 'An enormous round.' },
+  },
+  { min: 10 * GIB, celebration: { big: true, rule: false, sparks: '✦ ✦', phrase: 'A big round.' } },
+  { min: GIB, celebration: { big: true, rule: false, sparks: '✦', phrase: 'A good round.' } },
+];
+
+const NO_CELEBRATION: Celebration = { big: false, rule: false, sparks: '', phrase: undefined };
+
+export function celebrationFor(bytes: number): Celebration {
+  if (!Number.isFinite(bytes) || bytes <= 0) return NO_CELEBRATION;
+  for (const tier of TIERS) if (bytes >= tier.min) return tier.celebration;
+  return NO_CELEBRATION;
+}
+
+/**
  * `1 directory` / `7 directories`. The plural is a parameter rather than an `s` appended to
  * the singular, because the only noun this file counts in quantity is the one that does not
  * take one — and "7 directorys" in the sentence reporting a bulk deletion is exactly the
@@ -98,54 +281,110 @@ export function RoundSummary({
   width,
   canEmptyTrash,
 }: RoundSummaryProps): React.ReactElement {
-  const labelWidth = Math.max(12, width - BYTES_WIDTH - 4);
   const listed = report.problems.slice(0, MAX_PROBLEMS);
   const hidden = report.problems.length - listed.length;
   const session = sessionLine(report);
   const nothingMoved = report.trashed === 0;
 
+  /** Every line on this pane is clipped; a summary that wraps is one nobody re-reads. */
+  const fit = (text: string): string => truncateLabel(text, width);
+
+  // Both read `reclaimedBytes`, which `applyRound` fills from trashed outcomes alone. A round
+  // whose refusals were folded in here would draw a number the Trash cannot honour.
+  const cheer = nothingMoved ? NO_CELEBRATION : celebrationFor(report.reclaimedBytes);
+  const banner = cheer.big ? bigBytes(report.reclaimedBytes, width) : undefined;
+  const bannerWidth =
+    banner === undefined ? 0 : banner.reduce((widest, line) => Math.max(widest, line.length), 0);
+
   return (
     <Box flexDirection="column" paddingX={1}>
+      {banner === undefined ? null : (
+        <Box flexDirection="column">
+          <Text> </Text>
+          {cheer.rule ? <Text color="green">{`  ${'━'.repeat(bannerWidth)}`}</Text> : null}
+          {banner.map((line, index) => (
+            <Text key={`banner-${index}`} bold color="green">
+              {`  ${line}`}
+            </Text>
+          ))}
+          {cheer.rule ? <Text color="green">{`  ${'━'.repeat(bannerWidth)}`}</Text> : null}
+          <Text> </Text>
+        </Box>
+      )}
+
+      {/* Indented to two, so the caption sits under the banner it captions. */}
       <Text bold color={nothingMoved ? 'yellow' : 'green'}>
-        {nothingMoved
-          ? 'Nothing was moved to the Trash.'
-          : `Moved ${formatBytes(report.reclaimedBytes)} to the Trash.`}
+        {fit(
+          nothingMoved
+            ? '  Nothing was moved to the Trash.'
+            : `  Moved ${formatBytes(report.reclaimedBytes)} to the Trash.`,
+        )}
       </Text>
+      {cheer.phrase === undefined ? null : (
+        <Text bold color="green">
+          {fit(`  ${cheer.sparks}  ${cheer.phrase}`)}
+        </Text>
+      )}
       <Text dimColor>
-        {`${plural(report.trashed, 'directory', 'directories')} trashed` +
-          (report.refused > 0 ? ` · ${report.refused} refused` : '') +
-          (report.failed > 0 ? ` · ${report.failed} failed` : '')}
+        {fit(
+          `  ${plural(report.trashed, 'directory', 'directories')} trashed` +
+            (report.refused > 0 ? ` · ${report.refused} refused` : '') +
+            (report.failed > 0 ? ` · ${report.failed} failed` : ''),
+        )}
       </Text>
 
       {listed.length === 0 ? null : (
         <Box flexDirection="column">
           <Text> </Text>
           <Text bold color="red">
-            {`  Left in place · ${plural(report.problems.length, 'item')} — not in the total above`}
+            {fit(
+              `  Left in place · ${plural(report.problems.length, 'item')} — not in the total above`,
+            )}
           </Text>
           {listed.flatMap((entry) => [
             <Text key={`${entry.id}:row`} color="red">
-              {`  ! ${padLabel(entry.label, Math.max(10, labelWidth - 2))} ${formatBytesPadded(entry.bytes)}`}
+              {sizeRow('  ! ', entry.label, entry.bytes, width)}
             </Text>,
             <Text key={`${entry.id}:why`} dimColor>
-              {`      ${truncateLabel(entry.detail ?? entry.outcome, Math.max(10, width - 6))}`}
+              {fit(`      ${entry.detail ?? entry.outcome}`)}
             </Text>,
           ])}
-          {hidden > 0 ? <Text dimColor>{`  …and ${hidden} more`}</Text> : null}
+          {hidden > 0 ? <Text dimColor>{fit(`  …and ${hidden} more`)}</Text> : null}
         </Box>
       )}
 
       <Text> </Text>
-      {session === undefined ? null : <Text bold>{`  ${session}`}</Text>}
-      <Text dimColor>{'  Trash still holds the space until you empty it.'}</Text>
+      {session === undefined ? null : (
+        <Box flexDirection="column">
+          <Text bold>{fit(`  ${session}`)}</Text>
+          <Text> </Text>
+        </Box>
+      )}
+      {/*
+        Invariant 8, put where it is acted on. When the Trash can be emptied the disclosure
+        rides on the offer itself — one line that says both what the key does and why it is
+        the next thing worth doing. When it cannot, the same fact is stated on its own, because
+        the fact does not depend on whether this tool happens to be able to act on it.
+      */}
+      {canEmptyTrash ? (
+        <Box flexDirection="column">
+          {promptBox(['t empty the Trash — the space is not free until you do'], width).map(
+            (line, index) => (
+              <Text key={`offer-${index}`} bold color="cyan">
+                {line}
+              </Text>
+            ),
+          )}
+        </Box>
+      ) : (
+        <Text dimColor>{fit('  Trash still holds the space until you empty it.')}</Text>
+      )}
       <Text> </Text>
       {/*
         `esc`, never `enter` — see the module note. The hint has to name the key that works,
         because a user who presses enter here and sees nothing happen will press it again.
       */}
-      <Text dimColor>
-        {canEmptyTrash ? 'esc back to the list · t empty the Trash · q quit' : 'esc back to the list · q quit'}
-      </Text>
+      <Text dimColor>{fit('esc back to the list · q quit')}</Text>
     </Box>
   );
 }

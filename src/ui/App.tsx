@@ -47,32 +47,44 @@
  * nothing is reused between rounds, and the second round is screened as freshly as the first.
  * A retained snapshot would be consent given to a list that no longer exists.
  *
- * # The layout is a fixed budget
+ * # The layout is a fixed budget, and it is one line shorter than the terminal
  *
- * The frame is exactly as tall as the terminal, and the list is the only part that gives. The
- * header (three lines), the section note (one), the pane borders (two), the list's own scroll
- * hint (one) and the footer (two) are subtracted from the terminal's rows and whatever is left
- * is the window `viewport.ts` is asked for. That is what makes the footer *pinned*: it is not
- * pinned by a flex property, it is pinned because nothing above it is ever allowed to be
- * taller than the space it was given.
+ * The frame is sized to the terminal and the list is the only part that gives: the chrome is
+ * subtracted from the rows available and whatever is left is the window `viewport.ts` is asked
+ * for. That is what makes the footer *pinned* — not a flex property, but the fact that nothing
+ * above it is ever allowed to be taller than the space it was given.
+ *
+ * The subtlety, and the bug it hid for a whole release: **the budget is `rows - 1`, not
+ * `rows`.** Ink redraws by writing the frame followed by a newline and erasing that many lines
+ * next time, so a frame of exactly `rows` lines occupies `rows + 1` terminal lines, the
+ * emulator scrolls by one, and the erase can no longer reach what has left the screen. Ink
+ * knows this and switches to a whole-screen clear at `outputHeight >= rows` — but that path
+ * never updates the incremental renderer's line count, so the *next* frame that is shorter (a
+ * confirmation, a round summary, the first frames of a scan) erases the wrong number of lines
+ * and leaves the previous frame's header sitting above the new one. That is the duplicated
+ * header the user reported, and it is why `RESERVED_ROW` exists.
+ *
+ * The old constants added up to exactly `rows`, so *every* list frame took the whole-screen
+ * path and every transition out of the list could duplicate. The test that was supposed to
+ * catch it asserted `lines().length <= rows`, which is true of the broken layout.
  */
 
 import { Box, Text, render, useApp, useInput, useStdin, useStdout } from 'ink';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
+import { Headline, Logo, WORDMARK } from './Banner.js';
 import { Confirm, type BlockedEntry, type ConfirmEntry } from './Confirm.js';
 import { Detail } from './Detail.js';
-import { Gauge } from './Gauge.js';
+import { BAR_LEGEND, Gauge } from './Gauge.js';
 import { Footer } from './Footer.js';
 import { List } from './List.js';
 import { RoundSummary, type ProblemEntry, type RoundReport } from './Round.js';
 import { ScanStatus } from './ScanStatus.js';
 import { EMPTY_TRASH_WORD, TrashConfirm, TrashResult, trashConfirmArmed } from './Trash.js';
-import { formatBytes, truncateLabel } from './format.js';
+import { formatBytes } from './format.js';
 import {
   EMPTY_SELECTION,
   EMPTY_SESSION,
-  SECTION_NOTES,
   applyRound,
   buildRows,
   cursorIndex,
@@ -95,7 +107,7 @@ import {
   type SessionState,
 } from './model.js';
 import { windowFor, type Viewport } from './viewport.js';
-import type { DiskUsage } from './diskbar.js';
+import { TRASH_CAVEAT, diskLabels, type DiskUsage } from './diskbar.js';
 import type { ScanEvent } from '../scan.js';
 // Type-only, and deliberately so: `import type` is erased at compile time, so the UI still
 // never *loads* the modules that can delete or empty. The seams through which they are
@@ -346,26 +358,80 @@ const MIN_LIST_WIDTH = 28;
 const MAX_LIST_WIDTH = 52;
 
 /**
- * The fixed part of the frame, in lines. Everything here is drawn on every list frame, so the
- * list gets the terminal's rows minus this and not one line more.
+ * Columns the scan indicator must keep on the title line before anything else may share it.
  *
- * - 3 header: the title-and-scan line, and the two lines of the disk gauge.
- * - 1 section note.
+ * `✓ scan complete` is fifteen; eighteen leaves the running count a character or two as well.
+ * Below this the line carries the wordmark and the indicator, and nothing else.
+ */
+const MIN_SCAN_WIDTH = 18;
+
+/**
+ * The line the frame may not use.
+ *
+ * Ink writes `frame + "\n"`, so a frame of `rows` lines lands the cursor on line `rows + 1` and
+ * the emulator scrolls; the erase that begins the next redraw then cannot reach the line that
+ * has gone. Ink's own guard (`outputHeight >= rows` → clear the whole screen) avoids the
+ * garbling but bypasses the incremental renderer's bookkeeping, so the next *shorter* frame
+ * erases too few lines and the previous header stays on screen underneath it. Leaving one line
+ * unspent keeps every frame on the incremental path, where the arithmetic is correct.
+ *
+ * It is one line, not a margin for taste. See the note at the top of this file.
+ */
+const RESERVED_ROW = 1;
+
+/**
+ * The fixed part of the frame, in lines. Everything here is drawn on every list frame, so the
+ * list gets the budget minus this and not one line more.
+ *
+ * - 2 header: the wordmark-and-scan line, and the one-line disk gauge.
+ * - 2 headline: the selection total, in the block face, which is the number the user came for.
  * - 2 pane borders (top and bottom).
  * - 1 scroll hint, drawn *inside* the list pane by `List` whether or not it has anything to
  *   say — a line that came and went would change the frame height as the user scrolled.
- * - 2 footer: the key hints and the status line.
+ * - 1 footer: the key hints, with the session ledger or a message on the right.
+ *
+ * What is *not* here any more: the section note, which restated at one truncated line what the
+ * detail pane says in full beside every row it applies to, and the gauge's second line, whose
+ * contents now sit beside the headline figure they describe.
  */
-const HEADER_HEIGHT = 3;
-const NOTE_HEIGHT = 1;
+const HEADER_HEIGHT = 2;
+const HEADLINE_HEIGHT = 2;
 const PANE_BORDER_HEIGHT = 2;
 const SCROLL_HINT_HEIGHT = 1;
-const FOOTER_HEIGHT = 2;
+const FOOTER_HEIGHT = 1;
 const CHROME_HEIGHT =
-  HEADER_HEIGHT + NOTE_HEIGHT + PANE_BORDER_HEIGHT + SCROLL_HINT_HEIGHT + FOOTER_HEIGHT;
+  HEADER_HEIGHT + HEADLINE_HEIGHT + PANE_BORDER_HEIGHT + SCROLL_HINT_HEIGHT + FOOTER_HEIGHT;
+
+/**
+ * The chrome a terminal too short for the full layout gets instead: the wordmark line, the
+ * panes and the footer, with the gauge and the headline dropped.
+ *
+ * Not a nicety. Without it the budget goes negative on a short terminal and the floor below
+ * takes over, at which point the frame is taller than the screen again and the header
+ * duplicates — the exact failure the reserved row exists to prevent, reached from the other
+ * end. Which tier applies is a function of the terminal's height alone, so the number of lines
+ * rendered is always the number the list was budgeted against.
+ */
+const COMPACT_CHROME_HEIGHT = 1 + PANE_BORDER_HEIGHT + SCROLL_HINT_HEIGHT + FOOTER_HEIGHT;
 
 /** Below this the pane is unusable anyway, and a negative window is not a window. */
 const MIN_LIST_HEIGHT = 3;
+
+/**
+ * How the frame divides at a given terminal height: which chrome tier, and how many rows the
+ * list may draw.
+ *
+ * Exported because it is the layout's whole contract in one place — `chrome + list` is what
+ * will be rendered, and it is never more than `rows - RESERVED_ROW` for any `rows >= 7`. Below
+ * that a terminal cannot hold the borders, the hint and the footer at all, and the floor of one
+ * list row is the least-bad answer.
+ */
+export function frameBudget(rows: number): { chrome: number; listHeight: number; full: boolean } {
+  const budget = Math.max(0, (Number.isFinite(rows) ? Math.floor(rows) : 0) - RESERVED_ROW);
+  const full = budget - CHROME_HEIGHT >= MIN_LIST_HEIGHT;
+  const chrome = full ? CHROME_HEIGHT : COMPACT_CHROME_HEIGHT;
+  return { chrome, listHeight: Math.max(1, budget - chrome), full };
+}
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -485,7 +551,7 @@ export function App({
     : columns;
   const detailWidth = twoPane ? columns - listWidth : 0;
   const rowsAvailable = height ?? stdout?.rows ?? 24;
-  const listHeight = Math.max(MIN_LIST_HEIGHT, rowsAvailable - CHROME_HEIGHT);
+  const { listHeight, full: fullChrome } = frameBudget(rowsAvailable);
 
   const categories = useMemo(() => categoriesFor(preset), [categoriesFor, preset]);
   const rows = useMemo(
@@ -927,6 +993,10 @@ export function App({
           bytes={snapshot.bytes}
           blockedBytes={snapshot.blockedBytes}
           width={Math.min(columns - 4, 56)}
+          // Minus the two rows App itself spends around this pane (a spacer and the quit
+          // hint). Handing Confirm the whole terminal is how the frame came to be exactly
+          // two lines too tall.
+          height={rowsAvailable - 2}
         />
         {arrivals > 0 ? (
           <Box paddingX={1}>
@@ -942,12 +1012,26 @@ export function App({
   if (phase.kind === 'cleaning') {
     const { snapshot } = phase;
     const cleaningCount = snapshot.targets.length;
+    // The one screen with the terminal to itself and a user who has nothing to do but wait, so
+    // it is the one screen that can afford the tall wordmark — and the one that should have it,
+    // because the wait is where a tool either feels considered or feels stalled. It is drawn
+    // only when the terminal can hold it *and* the frame still fits inside `rows - 1`, which is
+    // the same rule the workspace obeys and for the same reason.
+    const roomForLogo = rowsAvailable - RESERVED_ROW >= 8;
     return (
       <Box flexDirection="column" paddingX={1}>
-        <Text bold color="yellow">
-          {`Moving ${formatBytes(snapshot.bytes)} to the Trash…`}
-        </Text>
-        <Text dimColor>{`${cleaningCount} ${cleaningCount === 1 ? 'directory' : 'directories'}`}</Text>
+        {roomForLogo ? (
+          <Box flexDirection="column">
+            <Logo width={Math.max(0, columns - 2)} />
+            <Text> </Text>
+          </Box>
+        ) : null}
+        <Headline
+          bytes={snapshot.bytes}
+          caption={`moving to the Trash… · ${cleaningCount} ${cleaningCount === 1 ? 'directory' : 'directories'}`}
+          note={TRASH_CAVEAT}
+          width={Math.max(0, columns - 2)}
+        />
       </Box>
     );
   }
@@ -990,28 +1074,81 @@ export function App({
   }
 
   const foundBytes = rows.reduce((sum, row) => (row.kind === 'header' ? sum + row.bytes : sum), 0);
-  const note = currentRow === undefined ? ' ' : SECTION_NOTES[currentRow.section];
+  const selectable = rows.reduce((sum, row) => (row.kind === 'header' ? sum : sum + 1), 0);
+
+  /**
+   * The two lines beside the headline figure.
+   *
+   * The first is what the figure *is* — how much of the list it covers — and, when there is a
+   * choice to project, what the volume would become. The second is the standing note: the
+   * caveat while something is selected, because that is exactly when a projected free-space
+   * figure could be misread as a reading; the bar's legend when nothing is, because that is
+   * when the bar is least self-explanatory and the caveat has nothing to qualify.
+   *
+   * Both strings come from `diskbar.ts` rather than being retyped or recomputed here — the
+   * projection through `diskLabels`, which owns the clamping, and `TRASH_CAVEAT` as the exported
+   * constant it is — so a re-layout cannot quietly drop the sentence that keeps the projection
+   * honest, and the figure beside the bar and the figure beside the headline cannot disagree.
+   */
+  const projected = disk === undefined ? undefined : diskLabels(disk, totalBytes).projected;
+  const headlineCaption = [
+    `selected ${count} of ${selectable}`,
+    ...(projected === undefined ? [] : [projected]),
+  ].join(' · ');
+  const headlineNote = totalBytes > 0 ? TRASH_CAVEAT : BAR_LEGEND;
+
+  /**
+   * The preset is dropped from the title line before the scan indicator is squeezed.
+   *
+   * They are not equal claims on the space. "Is the scan finished" is the question the user has
+   * to answer correctly before pressing enter, and the settled state is the only thing on
+   * screen that answers it; the preset is configuration, restated by the `p` hint in the
+   * footer and visible in the sizes themselves. Decided from the terminal's width rather than
+   * by letting Yoga shrink both, so that at any width one of them is *readable* rather than
+   * both being half-printed.
+   */
+  const presetText = `  preset ${preset}`;
+  const showPreset = columns - 2 >= WORDMARK.length + presetText.length + MIN_SCAN_WIDTH + 2;
 
   return (
     <Box flexDirection="column">
       <Box paddingX={1} flexDirection="column">
-        {/* Truncated like every other full-width line: the status grows with the project
-            count and the bytes found, and at a narrow terminal it wraps to two lines and
-            pushes the whole frame past the height budget. */}
+        {/* Every segment shrinks. The line grows with the project count, the bytes found and
+            the preset's name, and at a narrow terminal an unshrinkable piece would push the
+            line past the terminal's width, wrap it, and cost the list a row — which is how the
+            frame gets taller than the screen and the header starts duplicating. */}
         <Box width={Math.max(0, columns - 2)}>
-          {/* flexShrink={0}: the product name is the one thing on this line that must not
-              be eaten. Everything after it is a status that degrades gracefully. */}
+          {/* flexShrink={0}: the wordmark is the one thing on this line that must not be
+              eaten. Everything after it is status that degrades gracefully. */}
           <Box flexShrink={0}>
-            <Text bold>dev-cleaner </Text>
+            <Text bold color="cyan">{WORDMARK}</Text>
           </Box>
-          <ScanStatus
-            scanning={scanning}
-            projects={session.projects.length}
-            caches={session.caches.length}
-            bytes={foundBytes}
-          />
+          {showPreset ? (
+            <Box flexShrink={1}>
+              <Text dimColor wrap="truncate-end">{presetText}</Text>
+            </Box>
+          ) : null}
+          {/* A margin rather than trailing spaces on the text: the text is truncated when the
+              line is tight, and truncation eats trailing spaces exactly when the gap is most
+              needed — leaving `preset recomm…✓ scan complete` run together. */}
+          <Box flexShrink={1} flexGrow={1} marginLeft={2} justifyContent="flex-end">
+            <ScanStatus
+              scanning={scanning}
+              projects={session.projects.length}
+              caches={session.caches.length}
+              bytes={foundBytes}
+            />
+          </Box>
         </Box>
-        <Gauge usage={disk} reclaiming={totalBytes} width={columns - 2} />
+        {fullChrome ? <Gauge usage={disk} reclaiming={totalBytes} width={columns - 2} /> : null}
+        {fullChrome ? (
+          <Headline
+            bytes={totalBytes}
+            caption={headlineCaption}
+            note={headlineNote}
+            width={Math.max(0, columns - 2)}
+          />
+        ) : null}
       </Box>
       <Box>
         <Box borderStyle="round" flexDirection="column" paddingX={1} width={listWidth}>
@@ -1043,17 +1180,7 @@ export function App({
           </Box>
         ) : null}
       </Box>
-      <Box paddingX={1}>
-        <Text dimColor>{truncateLabel(note, Math.max(0, columns - 2))}</Text>
-      </Box>
-      <Footer
-        preset={preset}
-        selectedCount={count}
-        selectedBytes={totalBytes}
-        session={sessionSummary(session)}
-        message={message}
-        width={columns}
-      />
+      <Footer session={sessionSummary(session)} message={message} width={columns} />
     </Box>
   );
 }

@@ -21,12 +21,15 @@
 import { EventEmitter } from 'node:events';
 
 import React from 'react';
+import { render as inkRender } from 'ink';
 import { render } from 'ink-testing-library';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { App, runApp, type ExitSummary } from '../src/ui/App.js';
+import { App, frameBudget, runApp, type ExitSummary } from '../src/ui/App.js';
+import { LOGO_TEXT, WORDMARK, bigText } from '../src/ui/Banner.js';
+import { KEY_HINTS } from '../src/ui/Footer.js';
 import { ScanStatus, SPINNER_FRAMES } from '../src/ui/ScanStatus.js';
-import { CURSOR, MARK_OFF, MARK_ON } from '../src/ui/format.js';
+import { CURSOR, MARK_OFF, MARK_ON, formatBytes } from '../src/ui/format.js';
 import { LABEL_HELP } from '../src/ui/labels.js';
 import type { ScanEvent } from '../src/scan.js';
 import type { Screening, ScreeningTier } from '../src/clean.js';
@@ -263,6 +266,55 @@ interface Harness {
 
 const rendered: Instance[] = [];
 
+/**
+ * A terminal of a chosen size, for the assertions `ink-testing-library` cannot make.
+ *
+ * That harness hard-codes its stdout at 100 columns and reports no `rows` at all, so the
+ * `width` prop tells the *component* how wide it is while Yoga still lays out against 100.
+ * Anything about a line being too long for its terminal — which is the other half of "the frame
+ * fits", since a wrapped line is a physical row Ink never counted — has to render through a
+ * stdout that actually claims the width. `debug: true` makes Ink write whole frames with no
+ * cursor escapes in them, exactly as `ink-testing-library` does.
+ */
+class FixedStdout extends EventEmitter {
+  columns: number;
+  rows: number;
+  isTTY = true;
+  frames: string[] = [];
+  constructor(columns: number, rows: number) {
+    super();
+    this.columns = columns;
+    this.rows = rows;
+  }
+  write = (frame: string): boolean => {
+    this.frames.push(frame);
+    return true;
+  };
+  lastFrame = (): string => (this.frames.at(-1) ?? '').replace(/\n$/, '');
+}
+
+class FixedStdin extends EventEmitter {
+  isTTY = true;
+  private buffered: string | null = null;
+  write = (data: string): void => {
+    this.buffered = data;
+    this.emit('readable');
+  };
+  read = (): string | null => {
+    const data = this.buffered;
+    this.buffered = null;
+    return data;
+  };
+  setEncoding(): void {}
+  setRawMode(): void {}
+  resume(): void {}
+  pause(): void {}
+  ref(): void {}
+  unref(): void {}
+}
+
+const inkRendered: { unmount: () => void }[] = [];
+
 function mount(
   stream: AsyncIterable<ScanEvent>,
   overrides: {
@@ -421,6 +473,7 @@ afterEach(() => {
   for (const held of gates.splice(0)) held.open();
   for (const source of feeds.splice(0)) source.done();
   for (const instance of rendered.splice(0)) instance.unmount();
+  for (const instance of inkRendered.splice(0)) instance.unmount();
 });
 
 describe('progressive rendering', () => {
@@ -986,7 +1039,14 @@ describe('confirmation and exit', () => {
       },
     );
 
-    await ui.waitForText('pnpm store');
+    // Wait for the SELECTION, not merely for the row to be painted. A row appears one
+    // commit before the effect that preselects it runs, so waiting on the text can freeze a
+    // snapshot that has the row but not the selection — the frame then reads "1 more found
+    // while confirming" and the totals are short by that row. The file's `ready` helper
+    // exists for this; this test predated it.
+    await ui.waitForText('scan complete');
+    await ui.waitForText('13.0G');
+    await settle();
     await ui.press(ENTER);
     expect(ui.frame()).toContain('13.0G across 3 directories');
 
@@ -2405,5 +2465,449 @@ describe('connectivity chips reach the list pane', () => {
     // prefix is unambiguous — no other chip begins with it — and what is being tested is
     // that the pane received a category set at all, not how wide the harness is.
     expect(ui.line('app')).toContain('needs');
+  });
+});
+
+/**
+ * The duplicated header, and why counting to `rows` was one too far.
+ *
+ * The user's report was "when scrolling, sometimes the header duplicates", and the screenshot
+ * that came with it was taken after a clean. That is not a scrolling bug; it is the frame being
+ * exactly as tall as the terminal.
+ *
+ * Ink redraws incrementally: it writes `frame + "\n"` and, next time, erases the number of
+ * lines it wrote. A frame of exactly `rows` lines therefore occupies `rows + 1` terminal lines,
+ * the emulator scrolls by one, and the erase can no longer reach the line that has gone. Ink
+ * knows this and switches to a whole-screen clear at `outputHeight >= rows` — but that branch
+ * never updates the incremental renderer's line count, so the next frame that happens to be
+ * *shorter* (a confirmation, a round summary, the sparse first frames of a scan) erases too few
+ * lines and leaves the previous frame's header sitting above the new one. Hence "after a
+ * clean": the round summary is the short frame that follows a full-height list.
+ *
+ * The old chrome constants summed to exactly `rows`, so every single list frame took that
+ * branch. The test that was supposed to catch it asserted `lines().length <= rows`, which is
+ * true of the broken layout — the bug lives entirely in the difference between `<= rows` and
+ * `< rows`.
+ *
+ * These tests assert the frame is at most `rows - 1`, at a spread of terminal sizes, before and
+ * after a round. They are scoped to frames that carry the footer — the workspace, which is what
+ * this file's layout owns — because the modal panes are separate components with their own
+ * budgets.
+ */
+describe('the frame leaves the terminal a spare row', () => {
+  const many = (count: number): AsyncIterable<ScanEvent> =>
+    fastStream(
+      Array.from({ length: count }, (_, index) =>
+        projectEvent(
+          makeProject(`proj-${String(index).padStart(2, '0')}`, index % 4 === 0 ? 'active' : 'dormant', [
+            artifact('dist', 'build', (count - index) * GB),
+          ]),
+        ),
+      ),
+    );
+
+  /** A frame drawn by the workspace, as opposed to one of the modal panes. */
+  const isWorkspace = (frame: string): boolean => frame.includes('space toggle');
+
+  it('budgets chrome plus list to less than the terminal, at every height', () => {
+    for (let rows = 7; rows <= 60; rows += 1) {
+      const { chrome, listHeight } = frameBudget(rows);
+      expect(chrome + listHeight, `at ${rows} rows`).toBeLessThanOrEqual(rows - 1);
+      expect(listHeight, `at ${rows} rows`).toBeGreaterThan(0);
+    }
+  });
+
+  it.each([12, 14, 16, 18, 20, 24, 30, 40])(
+    'draws at most %i-1 lines with a list far longer than the window',
+    async (rows) => {
+      const ui = mount(many(30), { width: 100, height: rows });
+      await ui.waitForText('scan complete');
+      await settle();
+
+      expect(ui.lines().length, `at ${rows} rows`).toBeLessThanOrEqual(rows - 1);
+
+      // And it stays that way while the cursor walks the list, which is when the user saw it.
+      for (let step = 0; step < 12; step += 1) {
+        await ui.press('j');
+        expect(ui.lines().length, `at ${rows} rows, step ${step}`).toBeLessThanOrEqual(rows - 1);
+      }
+    },
+  );
+
+  /**
+   * The post-clean frame is the one in the screenshot, and it is not the same frame: the
+   * session ledger has appeared in the footer, rows have gone, and the totals have changed.
+   * Every one of those is a chance for a line to grow.
+   */
+  it.each([14, 18, 24, 40])('still fits after a clean round, at %i rows', async (rows) => {
+    const ui = mount(many(30), { screen: {}, width: 100, height: rows });
+    await ui.waitForText('scan complete');
+    await settle();
+
+    const before = ui.instance.frames.length;
+
+    await ui.press(ENTER);
+    await ui.waitForText('Move to Trash?');
+    await ui.press(ENTER);
+    await ui.waitForText('to the Trash.');
+    await ui.press(ESCAPE);
+    await settle();
+
+    // Back on the list, with the ledger now in the footer.
+    expect(ui.frame()).toContain('trashed this session');
+    expect(ui.lines().length, `at ${rows} rows`).toBeLessThanOrEqual(rows - 1);
+
+    // …and every workspace frame drawn along the way, not merely the one that survived.
+    const workspace = ui.instance.frames.slice(before).filter(isWorkspace);
+    expect(workspace.length).toBeGreaterThan(0);
+    for (const frame of workspace) {
+      expect(frame.split('\n').length, `at ${rows} rows`).toBeLessThanOrEqual(rows - 1);
+    }
+  });
+
+  /**
+   * Height is only half of it. Ink measures the frame it *lays out*; a line longer than the
+   * terminal is wrapped by the emulator afterwards, which adds a physical row Ink never counted
+   * and reproduces the same defect from the other axis. `ink-testing-library` fixes its own
+   * width at 100 columns, so this one renders through a stdout of its own.
+   */
+  it.each([40, 56, 60, 80, 100, 120])('keeps every line inside %i columns', async (columns) => {
+    const stdout = new FixedStdout(columns, 24);
+    const instance = inkRender(
+      <App
+        stream={many(30)}
+        categoriesFor={categoriesFor}
+        onClean={async () => []}
+        nowMs={NOW}
+        readDisk={async () => ({ total: 466 * GB, used: 391 * GB, free: 75 * GB })}
+      />,
+      {
+        stdout: stdout as unknown as NodeJS.WriteStream,
+        stdin: new FixedStdin() as unknown as NodeJS.ReadStream,
+        debug: true,
+        exitOnCtrlC: false,
+        patchConsole: false,
+      },
+    );
+    inkRendered.push(instance);
+
+    await vi.waitFor(() => expect(stdout.lastFrame()).toContain('scan complete'), {
+      timeout: 1_000,
+      interval: 10,
+    });
+
+    const lines = stdout.lastFrame().split('\n');
+    expect(lines.length).toBeLessThanOrEqual(23);
+    for (const line of lines) {
+      expect([...line].length, JSON.stringify(line)).toBeLessThanOrEqual(columns);
+    }
+    // The pinned chrome survived the narrowing, top and bottom.
+    expect(stdout.lastFrame()).toContain('dev-cleaner');
+    expect(stdout.lastFrame()).toContain('space toggle');
+  });
+});
+
+/**
+ * Less chrome, and the number given the room it bought.
+ *
+ * Six lines used to frame one table: a title, two lines of gauge, a section note truncated
+ * mid-sentence, the key hints and a status line. The note restated — badly, in one clipped line
+ * — what the detail pane says in full beside every row it applies to; the gauge's second line
+ * carried a caveat about a projection that was printed on the line above it. Neither earned a
+ * permanent row.
+ *
+ * What is left is four lines above the panes and one below, and two of those four are the
+ * headline figure. The assertions are positional on purpose: "how many lines of chrome" is the
+ * property, and it cannot be expressed as a substring.
+ */
+describe('the chrome is four lines above the panes and one below', () => {
+  const stream = (): AsyncIterable<ScanEvent> =>
+    fastStream([
+      projectEvent(makeProject('alpha', 'dormant', [artifact('dist', 'build', 6 * GB)])),
+      projectEvent(makeProject('beta', 'dormant', [artifact('dist', 'build', 5 * GB)])),
+      projectEvent(makeProject('busy', 'active', [artifact('dist', 'build', 4 * GB)])),
+    ]);
+
+  const usage: DiskUsage = { total: 100 * GB, used: 80 * GB, free: 20 * GB };
+
+  it('opens the panes on the fifth line and closes the frame one line later', async () => {
+    const ui = mount(stream(), { width: 100, height: 24, disk: [usage] });
+    await ui.waitForText('scan complete');
+    await settle();
+
+    const lines = ui.lines();
+    const top = lines.findIndex((line) => line.includes('╭'));
+    const bottom = lines.findIndex((line) => line.includes('╰'));
+
+    // Wordmark, gauge, and the two rows of the headline figure. Nothing else.
+    expect(top).toBe(4);
+    // Exactly one line under the panes: the key hints. Not two, and not a section note.
+    expect(lines.length - bottom - 1).toBe(1);
+    expect(lines[lines.length - 1]).toContain('space toggle');
+  });
+
+  /**
+   * The gauge is one line and states the volume; the consequences of the *selection* — the
+   * projection, and the caveat that stops it being read as a reading — moved next to the
+   * headline figure they describe. The caveat is still on screen, which is the part that
+   * matters: `diskbar.ts` exports the sentence precisely so a re-layout cannot lose it.
+   */
+  it('draws the bar and the volume on one line, with the caveat beside the figure', async () => {
+    const ui = mount(stream(), { width: 100, height: 24, disk: [usage] });
+    await ui.waitForText('selected 2');
+    await settle();
+
+    const lines = ui.lines();
+    const bar = lines.findIndex((line) => line.includes('█'));
+    expect(bar).toBe(1);
+    expect(lines[1]).toContain('80.0G used of 100G');
+    expect(lines[1]).toContain('20.0G free');
+    // The line after the bar is the headline figure, not a second line of gauge.
+    expect(lines[2]).toContain(bigText(formatBytes(11 * GB))[0]);
+
+    expect(ui.frame()).toContain('Trashed files still occupy the disk');
+    expect(ui.frame()).toContain('→ 31.0G free once emptied');
+  });
+});
+
+/**
+ * The number the user came for.
+ *
+ * "The amount that will be 'freed' is not very prominent" — it was `selected 8 · 104G` in dim
+ * cyan at the end of a status line, six characters at the bottom of a screen the user had
+ * opened *specifically* to find out that number. It is now the headline: two rows of block
+ * glyphs, the largest thing on the frame, redrawn on every keystroke that changes it.
+ *
+ * The assertions are against `bigText`, so they are about the figure actually being drawn at
+ * size — a footer that merely printed `11.0G` somewhere would satisfy a substring check.
+ */
+describe('the selection total is the headline', () => {
+  const stream = (): AsyncIterable<ScanEvent> =>
+    fastStream([
+      projectEvent(makeProject('big', 'dormant', [artifact('target', 'build', 6 * GB)])),
+      projectEvent(makeProject('small', 'dormant', [artifact('dist', 'build', 5 * GB)])),
+    ]);
+
+  const drawnAt = (frame: string, bytes: number): number => {
+    const [top, bottom] = bigText(formatBytes(bytes));
+    const lines = frame.split('\n');
+    const at = lines.findIndex((line) => line.includes(top));
+    // Both rows, adjacent and in order, or it is not a figure — it is a coincidence.
+    return at >= 0 && (lines[at + 1] ?? '').includes(bottom) ? at : -1;
+  };
+
+  it('draws the total at four times the size of anything else on the frame', async () => {
+    const ui = mount(stream(), { width: 100, height: 24 });
+    await ui.waitForText('selected 2');
+    await settle();
+
+    expect(drawnAt(ui.frame(), 11 * GB)).toBe(2);
+  });
+
+  it('redraws as the user checks and unchecks boxes', async () => {
+    const ui = mount(stream(), { width: 100, height: 24 });
+    await ui.waitForText('selected 2');
+    await settle();
+    expect(drawnAt(ui.frame(), 11 * GB)).toBeGreaterThanOrEqual(0);
+
+    await ui.press(SPACE); // clear `big`, 6 G
+    expect(ui.frame()).toContain('selected 1');
+    expect(drawnAt(ui.frame(), 5 * GB)).toBeGreaterThanOrEqual(0);
+    expect(drawnAt(ui.frame(), 11 * GB)).toBe(-1);
+
+    await ui.press(SPACE);
+    expect(drawnAt(ui.frame(), 11 * GB)).toBeGreaterThanOrEqual(0);
+  });
+
+  /**
+   * Zero is drawn, not hidden. The figure's whole job is to move as boxes are checked, and a
+   * number that appears out of nowhere on the first check reads as a new element arriving
+   * rather than as the same one answering.
+   */
+  it('draws a figure of 0B when nothing is selected', async () => {
+    const ui = mount(stream(), { width: 100, height: 24 });
+    await ui.waitForText('selected 2');
+    await settle();
+
+    await ui.press('a');
+    expect(ui.frame()).toContain('selected 0');
+    expect(drawnAt(ui.frame(), 0)).toBeGreaterThanOrEqual(0);
+  });
+
+  it('says how much of the list the figure covers', async () => {
+    const ui = mount(stream(), { width: 100, height: 24 });
+    await ui.waitForText('selected 2');
+    await settle();
+    expect(ui.frame()).toContain('selected 2 of 2');
+  });
+});
+
+/**
+ * Branding, and the row budget it is not allowed to spend.
+ *
+ * The user asked for "ascii style titling or something maybe?". A tall banner in the workspace
+ * would eat the rows the rest of this work just bought back, and would do it on every frame of
+ * every session to say something the user already knows. So the workspace gets a one-line
+ * wordmark, and the block face gets its full outing on the clean — the one screen with the
+ * terminal to itself and a user who has nothing to do but watch.
+ */
+describe('the wordmark', () => {
+  const stream = (): AsyncIterable<ScanEvent> =>
+    fastStream([projectEvent(makeProject('alpha', 'dormant', [artifact('dist', 'build', 5 * GB)]))]);
+
+  it('costs the workspace exactly one line', async () => {
+    const ui = mount(stream(), { width: 100, height: 24 });
+    await ui.waitForText('scan complete');
+    await settle();
+
+    const lines = ui.lines();
+    expect(lines[0]).toContain(WORDMARK);
+    // Not a banner: the second line is the gauge, not more letterforms.
+    expect(lines[1]).not.toContain('dev-cleaner');
+    expect(lines[1]).toContain('disk usage unavailable');
+  });
+
+  it('spells itself out in full on the clean, where nothing competes for the space', async () => {
+    const held = gate();
+    const ui = mount(stream(), { width: 100, height: 24, holdClean: held });
+    await ui.waitForText('selected 1');
+    await settle();
+
+    await ui.press(ENTER);
+    await ui.press(ENTER);
+    await vi.waitFor(() => expect(ui.cleaned).toHaveLength(1), { timeout: 1_000, interval: 10 });
+
+    const [top, bottom] = bigText(LOGO_TEXT);
+    expect(ui.frame()).toContain(top);
+    expect(ui.frame()).toContain(bottom);
+    // And the figure is still the headline: what is moving, at size.
+    expect(ui.frame()).toContain('to the Trash…');
+    expect(ui.frame()).toContain(bigText(formatBytes(5 * GB))[0]);
+
+    held.open();
+    await ui.waitForText('to the Trash.');
+  });
+
+  /** A terminal too narrow for the letterforms gets the compact mark rather than a wrap. */
+  it('degrades to the compact mark rather than wrapping on a narrow terminal', async () => {
+    const held = gate();
+    const stdout = new FixedStdout(40, 24);
+    const stdin = new FixedStdin();
+    let cleanedOnce = false;
+
+    const instance = inkRender(
+      <App
+        stream={fastStream([
+          projectEvent(makeProject('alpha', 'dormant', [artifact('dist', 'build', 5 * GB)])),
+        ])}
+        categoriesFor={categoriesFor}
+        onClean={async () => {
+          cleanedOnce = true;
+          await held.promise;
+          return [];
+        }}
+        nowMs={NOW}
+      />,
+      {
+        stdout: stdout as unknown as NodeJS.WriteStream,
+        stdin: stdin as unknown as NodeJS.ReadStream,
+        debug: true,
+        exitOnCtrlC: false,
+        patchConsole: false,
+      },
+    );
+    inkRendered.push(instance);
+
+    await vi.waitFor(() => expect(stdout.lastFrame()).toContain('selected 1'), {
+      timeout: 1_000,
+      interval: 10,
+    });
+    await settle();
+    stdin.write(ENTER);
+    await delay(30);
+    stdin.write(ENTER);
+    await vi.waitFor(() => expect(cleanedOnce).toBe(true), { timeout: 1_000, interval: 10 });
+
+    const frame = stdout.lastFrame();
+    expect(frame).not.toContain(bigText(LOGO_TEXT)[0]);
+    expect(frame).toContain('dev-cleaner');
+    for (const line of frame.split('\n')) expect([...line].length).toBeLessThanOrEqual(40);
+
+    held.open();
+  });
+});
+
+/**
+ * The command bar is one line, and it keeps the keys visible whatever else it has to say.
+ *
+ * It used to be two: hints, and a status line whose contents have all moved somewhere better —
+ * the selection total to the headline, the preset to the title line. What is left is the
+ * session ledger, and a message when there is one. Both share the line with the hints.
+ *
+ * The rule that matters is the one about messages: a user who has just seen `clean failed:` is
+ * exactly the user who needs to know which key gets them out, so the right-hand column may
+ * take at most half the bar and the keys keep the rest.
+ */
+describe('the command bar', () => {
+  const stream = (): AsyncIterable<ScanEvent> =>
+    fastStream([projectEvent(makeProject('alpha', 'dormant', [artifact('dist', 'build', 5 * GB)]))]);
+
+  it('shows a message and the keybindings on the same single line', async () => {
+    const ui = mount(stream(), { width: 100, height: 24 });
+    await ui.waitForText('selected 1');
+    await settle();
+
+    const before = ui.lines().length;
+
+    await ui.press('a'); // clear the section
+    expect(ui.frame()).toContain('selected 0');
+    await ui.press(ENTER);
+
+    const lines = ui.lines();
+    expect(lines.length).toBe(before);
+
+    const bar = lines[lines.length - 1] ?? '';
+    expect(bar).toContain('Nothing selected');
+    expect(bar).toContain('space toggle');
+    expect(bar).toContain('q quit');
+  });
+
+  it('never lets a long message take more than half the bar from the keys', async () => {
+    const ui = mount(stream(), {
+      width: 100,
+      height: 24,
+      onAttempt: () => {
+        throw new Error('EMFILE: too many open files while moving directories to the Trash');
+      },
+    });
+    await ui.waitForText('selected 1');
+    await settle();
+
+    await ui.press(ENTER);
+    await ui.press(ENTER);
+    await ui.waitForText('clean failed: EMFILE');
+
+    const bar = ui.lines()[ui.lines().length - 1] ?? '';
+    expect([...bar].length).toBeLessThanOrEqual(100);
+    // Half the bar is the message's ceiling, so the keys keep the rest — including the one
+    // that gets the user out of the state the message is about.
+    expect(bar).toContain('space toggle');
+    expect(bar).toContain(KEY_HINTS.slice(0, 40));
+  });
+
+  it('carries the session ledger once a round has completed', async () => {
+    const ui = mount(stream(), { screen: {}, width: 100, height: 24 });
+    await ui.waitForText('selected 1');
+    await settle();
+
+    await ui.press(ENTER);
+    await ui.waitForText('Move to Trash?');
+    await ui.press(ENTER);
+    await ui.waitForText('to the Trash.');
+    await ui.press(ESCAPE);
+
+    const bar = ui.lines()[ui.lines().length - 1] ?? '';
+    expect(bar).toContain('5.0G trashed this session');
+    expect(bar).toContain('space toggle');
   });
 });

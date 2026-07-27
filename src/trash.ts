@@ -32,9 +32,48 @@
  * they agree to destroy them. Showing this run's bytes beside an "Empty Trash?" prompt
  * would be a lie of arrangement, which is the kind this tool is least able to afford.
  *
- * That requirement is also why `available: false` zeroes the counts rather than reporting a
- * partial one: an understated total under a prompt that empties everything is worse than no
- * total at all. `available: false` means *do not show a figure and do not offer to empty*.
+ * # Three ways of knowing, and one of not knowing
+ *
+ * On a stock Mac the obvious implementation does not work. `~/.Trash` is protected by TCC:
+ * a terminal without Full Disk Access gets `EPERM` from `readdir`, and every process this
+ * tool can spawn inherits that refusal — `du` included, and `do shell script` sent *through*
+ * Finder included, which was tried and denied. So the direct read is not the common path on
+ * the machines this tool is for; it is the lucky one.
+ *
+ * Finder, however, already holds the entitlement, and it will answer questions about the
+ * Trash over Apple events. That is a *different* permission — Automation, not Full Disk
+ * Access — asked for with a different prompt, and grantable independently. So there are four
+ * states, and `TrashSource` names them:
+ *
+ * - `filesystem` — the direct read worked. Bytes and items are both exact. Preferred, always
+ *   tried first: it is faster and it needs no automation consent.
+ * - `finder` — the direct read was denied and Finder answered. Finder always knows the item
+ *   count. It reports a *size* only for items it has already measured, which for folders is
+ *   essentially never (`physical size of every item of trash` comes back `missing value` for
+ *   every directory, and directories are exactly what this tool puts there). So this state
+ *   usually carries a trustworthy count and no byte total at all.
+ * - `blind` — neither answered. Nothing about the contents is known.
+ * - `unsupported` — a platform whose Trash layout this module does not know, and cannot
+ *   empty.
+ *
+ * # Why "we cannot see inside" is still an offer, not a refusal
+ *
+ * An earlier version treated `available: false` as "offer nothing". On the machine this tool
+ * was written for that meant the feature was dead: 107 GB sat in the Trash, still occupying
+ * the disk, and the tool — whose entire purpose is reclaiming that space — stopped one step
+ * short of the only step that reclaims it, because it could not read a directory macOS does
+ * not let it read.
+ *
+ * The reasoning behind that refusal was sound and is preserved exactly: an **understated byte
+ * total** next to a prompt that destroys everything is the one arrangement that must never be
+ * rendered. `bytes` is therefore still meaningless unless `available` is true, and callers
+ * still must not print it otherwise. But "do not print a number you do not have" is not the
+ * same instruction as "do not offer". A prompt that says *we cannot see what is in there, and
+ * emptying takes all of it including whatever you put there yourself* is a worse deal for the
+ * user than a measured one and an honest one — and it is the deal macOS actually offers.
+ *
+ * `mayOfferEmpty` is where that line is drawn, in one place, so the difference between "no
+ * figure" and "no offer" cannot blur.
  *
  * # Why Finder, and not `rm -rf ~/.Trash/*`
  *
@@ -44,13 +83,19 @@
  * delete. And it is an unbounded recursive delete written by us, aimed by a glob, in a tool
  * whose entire reason for existing is that unbounded recursive deletes written casually are
  * how people lose data. Asking the platform to empty its own Trash costs one subprocess and
- * gets all three right.
+ * gets all three right. (It also would not work: `rm` is denied `~/.Trash` for the same
+ * reason `readdir` is.)
  *
  * # Nothing here runs by accident
  *
  * There is no default export and no side effect at import: the module body only declares
  * constants and functions. Importing it cannot empty anything, cannot spawn anything, and
  * cannot even read the disk. Every effect requires a call.
+ *
+ * The read path may now spawn `osascript`, which the write path also does — so the two are
+ * kept apart by construction. `EMPTY_SCRIPT` is the only string in this codebase that empties
+ * anything and is reachable only from `emptyTrash`; the read path can pass nothing but
+ * `COUNT_SCRIPT` and `SIZES_SCRIPT`, both of which only interrogate.
  */
 
 import { execFile } from 'node:child_process';
@@ -62,17 +107,34 @@ import path from 'node:path';
 import { dirSize } from './size.js';
 
 /**
+ * How dev-cleaner learned what is in the Trash — or why it could not. See the module note;
+ * on macOS the answer depends on which of two unrelated permissions the user has granted.
+ */
+export type TrashSource = 'filesystem' | 'finder' | 'blind' | 'unsupported';
+
+/**
  * What is in the Trash — **all** of it, not this run's contribution. See the module note:
  * the distinction is the whole safety story of this file.
  *
- * When `available` is false the tool could not establish the total, and `bytes` and `items`
+ * When `available` is false the byte total could not be established, and `bytes` and `items`
  * are zero because they are unknown, not because the Trash is empty. Those two states must
- * never be rendered the same way.
+ * never be rendered the same way, and `bytes` must not be printed at all in the second.
+ *
+ * `knownItems` is the one figure that can survive an unmeasurable Trash: Finder will report
+ * how many items it holds even when it will not report their size. It is present only when
+ * `available` is false and the count is nonetheless trustworthy — when `available` is true,
+ * `items` is that count.
  */
 export interface TrashSummary {
   bytes: number;
   items: number;
   available: boolean;
+  /** How the figures were obtained. Absent on a summary built by hand rather than read. */
+  source?: TrashSource;
+  /** Finder's item count, when the byte total is unknown but the count is not. */
+  knownItems?: number;
+  /** The missing permission and where to grant it, in the user's terms. */
+  detail?: string;
 }
 
 /** The outcome of an empty request. `detail` carries the platform's own words on failure. */
@@ -88,7 +150,7 @@ export interface EmptyTrashResult {
 export type TrashExec = (
   command: string,
   args: readonly string[],
-) => Promise<{ ok: boolean; stderr: string }>;
+) => Promise<{ ok: boolean; stdout: string; stderr: string }>;
 
 export interface TrashRootOptions {
   platform?: NodeJS.Platform;
@@ -105,6 +167,11 @@ export interface TrashSummaryOptions extends TrashRootOptions {
   roots?: readonly string[];
   /** Byte sizer, for tests that need a deterministic total. */
   size?: (target: string) => Promise<number>;
+  /**
+   * Subprocess runner for the Finder fallback. Injected so tests can drive Finder's answers —
+   * and its refusals — without an Apple event ever leaving the process.
+   */
+  exec?: TrashExec;
 }
 
 export interface EmptyTrashOptions {
@@ -119,6 +186,14 @@ export interface EmptyTrashOptions {
 const EMPTY_SCRIPT = 'tell application "Finder" to empty trash';
 
 /**
+ * The read path's entire vocabulary. Both only interrogate: there is no verb in either that
+ * moves, deletes or empties anything, which is what keeps "reading cannot destroy" a property
+ * of the code rather than of the author's care.
+ */
+const COUNT_SCRIPT = 'tell application "Finder" to count items in trash';
+const SIZES_SCRIPT = 'tell application "Finder" to get physical size of every item of trash';
+
+/**
  * Generous on purpose. Finder blocks until the empty completes, and a Trash holding a few
  * hundred thousand `node_modules` inodes — which is precisely what this tool puts there —
  * takes minutes. A tight timeout would report failure over a successful long empty, which is
@@ -127,12 +202,40 @@ const EMPTY_SCRIPT = 'tell application "Finder" to empty trash';
 const EMPTY_TIMEOUT_MS = 10 * 60_000;
 
 /**
+ * The read path gets its own, much shorter budget. It runs while the user waits at a prompt,
+ * and its failure mode is benign — an unanswered question degrades to "we cannot see inside",
+ * which is a state this module now handles rather than an error. It must also be long enough
+ * to cover the automation consent dialog, which blocks `osascript` until the user answers it.
+ */
+const READ_TIMEOUT_MS = 60_000;
+
+/**
+ * Above this many items, do not ask Finder to size them. The reply is one number per item on
+ * a single line, so a Trash holding a hundred thousand files would overrun the pipe buffer and
+ * turn a fast "we cannot measure this" into a slow one. The count alone is still worth having.
+ */
+const SIZE_PROBE_LIMIT = 5_000;
+
+/**
  * Finder's own bookkeeping file. Finder does not show it and neither should we: reporting
  * "1 item, 0 B" for a Trash the user sees as empty reads as a bug and teaches them to
  * distrust the count. Only this exact name is excluded — a user may legitimately trash a
  * dotfile, and `.env` is an item like any other.
  */
 const FINDER_METADATA = '.DS_Store';
+
+/**
+ * The actionable half of a permission failure, and nothing else.
+ *
+ * Each fits inside the 72 columns the pane is given, indent included, because a hint that
+ * truncates mid-sentence is worse than no hint: it costs a line, teaches the user that the
+ * tool's own text does not fit, and withholds the ending — which is where the instruction is.
+ * The diagnosis belongs in `describeFailure`, on the failure screen, where there is room.
+ */
+const CANNOT_MEASURE_HINT = 'Full Disk Access would let dev-cleaner show you the size.';
+const AUTOMATION_REFUSED_HINT =
+  'Automation was refused — grant it, or Full Disk Access, in Settings.';
+const NO_ANSWER_HINT = 'Finder did not answer. Grant Full Disk Access in System Settings.';
 
 /** Errors that mean "this trash directory is not here", which is not the same as a failure. */
 function isAbsent(error: unknown): boolean {
@@ -159,7 +262,7 @@ async function resolveOrSelf(target: string): Promise<string> {
  * volume commonly appears under `/Volumes` as well), and the same directory counted twice
  * would overstate the total.
  *
- * Non-macOS returns nothing: see `readTrashSummary`, which reports that as unavailable
+ * Non-macOS returns nothing: see `readTrashSummary`, which reports that as unsupported
  * rather than guessing at another platform's layout.
  */
 export async function defaultTrashRoots(options: TrashRootOptions = {}): Promise<string[]> {
@@ -216,8 +319,8 @@ type RootReading =
  * of a zero.
  *
  * This is not a hypothetical: on macOS, reading `~/.Trash` requires Full Disk Access, which
- * a terminal does not have by default. Unavailable is the *common* outcome, not the exotic
- * one, and it has to be a first-class answer rather than an error path.
+ * a terminal does not have by default. Unreadable is the *common* outcome, not the exotic
+ * one, and it is what sends `readTrashSummary` to Finder.
  */
 async function readRoot(
   root: string,
@@ -239,75 +342,46 @@ async function readRoot(
   return { kind: 'counted', bytes, items };
 }
 
-function unavailable(): TrashSummary {
-  return { bytes: 0, items: 0, available: false };
+function unknownTrash(source: TrashSource, detail: string): TrashSummary {
+  return { bytes: 0, items: 0, available: false, source, detail };
 }
 
 /**
- * How much is in the Trash right now — **the whole Trash**, every trash directory on the
- * machine, everything `emptyTrash` would destroy.
- *
- * ## The shell's obligation
- *
- * Whatever renders an "Empty Trash?" prompt must display *these* two numbers beside it, and
- * must not display the byte total or item count of the clean that just ran. Emptying does
- * not remove this run's items; it removes everything, including whatever the user put there
- * for reasons that have nothing to do with build artifacts. Showing the run's smaller figure
- * next to a prompt with this larger effect misrepresents the offer even if every individual
- * number on screen is true. The full explanation is in the module note above.
- *
- * When `available` is false the shell must show no figure and offer no empty: the total
- * could not be established, and `bytes`/`items` are zero because they are *unknown*.
- *
- * Never throws, and never mutates anything — reading the Trash cannot empty it, and this
- * function runs no subprocess capable of doing so.
- */
-export async function readTrashSummary(options: TrashSummaryOptions = {}): Promise<TrashSummary> {
-  const platform = options.platform ?? process.platform;
-  const size = options.size ?? ((target: string) => dirSize(target));
-
-  const roots = options.roots ?? (await defaultTrashRoots(options));
-  // No known trash layout for this platform, so no honest total to report.
-  if (roots.length === 0) return unavailable();
-
-  let bytes = 0;
-  let items = 0;
-  for (const root of roots) {
-    const reading = await readRoot(root, size);
-    // Fail closed. One unreadable trash directory means the reported total would be smaller
-    // than what emptying destroys, and an understated total is the one number that must
-    // never appear next to this prompt.
-    if (reading.kind === 'unreadable') return unavailable();
-    if (reading.kind === 'absent') continue;
-    bytes += reading.bytes;
-    items += reading.items;
-  }
-
-  return { bytes, items, available: true };
-}
-
-/**
- * The production executor: `osascript`, in argv form.
+ * The production executors: `osascript`, in argv form.
  *
  * `execFile`, never `exec`, so no string is ever handed to a shell — there is nothing here
  * for a shell to reinterpret, and the script text stays a single opaque argument.
  */
-const systemExec: TrashExec = (command, args) =>
-  new Promise((resolve) => {
-    execFile(
-      command,
-      [...args],
-      {
-        encoding: 'utf8',
-        timeout: EMPTY_TIMEOUT_MS,
-        maxBuffer: 1024 * 1024,
-        windowsHide: true,
-      },
-      (error, _stdout, stderr) => {
-        resolve({ ok: error === null, stderr: typeof stderr === 'string' ? stderr : '' });
-      },
-    );
-  });
+function osascriptExec(timeoutMs: number): TrashExec {
+  return (command, args) =>
+    new Promise((resolve) => {
+      execFile(
+        command,
+        [...args],
+        {
+          encoding: 'utf8',
+          timeout: timeoutMs,
+          maxBuffer: 1024 * 1024,
+          windowsHide: true,
+        },
+        (error, stdout, stderr) => {
+          resolve({
+            ok: error === null,
+            stdout: typeof stdout === 'string' ? stdout : '',
+            stderr: typeof stderr === 'string' ? stderr : '',
+          });
+        },
+      );
+    });
+}
+
+const systemExec: TrashExec = osascriptExec(EMPTY_TIMEOUT_MS);
+const readExec: TrashExec = osascriptExec(READ_TIMEOUT_MS);
+
+/** macOS denies Apple events to un-consented applications with error -1743. */
+function isAutomationDenial(stderr: string): boolean {
+  return stderr.includes('-1743') || stderr.toLowerCase().includes('not authorized');
+}
 
 /**
  * macOS denies Apple events to un-consented applications with error -1743, which arrives as
@@ -316,7 +390,7 @@ const systemExec: TrashExec = (command, args) =>
  */
 function describeFailure(stderr: string): string {
   const detail = stderr.trim();
-  if (detail.includes('-1743') || detail.toLowerCase().includes('not authorized')) {
+  if (isAutomationDenial(detail)) {
     return (
       'macOS did not allow dev-cleaner to control Finder. ' +
       'Grant it under System Settings > Privacy & Security > Automation, ' +
@@ -328,16 +402,189 @@ function describeFailure(stderr: string): string {
 }
 
 /**
+ * Finder's count, as a whole number. Anything else — a refusal, an AppleScript error printed
+ * to stdout, an empty reply — is `undefined`, never a zero: "Finder would not say" and "the
+ * Trash is empty" are the two states this module exists to keep apart.
+ */
+function parseCount(stdout: string): number | undefined {
+  const text = stdout.trim();
+  if (!/^\d+$/.test(text)) return undefined;
+  const value = Number.parseInt(text, 10);
+  return Number.isSafeInteger(value) ? value : undefined;
+}
+
+/**
+ * The sum of `physical size of every item of trash`, or `undefined` if any part of the reply
+ * is not a number.
+ *
+ * Finder answers `missing value` for anything whose size it has not already calculated, which
+ * is every folder — so this returns `undefined` far more often than it returns a total. That
+ * is the correct outcome and not a degraded one: a sum over the items Finder *could* size
+ * would be smaller than the truth, and an understated total is the single figure this module
+ * will not produce.
+ *
+ * `expected` is checked against the reply's length for the same reason. The count and the
+ * sizes are two separate Apple events, and a Trash that changed between them would otherwise
+ * yield a total that belongs to neither reading.
+ */
+function parseSizes(stdout: string, expected: number): number | undefined {
+  const text = stdout.trim();
+  if (text.length === 0) return undefined;
+
+  const tokens = text.split(',').map((token) => token.trim());
+  if (tokens.length !== expected) return undefined;
+
+  let total = 0;
+  for (const token of tokens) {
+    // `missing value`, and anything else Finder might say, fails here. AppleScript prints
+    // large sizes in exponential form (`1.07374182E+11`), which still begins with a digit and
+    // which `Number` reads correctly.
+    if (!/^\d/.test(token)) return undefined;
+    const value = Number(token);
+    if (!Number.isFinite(value) || value < 0) return undefined;
+    total += value;
+  }
+  return total;
+}
+
+/**
+ * Ask Finder. Reached only when the direct read was denied.
+ *
+ * Two questions, in order, and the second is skipped unless the first makes it worth asking.
+ * Neither can modify anything: see `COUNT_SCRIPT` and `SIZES_SCRIPT`.
+ */
+async function readViaFinder(exec: TrashExec): Promise<TrashSummary> {
+  const counted = await exec('osascript', ['-e', COUNT_SCRIPT]);
+  const count = counted.ok ? parseCount(counted.stdout) : undefined;
+  if (count === undefined) {
+    // Finder refused or answered unintelligibly. Nothing about the contents is known — but
+    // the offer to empty survives that, with copy that says so. See the module note.
+    const refused = isAutomationDenial(counted.stderr.trim());
+    return unknownTrash('blind', refused ? AUTOMATION_REFUSED_HINT : NO_ANSWER_HINT);
+  }
+
+  // An empty Trash is the one thing Finder can tell us exactly. Zero items is zero bytes, and
+  // that is a real, disclosable total rather than an absence of one.
+  if (count === 0) return { bytes: 0, items: 0, available: true, source: 'finder' };
+
+  if (count <= SIZE_PROBE_LIMIT) {
+    const sized = await exec('osascript', ['-e', SIZES_SCRIPT]);
+    const bytes = sized.ok ? parseSizes(sized.stdout, count) : undefined;
+    if (bytes !== undefined) {
+      return { bytes, items: count, available: true, source: 'finder' };
+    }
+  }
+
+  return {
+    bytes: 0,
+    items: 0,
+    available: false,
+    source: 'finder',
+    knownItems: count,
+    detail: CANNOT_MEASURE_HINT,
+  };
+}
+
+/**
+ * How much is in the Trash right now — **the whole Trash**, every trash directory on the
+ * machine, everything `emptyTrash` would destroy.
+ *
+ * ## The shell's obligation
+ *
+ * Whatever renders an "Empty Trash?" prompt must display *these* figures beside it, and must
+ * not display the byte total or item count of the clean that just ran. Emptying does not
+ * remove this run's items; it removes everything, including whatever the user put there for
+ * reasons that have nothing to do with build artifacts. Showing the run's smaller figure next
+ * to a prompt with this larger effect misrepresents the offer even if every individual number
+ * on screen is true. The full explanation is in the module note above.
+ *
+ * When `available` is false the shell must show **no byte figure**: the total could not be
+ * established, and `bytes` is zero because it is *unknown*. It may still show `knownItems`
+ * when that is present, and — see `mayOfferEmpty` — it may still offer to empty, provided the
+ * copy says plainly that the contents are unseen and that emptying takes all of them.
+ *
+ * ## The order of attempts
+ *
+ * The direct filesystem read is tried first and preferred: it is exact, it is fast, and it
+ * asks the user for nothing. Only when a trash directory answers `EPERM` — the macOS default,
+ * not the exception — is Finder asked, which costs an automation consent prompt the first
+ * time and may itself be declined.
+ *
+ * Never throws, and never mutates anything — reading the Trash cannot empty it, and the only
+ * scripts this function can run are the two that interrogate.
+ */
+export async function readTrashSummary(options: TrashSummaryOptions = {}): Promise<TrashSummary> {
+  const platform = options.platform ?? process.platform;
+  const size = options.size ?? ((target: string) => dirSize(target));
+
+  const roots = options.roots ?? (await defaultTrashRoots(options));
+  // No known trash layout for this platform, and nothing here can empty one either.
+  if (roots.length === 0) {
+    return unknownTrash(
+      'unsupported',
+      `dev-cleaner does not know how to read or empty the Trash on ${platform}.`,
+    );
+  }
+
+  let bytes = 0;
+  let items = 0;
+  let blocked = false;
+  for (const root of roots) {
+    const reading = await readRoot(root, size);
+    // Fail closed on the byte total. One unreadable trash directory means the figure would be
+    // smaller than what emptying destroys, and an understated total is the one number that
+    // must never appear next to this prompt. The partial sum is abandoned, not reported.
+    if (reading.kind === 'unreadable') {
+      blocked = true;
+      break;
+    }
+    if (reading.kind === 'absent') continue;
+    bytes += reading.bytes;
+    items += reading.items;
+  }
+
+  if (!blocked) return { bytes, items, available: true, source: 'filesystem' };
+
+  // Finder holds the entitlement this process does not. It is macOS-only, so everywhere else
+  // an unreadable trash directory is simply the end of the road.
+  if (platform !== 'darwin') {
+    return unknownTrash('blind', 'dev-cleaner could not read the Trash on this system.');
+  }
+  return readViaFinder(options.exec ?? readExec);
+}
+
+/**
+ * May an "Empty the Trash?" prompt be offered against this summary?
+ *
+ * The one place the distinction between "no figure" and "no offer" is decided, so the two
+ * cannot blur. Three of the four states permit an offer:
+ *
+ * - measured (`available`) — offer it, captioned with the total;
+ * - `finder` or `blind` — offer it, captioned with the truth that the contents are unseen and
+ *   that emptying takes every one of them. Refusing here is what made this feature dead on a
+ *   stock Mac, and stopping short of the step that reclaims the space is doing half a job;
+ * - `unsupported` — no. There is nothing to offer: `emptyTrash` will not run a command on a
+ *   platform whose Trash it does not know.
+ *
+ * A summary with no `source` at all was not produced by this module — it was built by hand, by
+ * a caller that said only "unavailable" and nothing about why. That gets the conservative
+ * answer, because the reason an offer is defensible above is that the reason is known.
+ */
+export function mayOfferEmpty(summary: TrashSummary): boolean {
+  if (summary.available) return true;
+  return summary.source === 'finder' || summary.source === 'blind';
+}
+
+/**
  * Empty the Trash. **IRREVERSIBLE, and total.**
  *
  * This destroys everything in every trash directory on the machine — not the items this run
- * put there, everything. Call it only after the user has agreed to that having seen
- * `readTrashSummary`'s figures, and only when that summary reported `available: true`; an
- * empty offered without a disclosed total is an offer the user cannot evaluate.
+ * put there, everything. Call it only after the user has agreed to that having seen what
+ * `readTrashSummary` could establish, and only when `mayOfferEmpty` allowed the offer.
  *
  * Delegates to Finder rather than deleting anything itself, which is what makes it cover the
  * per-volume trashes and leave Finder's own state coherent. See the module note for why the
- * obvious `rm -rf` is not merely inferior but wrong.
+ * obvious `rm -rf` is not merely inferior but wrong — and, on a stock Mac, not even possible.
  *
  * Returns `ok: false` rather than throwing on every failure, including a platform where this
  * is unsupported — where it also runs **no command at all**, since the same request means
