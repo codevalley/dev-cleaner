@@ -139,7 +139,7 @@ async function runClean(
       const trashedBytes = outcomes
         .filter((outcome) => outcome.outcome === 'trashed')
         .reduce((sum, outcome) => sum + outcome.bytes, 0);
-      return { cleaned: true, outcomes, trashedBytes };
+      return { cleaned: true, outcomes, trashedBytes, rounds: 1, trashEmptied: false };
     },
     trash: async () => undefined,
     ...overrides,
@@ -297,11 +297,18 @@ describe('the store prune, against a machine the scan did not cover', () => {
       expect(refusal?.bytes).toBe(8 * GB);
       // Ordering survives: a store prune is the last thing a run would have done.
       expect(run.outcomes[run.outcomes.length - 1]).toBe(refusal);
-      // Refused, not trashed: the store is listed as refused and the disclosure counts only
-      // the 2G that actually moved, never the 8G the store would have been.
-      expect(run.out).toMatch(/refused\s+pnpm store/);
-      expect(run.out).toContain('2.0G is now in the Trash');
-      expect(run.out).not.toMatch(/8\.0G is now in the Trash/);
+      // Refused, not trashed — and invariant 8's arithmetic follows it out to stdout: the
+      // closing line counts only the 2 G that actually moved, never the 8 G the store would
+      // have been. That subtraction is the assertion; a total that silently included a
+      // refusal would send the user to empty a Trash expecting four times what is in it.
+      //
+      // The refusal's own *wording* is no longer stdout's job. The per-outcome report now
+      // renders inside the interface, one round at a time, where it can be read next to the
+      // list it describes — so what it says is pinned against the round summary in
+      // `ui.app.test.tsx`, and what it *is* is pinned by `run.outcomes` immediately above.
+      expect(run.out).toContain('2.0G');
+      expect(run.out).not.toContain('8.0G');
+      expect(run.out).toMatch(/empty the Trash/i);
       expect(run.code).toBe(0);
     } finally {
       await fx.cleanup();

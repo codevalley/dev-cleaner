@@ -25,9 +25,12 @@ import { render } from 'ink-testing-library';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { App, runApp, type ExitSummary } from '../src/ui/App.js';
+import { ScanStatus, SPINNER_FRAMES } from '../src/ui/ScanStatus.js';
 import { CURSOR, MARK_OFF, MARK_ON } from '../src/ui/format.js';
 import type { ScanEvent } from '../src/scan.js';
 import type { Screening, ScreeningTier } from '../src/clean.js';
+import type { DiskUsage } from '../src/ui/diskbar.js';
+import type { EmptyTrashResult, TrashSummary } from '../src/trash.js';
 import type {
   Artifact,
   CacheEntry,
@@ -94,6 +97,22 @@ function makeCache(id: string, bytes: number): CacheEntry {
 }
 
 const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Wait for the frame on screen and the handler that will act on it to be the same generation.
+ *
+ * A frame is painted at commit; `useInput` re-subscribes in a *passive* effect, which React
+ * runs after. So there is a window — one macrotask wide — in which `lastFrame()` already shows
+ * a row and its selection, while a keystroke written to stdin is still dispatched to the
+ * previous render's closure, which had neither. A test that asserts on the frame and then
+ * presses a key inside that window freezes a snapshot the screen never showed, and fails with
+ * a total one row short.
+ *
+ * This is a property of the harness, not of the app: freezing whatever the last render knew is
+ * exactly what "consent is a snapshot" means. What the tests need is to press the key *after*
+ * the app has finished absorbing the scan, and this is how they wait for that.
+ */
+const settle = (): Promise<void> => delay(30);
 
 interface Gate {
   promise: Promise<void>;
@@ -233,6 +252,9 @@ interface Harness {
   cleaned: CleanTarget[][];
   screened: ScreenCall[];
   exits: ExitSummary[];
+  /** One entry per `emptyTrash` call. Length is the assertion that matters. */
+  emptied: number[];
+  lines(): string[];
   press(data: string): Promise<void>;
   waitForText(text: string, timeout?: number): Promise<void>;
 }
@@ -255,11 +277,50 @@ function mount(
     outcomeFor?: (target: CleanTarget) => CleanOutcome['outcome'];
     /** Absent means no `onScreen` prop at all — the unscreened app. */
     screen?: ScreenPlan;
+    /** Terminal geometry. Small heights are how the scrolling tests get a short window. */
+    width?: number;
+    height?: number;
+    /** Successive disk readings, one per call, so a refresh can observe a changed volume. */
+    disk?: (DiskUsage | undefined)[];
+    /** Successive Trash readings, likewise — before the empty, and after it. */
+    trash?: TrashSummary[];
+    emptyTrash?: () => Promise<EmptyTrashResult>;
   } = {},
 ): Harness {
   const cleaned: CleanTarget[][] = [];
   const screened: ScreenCall[] = [];
   const exits: ExitSummary[] = [];
+  const emptied: number[] = [];
+
+  const diskReadings = overrides.disk;
+  let diskRead = 0;
+  const readDisk =
+    diskReadings === undefined
+      ? undefined
+      : async (): Promise<DiskUsage | undefined> => {
+          const at = Math.min(diskRead, diskReadings.length - 1);
+          diskRead += 1;
+          return diskReadings[at];
+        };
+
+  const trashReadings = overrides.trash;
+  let trashRead = 0;
+  const readTrash =
+    trashReadings === undefined
+      ? undefined
+      : async (): Promise<TrashSummary> => {
+          const at = Math.min(trashRead, trashReadings.length - 1);
+          trashRead += 1;
+          return trashReadings[at] as TrashSummary;
+        };
+
+  const onEmptyTrash =
+    trashReadings === undefined && overrides.emptyTrash === undefined
+      ? undefined
+      : async (): Promise<EmptyTrashResult> => {
+          emptied.push(Date.now());
+          return overrides.emptyTrash === undefined ? { ok: true } : overrides.emptyTrash();
+        };
 
   const plan = overrides.screen;
   const onScreen =
@@ -301,6 +362,11 @@ function mount(
       nowMs={NOW}
       {...(onScreen === undefined ? {} : { onScreen })}
       {...(overrides.preset === undefined ? {} : { preset: overrides.preset })}
+      {...(overrides.width === undefined ? {} : { width: overrides.width })}
+      {...(overrides.height === undefined ? {} : { height: overrides.height })}
+      {...(readDisk === undefined ? {} : { readDisk })}
+      {...(readTrash === undefined ? {} : { readTrash })}
+      {...(onEmptyTrash === undefined ? {} : { onEmptyTrash })}
     />,
   );
   rendered.push(instance);
@@ -333,6 +399,11 @@ function mount(
     cleaned,
     screened,
     exits,
+    emptied,
+    /** Every physical line of the frame — what the terminal would actually have to fit. */
+    lines(): string[] {
+      return frame().split('\n');
+    },
     async press(data: string): Promise<void> {
       instance.stdin.write(data);
       // Let Ink's reconciler flush the state update into a new frame.
@@ -428,7 +499,7 @@ describe('selection', () => {
 
   it('preselects dormant projects and leaves the active one protected', async () => {
     const ui = mount(stream());
-    await ui.waitForText('ACTIVE (protected)');
+    await ui.waitForText('IN USE RECENTLY');
 
     expect(ui.line('big-dormant')).toContain(MARK_ON);
     expect(ui.line('small-dormant')).toContain(MARK_ON);
@@ -627,15 +698,24 @@ describe('confirmation and exit', () => {
     ]);
 
   /**
-   * Ready means *both* events have landed, and waiting for `bump` does not mean that.
+   * Ready means the app has absorbed the *whole* scan — every row painted **and** every
+   * default applied — and neither half is implied by the other.
    *
-   * The project paints one event before the cache, so a test that pressed enter on the
-   * first frame would freeze a snapshot holding only `dist` and then assert on a 5 G total
-   * that includes the cache. That is a real race and it does fire: it is the difference
-   * between a 20 ms scheduling slice and a 30 ms one. The cache is the last event in the
-   * stream, so its row appearing is the honest "everything is on screen" signal.
+   * A row is painted one commit before the effect that preselects it runs, so a test that
+   * pressed enter the instant `npm cache` appeared could freeze a snapshot that had the row
+   * but not the selection, and then assert a 5 G total against a 3 G work list. That is a
+   * real race and it does fire; it is the difference between one scheduling slice and the
+   * next.
+   *
+   * So the wait is on the two signals the *user* is given for the same question: the settled
+   * scan indicator, which is what tells a person it is safe to press enter, and the selection
+   * count in the footer. Waiting on what the interface promises is also a test of the promise.
    */
-  const ready = (ui: Harness): Promise<void> => ui.waitForText('npm cache');
+  const ready = async (ui: Harness): Promise<void> => {
+    await ui.waitForText('scan complete');
+    await ui.waitForText('selected 2');
+    await settle();
+  };
 
   it('q quits without cleaning anything', async () => {
     const ui = mount(stream());
@@ -644,7 +724,9 @@ describe('confirmation and exit', () => {
     await ui.press('q');
 
     expect(ui.cleaned).toEqual([]);
-    expect(ui.exits).toEqual([{ cleaned: false, outcomes: [], trashedBytes: 0 }]);
+    expect(ui.exits).toEqual([
+      { cleaned: false, outcomes: [], trashedBytes: 0, rounds: 0, trashEmptied: false },
+    ]);
   });
 
   it('enter asks for a second confirmation before anything is trashed', async () => {
@@ -696,10 +778,18 @@ describe('confirmation and exit', () => {
     if (cache?.kind !== 'cache') throw new Error('expected a cache target');
     expect(cache.cache.id).toBe('npm cache');
 
+    // The round reports itself *inside* the frame, and the app is still running.
+    await ui.waitForText('Moved 5.0G to the Trash.');
+    expect(ui.exits).toEqual([]);
+
+    // Only `q` ends the session, and the figure it carries is the one the round trashed.
+    await ui.press(ESCAPE);
+    await ui.press('q');
     await vi.waitFor(() => expect(ui.exits).toHaveLength(1), { timeout: 1_000, interval: 10 });
     expect(ui.exits[0]?.cleaned).toBe(true);
     expect(ui.exits[0]?.trashedBytes).toBe(5 * GB);
     expect(ui.exits[0]?.outcomes).toHaveLength(2);
+    expect(ui.exits[0]?.rounds).toBe(1);
   });
 
   /**
@@ -764,12 +854,17 @@ describe('confirmation and exit', () => {
     ui.instance.stdin.write(ENTER);
     ui.instance.stdin.write(ENTER);
 
-    await vi.waitFor(() => expect(ui.exits).toHaveLength(1), { timeout: 1_000, interval: 10 });
+    await ui.waitForText('Moved 5.0G to the Trash.');
     await delay(100);
 
+    // One call to `onClean`, and one round in the session — not two of either.
     expect(ui.cleaned).toHaveLength(1);
-    expect(ui.exits).toHaveLength(1);
+
+    await ui.press(ESCAPE);
+    await ui.press('q');
+    await vi.waitFor(() => expect(ui.exits).toHaveLength(1), { timeout: 1_000, interval: 10 });
     expect(ui.exits[0]?.trashedBytes).toBe(5 * GB);
+    expect(ui.exits[0]?.rounds).toBe(1);
   });
 
   /**
@@ -795,8 +890,12 @@ describe('confirmation and exit', () => {
     expect(ui.frame()).toContain('Move to Trash?');
     await ui.press(ENTER);
 
-    await vi.waitFor(() => expect(ui.exits).toHaveLength(1), { timeout: 1_000, interval: 10 });
+    await ui.waitForText('Moved 5.0G to the Trash.');
     expect(ui.cleaned).toHaveLength(2);
+
+    await ui.press(ESCAPE);
+    await ui.press('q');
+    await vi.waitFor(() => expect(ui.exits).toHaveLength(1), { timeout: 1_000, interval: 10 });
     expect(ui.exits[0]?.cleaned).toBe(true);
     expect(ui.exits[0]?.trashedBytes).toBe(5 * GB);
   });
@@ -845,6 +944,13 @@ describe('confirmation and exit', () => {
 
     held.open();
 
+    // The clean finishes and the round reports itself; the mid-flight `q` is simply gone,
+    // rather than having been queued up to tear the app down after the fact.
+    await ui.waitForText('Moved 5.0G to the Trash.');
+    expect(ui.exits).toEqual([]);
+
+    await ui.press(ESCAPE);
+    await ui.press('q');
     await vi.waitFor(() => expect(ui.exits).toHaveLength(1), { timeout: 1_000, interval: 10 });
     expect(ui.exits[0]?.cleaned).toBe(true);
     expect(ui.exits[0]?.trashedBytes).toBe(5 * GB);
@@ -883,6 +989,12 @@ describe('confirmation and exit', () => {
     expect(ui.frame()).toContain('13.0G across 3 directories');
 
     await ui.press(ENTER);
+    // The in-frame round summary is held to the same rule as the exit summary.
+    await ui.waitForText('Moved 2.0G to the Trash.');
+    expect(ui.frame()).not.toContain('13.0G to the Trash');
+
+    await ui.press(ESCAPE);
+    await ui.press('q');
     await vi.waitFor(() => expect(ui.exits).toHaveLength(1), { timeout: 1_000, interval: 10 });
 
     const summary = ui.exits[0];
@@ -954,6 +1066,9 @@ describe('the confirmation is a snapshot', () => {
 
     expect(targetPaths(ui.cleaned[0] ?? [])).toEqual(['/dev/shown/dist']);
 
+    await ui.waitForText('Moved 3.0G to the Trash.');
+    await ui.press(ESCAPE);
+    await ui.press('q');
     await vi.waitFor(() => expect(ui.exits).toHaveLength(1), { timeout: 1_000, interval: 10 });
     expect(ui.exits[0]?.trashedBytes).toBe(3 * GB);
   });
@@ -1057,8 +1172,12 @@ describe('the confirmation is screened before it is asked', () => {
       cacheEvent(makeCache('npm cache', 2 * GB)),
     ]);
 
-  /** The last event in the stream, so its row means everything is on screen. */
-  const ready = (ui: Harness): Promise<void> => ui.waitForText('npm cache');
+  /** Settled scan plus the full selection: see the note on the other `ready`. */
+  const ready = async (ui: Harness): Promise<void> => {
+    await ui.waitForText('scan complete');
+    await ui.waitForText('selected 3');
+    await settle();
+  };
 
   const ALL_SELECTED = [
     '/caches/npm cache',
@@ -1130,6 +1249,9 @@ describe('the confirmation is screened before it is asked', () => {
     // And the promise is kept: the work list is the two directories the headline described.
     expect(targetPaths(ui.cleaned[0] ?? [])).toEqual(['/caches/npm cache', '/dev/tinysync/dist']);
 
+    await ui.waitForText('Moved 5.0G to the Trash.');
+    await ui.press(ESCAPE);
+    await ui.press('q');
     await vi.waitFor(() => expect(ui.exits).toHaveLength(1), { timeout: 1_000, interval: 10 });
     expect(ui.exits[0]?.trashedBytes).toBe(5 * GB);
   });
@@ -1241,7 +1363,9 @@ describe('the confirmation is screened before it is asked', () => {
     await ui.press(ENTER);
     await ui.press('q');
 
-    expect(ui.exits).toEqual([{ cleaned: false, outcomes: [], trashedBytes: 0 }]);
+    expect(ui.exits).toEqual([
+      { cleaned: false, outcomes: [], trashedBytes: 0, rounds: 0, trashEmptied: false },
+    ]);
     expect(ui.cleaned).toEqual([]);
 
     held.open();
@@ -1330,6 +1454,626 @@ describe('the confirmation is screened before it is asked', () => {
   });
 });
 
+
+/**
+ * The scan says what it is doing, and — the half that was missing — says when it has stopped.
+ *
+ * Rendering is progressive, so a half-scanned list is pixel-identical to a finished one. The
+ * old footer printed `scanning…` and then printed nothing, which makes *finished* and *the
+ * word got dropped in a re-layout* the same frame. Absence is not a state an eye can read, and
+ * "have I seen everything yet" is exactly the question a user must answer correctly before
+ * pressing enter.
+ *
+ * The animation needs its own clock, because Ink re-renders on state change and a scan can
+ * spend thirty seconds inside one `dirSize` without producing an event — the frozen spinner
+ * would be on screen for precisely the wait it exists to explain. A clock in a CLI is a
+ * liability, so the two properties that make it safe are pinned here as well as the copy.
+ */
+describe('the scan indicator', () => {
+  it('animates while the scan runs, then settles into something unambiguous', async () => {
+    const held = gate();
+    const ui = mount(
+      slowStream(
+        [
+          projectEvent(makeProject('tinysync', 'dormant', [artifact('target', 'build', 67 * GB)])),
+          projectEvent(makeProject('bump', 'dormant', [artifact('dist', 'build', 3 * GB)])),
+        ],
+        held,
+      ),
+    );
+
+    // The running count is the other half of "wait": it says how much has arrived so far.
+    await ui.waitForText('1 project');
+    expect(ui.frame()).toContain('scanning…');
+    expect(ui.frame()).toContain('67.0G');
+    expect(ui.frame()).not.toContain('scan complete');
+
+    // A spinner that does not spin is a frozen interface. Sample it over several ticks and
+    // require the glyph to actually change — the assertion a re-render-driven spinner fails.
+    const seenFrames = new Set<string>();
+    for (let sample = 0; sample < 12; sample += 1) {
+      const line = ui.frame().split('\n')[0] ?? '';
+      for (const glyph of SPINNER_FRAMES) if (line.includes(glyph)) seenFrames.add(glyph);
+      await delay(40);
+    }
+    expect(seenFrames.size).toBeGreaterThan(1);
+
+    held.open();
+
+    // Settled: a word, not merely the absence of one, and the final count beside it.
+    await ui.waitForText('scan complete');
+    expect(ui.frame()).toContain('2 projects');
+    expect(ui.frame()).toContain('70.0G');
+    expect(ui.frame()).not.toContain('scanning…');
+  });
+
+  /**
+   * The timer must not outlive the interface, in either sense.
+   *
+   * `clearInterval` on unmount is the ordinary half. `unref` is the half that bites: Node's
+   * event loop stays alive while a referenced interval exists, so a CLI whose last act is
+   * `exit()` would print its closing line and then simply hang, with no interface left to
+   * explain why. It reads as a crash, and it is caused by an animation.
+   *
+   * Asserted against the real `setInterval` — wrapped, not faked — so this is a claim about
+   * the handle the component actually created.
+   */
+  it('unrefs its interval and clears it when the scan settles', async () => {
+    const handles: { unreffed: boolean; handle: NodeJS.Timeout }[] = [];
+    const realSetInterval = globalThis.setInterval;
+    const realClearInterval = globalThis.clearInterval;
+    const cleared: unknown[] = [];
+
+    const setSpy = vi.spyOn(globalThis, 'setInterval').mockImplementation(((
+      callback: () => void,
+      ms: number,
+    ) => {
+      const handle = realSetInterval(callback, ms);
+      const record = { unreffed: false, handle };
+      const realUnref = handle.unref.bind(handle);
+      handle.unref = () => {
+        record.unreffed = true;
+        return realUnref();
+      };
+      handles.push(record);
+      return handle;
+    }) as never);
+    const clearSpy = vi
+      .spyOn(globalThis, 'clearInterval')
+      .mockImplementation(((handle: NodeJS.Timeout) => {
+        cleared.push(handle);
+        realClearInterval(handle);
+      }) as never);
+
+    try {
+      const instance = render(<ScanStatus scanning projects={2} caches={0} bytes={GB} />);
+      rendered.push(instance);
+      await delay(30);
+
+      expect(handles.length).toBeGreaterThan(0);
+      expect(handles.every((record) => record.unreffed)).toBe(true);
+
+      // Settling is a state change, not an unmount, and it must stop the clock all the same.
+      instance.rerender(<ScanStatus scanning={false} projects={2} caches={0} bytes={GB} />);
+      await delay(30);
+      expect(cleared).toContain(handles[0]?.handle);
+    } finally {
+      setSpy.mockRestore();
+      clearSpy.mockRestore();
+    }
+  });
+});
+
+/**
+ * The list scrolls inside its pane; the terminal does not scroll at all.
+ *
+ * The defect being fixed: the pane used to render every row it was handed. On a list longer
+ * than the window that does not scroll the list — Ink prints an over-tall frame, the emulator
+ * pushes the top off the screen, and the footer goes with it. The footer is the only place the
+ * keybindings are written down, so the user is left holding an interface they cannot operate
+ * and cannot get back, because the next repaint is over-tall too.
+ *
+ * So the assertions are about the *frame*, not about the list: how many physical lines it
+ * occupies, and whether the pinned chrome is among them. A test that only checked "the cursor
+ * row is visible" would pass on the broken version.
+ */
+describe('the list scrolls inside its pane', () => {
+  const TERMINAL_ROWS = 18;
+
+  const many = (count: number): AsyncIterable<ScanEvent> =>
+    fastStream(
+      Array.from({ length: count }, (_, index) =>
+        projectEvent(
+          makeProject(`proj-${String(index).padStart(2, '0')}`, 'dormant', [
+            artifact('dist', 'build', (count - index) * GB),
+          ]),
+        ),
+      ),
+    );
+
+  const tall = (): ReturnType<typeof mount> =>
+    mount(many(24), { width: 100, height: TERMINAL_ROWS });
+
+  it('never draws a frame taller than the terminal, however long the list', async () => {
+    const ui = tall();
+    await ui.waitForText('scan complete');
+
+    expect(ui.lines().length).toBeLessThanOrEqual(TERMINAL_ROWS);
+
+    // Every row rendered would be 25 lines of list alone. Only a window is drawn.
+    const rowLines = ui.lines().filter((line) => line.includes('proj-'));
+    expect(rowLines.length).toBeLessThan(24);
+    expect(rowLines.length).toBeGreaterThan(0);
+  });
+
+  it('keeps the header and the footer on screen while the cursor walks the whole list', async () => {
+    const ui = tall();
+    await ui.waitForText('scan complete');
+    await settle();
+
+    for (let step = 0; step < 23; step += 1) {
+      await ui.press('j');
+      // The pinned chrome, top and bottom, on every single frame.
+      expect(ui.frame()).toContain('dev-cleaner');
+      expect(ui.frame()).toContain('space toggle');
+      expect(ui.frame()).toContain('preset recommended');
+      expect(ui.lines().length).toBeLessThanOrEqual(TERMINAL_ROWS);
+    }
+
+    // …and the cursor is on a row that is actually drawn, not on one scrolled past.
+    const cursorLine = ui.lines().find((line) => line.includes(CURSOR));
+    expect(cursorLine).toBeDefined();
+    expect(cursorLine).toContain('proj-23');
+  });
+
+  it('says how much is hidden, on each side, and nothing when nothing is', async () => {
+    const ui = tall();
+    await ui.waitForText('scan complete');
+    await settle();
+
+    // At the top: nothing above, plenty below.
+    expect(ui.frame()).toContain('more below');
+    expect(ui.frame()).not.toContain('more above');
+
+    for (let step = 0; step < 22; step += 1) await ui.press('j');
+
+    // At the bottom: the mirror image.
+    expect(ui.frame()).toContain('more above');
+    expect(ui.frame()).not.toContain('more below');
+
+    // A list that fits says neither, or the indicator would mean nothing.
+    const short = mount(many(3), { width: 100, height: TERMINAL_ROWS });
+    await short.waitForText('scan complete');
+    expect(short.frame()).not.toContain('more below');
+    expect(short.frame()).not.toContain('more above');
+  });
+});
+
+/**
+ * A session: many rounds, one interface.
+ *
+ * The old flow ended at the first clean — unmount, print, exit — so a second round meant
+ * re-running the program and re-scanning a tree that takes minutes. Everything in this block
+ * is about the interface still being there afterwards, and being *correct* afterwards: the
+ * rows that were trashed are gone, the totals reflect it, the running figure accrues, and the
+ * next round is a genuinely new decision rather than a replay of the last one.
+ */
+describe('the session survives a clean', () => {
+  const three = (): AsyncIterable<ScanEvent> =>
+    fastStream([
+      projectEvent(makeProject('alpha', 'dormant', [artifact('dist', 'build', 9 * GB)])),
+      projectEvent(makeProject('beta', 'dormant', [artifact('dist', 'build', 5 * GB)])),
+      projectEvent(makeProject('gamma', 'dormant', [artifact('dist', 'build', 2 * GB)])),
+    ]);
+
+  const ready = async (ui: Harness): Promise<void> => {
+    await ui.waitForText('scan complete');
+    await ui.waitForText('selected 3');
+    await settle();
+  };
+
+  it('returns to the list with the cleaned rows gone and the totals updated', async () => {
+    const ui = mount(three(), { screen: {} });
+    await ready(ui);
+    expect(ui.frame()).toContain('16.0G');
+
+    // Clear the section, then take just `alpha`.
+    await ui.press('a');
+    expect(ui.frame()).toContain('selected 0');
+    await ui.press(SPACE);
+    expect(ui.frame()).toContain('selected 1');
+    await settle();
+
+    await ui.press(ENTER);
+    await ui.waitForText('Move to Trash?');
+    await ui.press(ENTER);
+
+    // The round reports itself in the frame. The app has not exited.
+    await ui.waitForText('Moved 9.0G to the Trash.');
+    expect(ui.exits).toEqual([]);
+
+    await ui.press(ESCAPE);
+
+    // Home again — and `alpha` is not offered a second time.
+    expect(ui.frame()).toContain('space toggle');
+    expect(ui.frame()).not.toContain('alpha');
+    expect(ui.frame()).toContain('beta');
+    expect(ui.frame()).toContain('gamma');
+    // The section header total lost exactly the 9 G that moved.
+    expect(ui.frame()).toContain('7.0G');
+    expect(ui.frame()).not.toContain('16.0G');
+    // And the running figure is on screen, in the footer, where the selection totals are.
+    expect(ui.frame()).toContain('9.0G trashed this session');
+  });
+
+  it('accrues across rounds, and screens each one from a fresh snapshot', async () => {
+    const ui = mount(three(), { screen: {} });
+    await ready(ui);
+
+    await ui.press('a');
+    await ui.press(SPACE); // alpha, 9.0G
+    await settle();
+    await ui.press(ENTER);
+    await ui.waitForText('Move to Trash?');
+    await ui.press(ENTER);
+    await ui.waitForText('Moved 9.0G to the Trash.');
+    await ui.press(ESCAPE);
+    await settle();
+
+    // Round one screened exactly alpha.
+    expect(ui.screened.map((call) => call.paths)).toEqual([
+      ['/dev/alpha/dist'],
+      ['/dev/alpha/dist'],
+    ]);
+
+    // Round two: a different selection, taken now, over the list as it stands.
+    await ui.press(SPACE); // beta, 5.0G — the cursor fell to the first surviving row
+    expect(ui.frame()).toContain('selected 1');
+    await settle();
+    await ui.press(ENTER);
+    await ui.waitForText('Move to Trash?');
+    expect(ui.frame()).toContain('5.0G across 1 directory');
+    await ui.press(ENTER);
+    await ui.waitForText('Moved 5.0G to the Trash.');
+
+    // The second round was screened afresh — and never over the paths the first one took.
+    expect(ui.screened).toHaveLength(4);
+    expect(ui.screened[2]?.paths).toEqual(['/dev/beta/dist']);
+    expect(ui.screened[3]?.paths).toEqual(['/dev/beta/dist']);
+    expect(ui.screened.some((call) => call.paths.includes('/dev/alpha/dist') && call !== ui.screened[0] && call !== ui.screened[1])).toBe(false);
+
+    // Two calls to `onClean`, each with only its own round's work.
+    expect(ui.cleaned).toHaveLength(2);
+    expect(targetPaths(ui.cleaned[0] ?? [])).toEqual(['/dev/alpha/dist']);
+    expect(targetPaths(ui.cleaned[1] ?? [])).toEqual(['/dev/beta/dist']);
+
+    // The running total is the sum, and the round count says how it got there.
+    expect(ui.frame()).toContain('14.0G trashed this session');
+    expect(ui.frame()).toContain('2 rounds');
+
+    await ui.press(ESCAPE);
+    await ui.press('q');
+    await vi.waitFor(() => expect(ui.exits).toHaveLength(1), { timeout: 1_000, interval: 10 });
+    expect(ui.exits[0]?.trashedBytes).toBe(14 * GB);
+    expect(ui.exits[0]?.rounds).toBe(2);
+    expect(ui.exits[0]?.outcomes).toHaveLength(2);
+  });
+
+  /**
+   * A row that was refused is still on the disk, so it stays in the list — and it stays
+   * *unchecked*, because leaving it armed would re-promise it next round and refuse it again.
+   * That loop is how a user learns to stop reading refusals.
+   */
+  it('keeps a refused row in the list, unchecked, at its full size', async () => {
+    const ui = mount(three(), {
+      screen: {},
+      outcomeFor: (target) =>
+        target.kind === 'project' && target.project.name === 'beta' ? 'refused' : 'trashed',
+    });
+    await ready(ui);
+
+    await ui.press(ENTER);
+    await ui.waitForText('Move to Trash?');
+    await ui.press(ENTER);
+
+    await ui.waitForText('Moved 11.0G to the Trash.');
+    expect(ui.frame()).toContain('2 directories trashed · 1 refused');
+    expect(ui.frame()).not.toContain('directorys');
+    // Named, with its size, and outside the total.
+    expect(ui.frame()).toContain('Left in place');
+    expect(ui.frame()).toContain('5.0G');
+
+    await ui.press(ESCAPE);
+    expect(ui.frame()).not.toContain('alpha');
+    expect(ui.line('beta')).toContain('5.0G');
+    expect(ui.line('beta')).toContain(MARK_OFF);
+    expect(ui.frame()).toContain('selected 0');
+    expect(ui.frame()).toContain('11.0G trashed this session');
+  });
+
+  /**
+   * The new pinned guard, and it belongs to the same family as "only enter starts a clean".
+   *
+   * `enter` is this application's commit key. A user holding it — and the confirmation dialog
+   * is exactly where people hold keys — would otherwise chain *dismiss the summary → list →
+   * enter → screening → confirm → enter* and run a second round they never chose. So the one
+   * screen that sits between two rounds refuses the key that starts them.
+   */
+  it('ignores enter on the round summary, so a held key cannot chain a second round', async () => {
+    const ui = mount(three(), { screen: {} });
+    await ready(ui);
+
+    await ui.press(ENTER);
+    await ui.waitForText('Move to Trash?');
+    await ui.press(ENTER);
+    await ui.waitForText('Moved 16.0G to the Trash.');
+
+    for (const key of [ENTER, ENTER, ENTER, 'j', 'a', 'p']) {
+      await ui.press(key);
+      // Still the summary: no key here has advanced anywhere, least of all into a new round.
+      expect(ui.frame()).toContain('Moved 16.0G to the Trash.');
+      expect(ui.frame()).not.toContain('Move to Trash?');
+      expect(ui.cleaned).toHaveLength(1);
+    }
+    await delay(50);
+    expect(ui.cleaned).toHaveLength(1);
+    expect(ui.exits).toEqual([]);
+
+    // The key the screen actually offers does work.
+    await ui.press(ESCAPE);
+    expect(ui.frame()).toContain('space toggle');
+  });
+});
+
+/**
+ * The gauge answers "what does checking this box do to my disk", which is the question the
+ * user came to the tool with and which a column of sizes cannot answer.
+ *
+ * It is a *projection*, not a reading — dev-cleaner trashes rather than deletes, so free space
+ * does not move until the Trash is emptied — and the caveat is asserted here because a gauge
+ * that quietly implied otherwise would be the most convincing lie the interface could tell.
+ */
+describe('the disk gauge', () => {
+  const HUNDRED = 100 * GB;
+  const usage = (used: number): DiskUsage => ({
+    total: HUNDRED,
+    used,
+    free: HUNDRED - used,
+  });
+
+  const stream = (): AsyncIterable<ScanEvent> =>
+    fastStream([
+      projectEvent(makeProject('alpha', 'dormant', [artifact('dist', 'build', 6 * GB)])),
+      projectEvent(makeProject('beta', 'dormant', [artifact('dist', 'build', 4 * GB)])),
+    ]);
+
+  it('moves with the selection, and says the space is only a projection', async () => {
+    const ui = mount(stream(), { width: 100, disk: [usage(80 * GB)] });
+    await ui.waitForText('scan complete');
+    await ui.waitForText('selected 2');
+
+    // 20 G free now; the 10 G selected would make it 30 G — once the Trash is emptied.
+    expect(ui.frame()).toContain('80.0G used of 100G');
+    expect(ui.frame()).toContain('20.0G free');
+    expect(ui.frame()).toContain('→ 30.0G free once emptied');
+    expect(ui.frame()).toContain('Trashed files still occupy the disk');
+
+    // Uncheck the 6 G row: the projection follows immediately.
+    await settle();
+    await ui.press(SPACE);
+    expect(ui.frame()).toContain('→ 24.0G free once emptied');
+
+    // Nothing selected: no "after" figure at all, and the legend instead — because an
+    // unchanged projection printed beside the current free space invites the reader to
+    // believe the two differ for some other reason. (`a` on a partly-checked section checks
+    // it; a second press is what clears it.)
+    await ui.press('a');
+    await ui.press('a');
+    expect(ui.frame()).toContain('selected 0');
+    expect(ui.frame()).not.toContain('once emptied');
+    expect(ui.frame()).toContain('this selection');
+  });
+
+  /** Three glyphs, so the bar survives a terminal with no colour at all. */
+  it('draws the bar in glyphs rather than in colour alone', async () => {
+    const ui = mount(stream(), { width: 100, disk: [usage(80 * GB)] });
+    await ui.waitForText('selected 2');
+
+    const bar = ui.lines().find((line) => line.includes('█')) ?? '';
+    expect(bar).toContain('█'); // in use and staying
+    expect(bar).toContain('▓'); // this selection
+    expect(bar).toContain('░'); // already free
+  });
+
+  /** A volume that cannot be measured draws no bar, rather than a full one. */
+  it('degrades to a plain line when the volume cannot be read', async () => {
+    const ui = mount(stream(), { width: 100, disk: [undefined] });
+    await ui.waitForText('selected 2');
+
+    expect(ui.frame()).toContain('disk usage unavailable');
+    expect(ui.frame()).not.toContain('used of');
+  });
+
+  it('is re-read after a round, so the gauge is not left describing the old list', async () => {
+    const ui = mount(stream(), {
+      screen: {},
+      width: 100,
+      disk: [usage(80 * GB), usage(70 * GB)],
+    });
+    await ui.waitForText('selected 2');
+    expect(ui.frame()).toContain('80.0G used of 100G');
+    await settle();
+
+    await ui.press(ENTER);
+    await ui.waitForText('Move to Trash?');
+    await ui.press(ENTER);
+    await ui.waitForText('Moved 10.0G to the Trash.');
+    await ui.press(ESCAPE);
+
+    await vi.waitFor(() => expect(ui.frame()).toContain('70.0G used of 100G'), {
+      timeout: 1_000,
+      interval: 10,
+    });
+  });
+});
+
+/**
+ * Emptying the Trash — the one action in this tool with no undo.
+ *
+ * Two things have to be true and they pull in opposite directions from the rest of the
+ * interface. The figure shown must be the **whole** Trash, never this run's contribution,
+ * because emptying takes the user's holiday photos along with the `node_modules` and a prompt
+ * captioned with the smaller number misrepresents the offer even though every figure on screen
+ * is true. And the confirmation must not be `enter`, because `enter` is the key the user has
+ * been pressing for the last four screens and a yes answered by momentum is not an answer.
+ */
+describe('emptying the Trash', () => {
+  const summary = (bytes: number, items: number): TrashSummary => ({
+    bytes,
+    items,
+    available: true,
+  });
+
+  const stream = (): AsyncIterable<ScanEvent> =>
+    fastStream([projectEvent(makeProject('alpha', 'dormant', [artifact('dist', 'build', 3 * GB)]))]);
+
+  const open = async (ui: Harness): Promise<void> => {
+    await ui.waitForText('selected 1');
+    await settle();
+    await ui.press('t');
+    await ui.waitForText('Empty the Trash?');
+  };
+
+  it('discloses the whole Trash, not this run, and needs the word typed out', async () => {
+    const ui = mount(stream(), { width: 100, trash: [summary(120 * GB, 348), summary(0, 0)] });
+    await open(ui);
+
+    // The number that matters: everything emptying would destroy.
+    expect(ui.frame()).toContain('120G · 348 items in the Trash');
+    expect(ui.frame()).toContain('not only what dev-cleaner put there');
+    expect(ui.frame()).toContain('cannot be undone');
+
+    // `enter` alone is not an answer — and neither is a plausible-looking wrong word.
+    await ui.press(ENTER);
+    await delay(30);
+    expect(ui.emptied).toEqual([]);
+    expect(ui.frame()).toContain('Empty the Trash?');
+
+    for (const letter of ['e', 'm', 'p', 't']) await ui.press(letter);
+    await ui.press(ENTER);
+    await delay(30);
+    expect(ui.emptied).toEqual([]);
+    expect(ui.frame()).toContain('Empty the Trash?');
+
+    // The whole word, and only then.
+    await ui.press('y');
+    expect(ui.frame()).toContain('enter empties the Trash');
+    await ui.press(ENTER);
+
+    await ui.waitForText('Trash emptied.');
+    expect(ui.emptied).toHaveLength(1);
+    // Read back from the Trash afterwards rather than assumed from the attempt's verdict.
+    expect(ui.frame()).toContain('0B · 0 items in the Trash now');
+  });
+
+  /**
+   * The same prompt, reached from the round summary, still shows the Trash's figures and not
+   * the round's. This is the arrangement `trash.ts` names as the dangerous one: "18.1G moved
+   * to the Trash" on the previous screen, an offer to empty on this one.
+   */
+  it('shows the Trash total after a clean, never the round total', async () => {
+    const ui = mount(stream(), { screen: {}, trash: [summary(120 * GB, 348), summary(0, 0)] });
+    await ui.waitForText('selected 1');
+    await settle();
+
+    await ui.press(ENTER);
+    await ui.waitForText('Move to Trash?');
+    await ui.press(ENTER);
+    await ui.waitForText('Moved 3.0G to the Trash.');
+    expect(ui.frame()).toContain('t empty the Trash');
+
+    await ui.press('t');
+    await ui.waitForText('Empty the Trash?');
+
+    expect(ui.frame()).toContain('120G · 348 items in the Trash');
+    expect(ui.frame()).not.toContain('3.0G');
+  });
+
+  it('backs out on escape, having done nothing', async () => {
+    const ui = mount(stream(), { trash: [summary(120 * GB, 348)] });
+    await open(ui);
+
+    await ui.press('e');
+    await ui.press(ESCAPE);
+    expect(ui.frame()).toContain('space toggle');
+    expect(ui.emptied).toEqual([]);
+
+    // And the typing does not survive the trip: the word must be spelled out again.
+    await ui.press('t');
+    await ui.waitForText('Empty the Trash?');
+    await ui.press(ENTER);
+    await delay(30);
+    expect(ui.emptied).toEqual([]);
+  });
+
+  /**
+   * `available: false` means the total is *unknown*, not zero. `trash.ts` is explicit that an
+   * understated figure under a prompt that destroys everything is worse than no figure — so
+   * there is no figure, and no offer.
+   */
+  it('offers no empty at all when the Trash cannot be measured', async () => {
+    const ui = mount(stream(), { trash: [{ bytes: 0, items: 0, available: false }] });
+    await open(ui);
+
+    expect(ui.frame()).toContain('could not read the Trash');
+    expect(ui.frame()).not.toContain('0B · 0 items');
+    expect(ui.frame()).not.toContain('type empty');
+
+    // Even typed out in full, the word unlocks nothing: there is no disclosed total to
+    // consent against.
+    for (const letter of ['e', 'm', 'p', 't', 'y']) await ui.press(letter);
+    await ui.press(ENTER);
+    await delay(30);
+    expect(ui.emptied).toEqual([]);
+  });
+
+  it('empties exactly once when two enters land in the same tick', async () => {
+    const ui = mount(stream(), { trash: [summary(120 * GB, 348), summary(0, 0)] });
+    await open(ui);
+    for (const letter of ['e', 'm', 'p', 't', 'y']) await ui.press(letter);
+
+    // No await between them: both handlers see the armed confirmation.
+    ui.instance.stdin.write(ENTER);
+    ui.instance.stdin.write(ENTER);
+
+    await ui.waitForText('Trash emptied.');
+    await delay(100);
+    expect(ui.emptied).toHaveLength(1);
+  });
+
+  it('reports the session emptied the Trash, so the closing line can say so', async () => {
+    const ui = mount(stream(), { screen: {}, trash: [summary(120 * GB, 348), summary(0, 0)] });
+    await ui.waitForText('selected 1');
+    await settle();
+
+    await ui.press(ENTER);
+    await ui.waitForText('Move to Trash?');
+    await ui.press(ENTER);
+    await ui.waitForText('Moved 3.0G to the Trash.');
+    await ui.press('t');
+    await ui.waitForText('Empty the Trash?');
+    for (const letter of ['e', 'm', 'p', 't', 'y']) await ui.press(letter);
+    await ui.press(ENTER);
+    await ui.waitForText('Trash emptied.');
+
+    await ui.press(ESCAPE);
+    await ui.press('q');
+    await vi.waitFor(() => expect(ui.exits).toHaveLength(1), { timeout: 1_000, interval: 10 });
+    expect(ui.exits[0]?.trashEmptied).toBe(true);
+    expect(ui.exits[0]?.trashedBytes).toBe(3 * GB);
+  });
+});
+
 /**
  * `runApp` is the seam `cli.ts` uses, since a `.ts` entry point cannot write JSX. It is
  * small, but it owns one thing that is easy to get wrong: the summary has to be captured
@@ -1388,6 +2132,104 @@ describe('runApp', () => {
     });
 
     stdin.write('q');
-    await expect(promise).resolves.toEqual({ cleaned: false, outcomes: [], trashedBytes: 0 });
+    await expect(promise).resolves.toEqual({
+      cleaned: false,
+      outcomes: [],
+      trashedBytes: 0,
+      rounds: 0,
+      trashEmptied: false,
+    });
+  });
+});
+
+/**
+ * Defects found by adversarial review of the finished shell. Two share a root cause with the
+ * double-`enter` race already pinned above: a guard keyed on React state, read by a handler
+ * closure from the render *before* the state was scheduled. `phase` is not committed within
+ * the tick that set it, so any second key delivered in the same read still sees `confirm`.
+ *
+ * The third is layout: two panes each clamped to a minimum independently can sum to more than
+ * the terminal, and Yoga then wraps every row — which un-pins the footer that the whole
+ * viewport mechanism exists to pin.
+ */
+describe('same-tick keys during a clean, and narrow terminals', () => {
+  const oneProject = (): AsyncIterable<ScanEvent> =>
+    fastStream([
+      projectEvent(makeProject('bump', 'dormant', [artifact('dist', 'build', 5 * GB)])),
+    ]);
+
+  const atConfirm = async (held: Gate): Promise<Harness> => {
+    const ui = mount(oneProject(), { holdClean: held });
+    await ui.waitForText('scan complete');
+    await ui.waitForText('selected 1');
+    await settle();
+    await ui.press(ENTER);
+    expect(ui.frame()).toContain('Move to Trash?');
+    return ui;
+  };
+
+  it('ignores a q delivered in the same tick as the confirming enter', async () => {
+    const held = gate();
+    const ui = await atConfirm(held);
+
+    // No await between them: both reach the pre-clean render's handler.
+    ui.instance.stdin.write(ENTER);
+    ui.instance.stdin.write('q');
+    await settle();
+
+    // The clean started and is still holding the user's directories. Quitting here would
+    // report `cleaned: false, trashedBytes: 0` to the CLI while `onClean` is in flight, so
+    // the invariant-8 Trash disclosure would never print and the user would never be told
+    // what is in their Trash.
+    expect(ui.cleaned).toHaveLength(1);
+    expect(ui.exits).toHaveLength(0);
+
+    held.open();
+    await ui.waitForText('Moved 5.0G to the Trash.');
+  });
+
+  it('ignores an esc delivered in the same tick as the confirming enter', async () => {
+    const held = gate();
+    const ui = await atConfirm(held);
+
+    ui.instance.stdin.write(ENTER);
+    ui.instance.stdin.write(ESCAPE);
+    await settle();
+
+    // `setPhase({kind:'list'})` would batch *after* runClean's `setPhase({kind:'cleaning'})`,
+    // rendering the full live list — every key active, footer offering `enter clean` — while
+    // directories are still being moved.
+    expect(ui.cleaned).toHaveLength(1);
+    expect(ui.frame()).not.toContain('enter clean');
+
+    held.open();
+    await ui.waitForText('Moved 5.0G to the Trash.');
+  });
+
+  /**
+   * What can and cannot be asserted here.
+   *
+   * `ink-testing-library` renders into a stream of its own fixed width, so the `width` prop
+   * tells the *component* how wide it is while Yoga still lays out against the harness's
+   * width. Passing 120 and asserting the frame is 120 wide therefore tests the harness, not
+   * the app — an earlier version of this test did exactly that and failed for that reason.
+   *
+   * What IS controllable is any element given an explicit width: Ink truncates inside it
+   * regardless of the terminal. The header is the line that mattered — it grows with the
+   * project count and the bytes found, and untruncated it wrapped and cost the list a row.
+   */
+  it.each([40, 56, 80])('keeps the header inside %i declared columns', async (columns) => {
+    const many = Array.from({ length: 40 }, (_, i) =>
+      projectEvent(
+        makeProject(`project-number-${i}`, 'dormant', [artifact('dist', 'build', GB)]),
+      ),
+    );
+    const ui = mount(fastStream(many), { width: columns, height: 24 });
+    await ui.waitForText('scan complete');
+    await settle();
+
+    const header = ui.lines()[0] ?? '';
+    expect(header).toContain('dev-cleaner');
+    expect(header.length).toBeLessThanOrEqual(columns);
   });
 });

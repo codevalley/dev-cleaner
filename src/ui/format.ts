@@ -53,6 +53,19 @@ export function formatBytesPadded(bytes: number, width: number = BYTES_WIDTH): s
 }
 
 /**
+ * A fraction as a whole-number percentage: `0.837` → `84%`.
+ *
+ * Rounded rather than truncated, and clamped to `0%`–`100%`: this labels the disk gauge,
+ * where a value outside the bar's own range would describe a bar that cannot be drawn. A
+ * degenerate input (NaN from a division by a zero-byte volume) reads `0%`, matching the empty
+ * bar `diskbar.ts` draws for the same case — the two must not disagree on screen.
+ */
+export function formatPercent(fraction: number): string {
+  if (!Number.isFinite(fraction) || fraction <= 0) return '0%';
+  return `${Math.round(Math.min(fraction, 1) * 100)}%`;
+}
+
+/**
  * A coarse, single-unit age: `now`, `30m`, `5h`, `3d`, `8mo`, `2y`. Deliberately lossy —
  * this decorates a status line ("dormant 8mo"), where precision would only add noise.
  */

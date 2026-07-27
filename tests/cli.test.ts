@@ -10,7 +10,14 @@
 
 import { describe, expect, it, vi, type Mock } from 'vitest';
 
-import { HELP_TEXT, main, parseArgs, type CliIO, type MainDeps } from '../src/cli.js';
+import {
+  HELP_TEXT,
+  main,
+  parseArgs,
+  renderClosingLine,
+  type CliIO,
+  type MainDeps,
+} from '../src/cli.js';
 import { SafetyError } from '../src/types.js';
 import type { CacheEntry, Category, CleanOutcome, Preset, Project } from '../src/types.js';
 
@@ -86,7 +93,13 @@ function stubDeps(io: CliIO, overrides: Partial<StubDeps> = {}): StubDeps {
       yield { kind: 'cache' as const, cache: CACHE };
       yield { kind: 'done' as const };
     }),
-    runApp: vi.fn(async () => ({ cleaned: false, outcomes: [] as CleanOutcome[], trashedBytes: 0 })),
+    runApp: vi.fn(async () => ({
+      cleaned: false,
+      outcomes: [] as CleanOutcome[],
+      trashedBytes: 0,
+      rounds: 0,
+      trashEmptied: false,
+    })),
     clean: vi.fn(async () => [] as CleanOutcome[]),
     categoriesFor: (preset: Preset) => new Set(CATEGORIES[preset]),
     resolveScanRoot: async (root: string) => root,
@@ -317,6 +330,16 @@ describe('main', () => {
       ]);
     });
 
+    /**
+     * What stdout owes the user once the interface is gone.
+     *
+     * The full per-outcome report now renders *inside* the interface, one round at a time,
+     * where it can be read next to the list it describes. What is left here is the one thing a
+     * terminal is genuinely better at than a torn-down TUI: a single durable line in the
+     * scrollback. It still carries invariant 8's disclosure, because a user who does not know
+     * the bytes are in the Trash rather than back on the disk will go looking for space that
+     * is not there.
+     */
     it('prints the trash disclosure after a clean, and nothing after a quit', async () => {
       const io = fakeIO(true);
       const cleaned = stubDeps(io, {
@@ -331,6 +354,8 @@ describe('main', () => {
             },
           ],
           trashedBytes: 8 * GB,
+          rounds: 1,
+          trashEmptied: false,
         })),
       });
 
@@ -338,10 +363,54 @@ describe('main', () => {
       expect(io.out()).toContain('8.0G');
       expect(io.out()).toMatch(/empty/i);
 
+      // One line, not a report: the round's detail lives in the interface now.
+      expect(io.out().trimEnd().split('\n')).toHaveLength(1);
+
       const quitIO = fakeIO(true);
       const quit = stubDeps(quitIO);
       expect(await main(['/scan'], quit)).toBe(0);
       expect(quitIO.out()).toBe('');
+    });
+
+    describe('the closing line', () => {
+      const summary = (over: Partial<Parameters<typeof renderClosingLine>[0]> = {}) =>
+        renderClosingLine({
+          cleaned: true,
+          outcomes: [],
+          trashedBytes: 8 * GB,
+          rounds: 1,
+          trashEmptied: false,
+          ...over,
+        });
+
+      it('says nothing at all when the session cleaned nothing', () => {
+        // `dev-cleaner` used as a viewer must be as quiet as `ls`.
+        expect(summary({ cleaned: false })).toBe('');
+        expect(summary({ cleaned: false, trashedBytes: 8 * GB })).toBe('');
+      });
+
+      it('counts the session, not the round, and pluralises what it counts', () => {
+        expect(summary({ trashedBytes: 12 * GB, rounds: 3 })).toContain('12.0G');
+        expect(summary({ trashedBytes: 12 * GB, rounds: 3 })).toContain('3 rounds');
+        expect(summary({ rounds: 1 })).toContain('1 round');
+        expect(summary({ rounds: 1 })).not.toContain('1 rounds');
+      });
+
+      /**
+       * The disclosure is conditional on being *true*. Once the user has emptied the Trash
+       * from inside the interface, telling them the space is still occupied would send them
+       * to empty an empty Trash looking for bytes they already have.
+       */
+      it('drops the disclosure exactly when the user has already emptied the Trash', () => {
+        expect(summary()).toMatch(/empty the Trash/i);
+        expect(summary({ trashEmptied: true })).not.toMatch(/until you empty/i);
+        expect(summary({ trashEmptied: true })).toMatch(/emptied/i);
+      });
+
+      it('is one line, terminated, so it cannot run into a shell prompt', () => {
+        expect(summary()).toMatch(/\n$/);
+        expect(summary().trimEnd().split('\n')).toHaveLength(1);
+      });
     });
   });
 

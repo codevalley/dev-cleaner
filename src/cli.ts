@@ -26,13 +26,16 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import { storeHasIncomingHardlinks } from './caches.js';
-import { renderCleanSummary, renderScreenedReport } from './report.js';
+import { renderScreenedReport } from './report.js';
 import { SafetyError } from './types.js';
 import type { Category, CleanOutcome, CleanTarget, Preset, TrashFn } from './types.js';
 import { screenTargets } from './clean.js';
 import type { CleanOptions, ScreeningTier } from './clean.js';
 import type { ScanEvent, ScanOptions, ScanResult } from './scan.js';
+import type { EmptyTrashResult, TrashSummary } from './trash.js';
 import type { ExitSummary, RunOptions } from './ui/App.js';
+import type { DiskUsage } from './ui/diskbar.js';
+import { formatBytes } from './ui/format.js';
 
 export const EXIT_OK = 0;
 export const EXIT_FAILURE = 1;
@@ -107,6 +110,9 @@ export interface MainDeps {
    * tests that must answer the question without building a real store on disk.
    */
   storeHasIncomingHardlinks?: (storePath: string) => Promise<boolean>;
+  readDiskUsage?: (pathOnVolume: string) => Promise<DiskUsage | undefined>;
+  readTrashSummary?: () => Promise<TrashSummary>;
+  emptyTrash?: () => Promise<EmptyTrashResult>;
 }
 
 function processIO(): CliIO {
@@ -425,6 +431,34 @@ async function runStaticReport(
   return EXIT_OK;
 }
 
+/**
+ * One line on the way out, or nothing at all.
+ *
+ * The full per-target report used to be printed here, after the interface had already been
+ * torn off the screen — which meant the moment the user most wanted to read carefully was the
+ * moment the tool switched to a wall of plain text below a shell prompt. That report now
+ * renders *inside* the interface, one round at a time, where it can be read next to the list
+ * it describes and where the user can act on it. What is left for stdout is the thing a
+ * terminal is genuinely good at: a single durable line that survives scrollback.
+ *
+ * It still carries invariant 8's disclosure, because the disclosure is the point: the bytes
+ * are in the Trash, not back on the disk, until the Trash is emptied. When the user emptied it
+ * from inside the interface that sentence would be false, so it is replaced rather than
+ * softened.
+ *
+ * A session that cleaned nothing prints nothing. `dev-cleaner` used as a viewer must be as
+ * quiet as `ls`.
+ */
+export function renderClosingLine(summary: ExitSummary): string {
+  if (!summary.cleaned) return '';
+
+  const rounds = summary.rounds === 1 ? '1 round' : `${summary.rounds} rounds`;
+  const tail = summary.trashEmptied
+    ? 'The Trash was emptied, so that space is back.'
+    : 'Trashed files still occupy the disk until you empty the Trash.';
+  return `dev-cleaner: ${formatBytes(summary.trashedBytes)} moved to the Trash in ${rounds}. ${tail}\n`;
+}
+
 async function runInteractive(options: CliOptions, deps: MainDeps, io: CliIO): Promise<number> {
   const scanStream = deps.scanStream ?? (await import('./scan.js')).scanStream;
   const categoriesFor = await loadCategoriesFor(deps);
@@ -458,11 +492,40 @@ async function runInteractive(options: CliOptions, deps: MainDeps, io: CliIO): P
     return nodeModulesSeen.filter((p) => !selected.has(p));
   };
 
+  /**
+   * The gauge, the Trash disclosure and the empty itself, each reached lazily.
+   *
+   * Bound as closures that `import()` on first call rather than at the top of this function,
+   * so a run that never draws a bar never loads `node:fs/promises`'s `statfs` path and — much
+   * more importantly — a run that never asks to empty the Trash never loads the module that
+   * can. `trash.ts` has no side effects at import, but "the destructive module is only loaded
+   * when the destructive path is taken" is a property worth keeping true by construction.
+   *
+   * The volume measured is the first scan root: it is where the artifacts are, so it is the
+   * volume whose free space the user is here about. Roots are already realpath'd by `main`.
+   */
+  const volume = options.roots[0] ?? process.cwd();
+  const readDisk = async (): Promise<DiskUsage | undefined> => {
+    const read = deps.readDiskUsage ?? (await import('./ui/diskbar.js')).readDiskUsage;
+    return read(volume);
+  };
+  const readTrash = async (): Promise<TrashSummary> => {
+    const read = deps.readTrashSummary ?? (await import('./trash.js')).readTrashSummary;
+    return read();
+  };
+  const emptyTheTrash = async (): Promise<EmptyTrashResult> => {
+    const empty = deps.emptyTrash ?? (await import('./trash.js')).emptyTrash;
+    return empty();
+  };
+
   const summary = await runApp({
     stream,
     categoriesFor,
     preset: options.preset,
     nowMs: deps.nowMs ?? Date.now(),
+    readDisk,
+    readTrash,
+    onEmptyTrash: emptyTheTrash,
     /**
      * Without this binding the whole pre-consent screening layer is dead code: `onScreen` is
      * optional, so omitting it compiles, every unit test passes, and the confirmation screen
@@ -499,9 +562,7 @@ async function runInteractive(options: CliOptions, deps: MainDeps, io: CliIO): P
     },
   });
 
-  // Invariant 8: the disclosure only makes sense when something was actually trashed, and
-  // `renderCleanSummary` is the one place it is worded.
-  if (summary.cleaned) io.write(renderCleanSummary(summary.outcomes));
+  io.write(renderClosingLine(summary));
   return EXIT_OK;
 }
 

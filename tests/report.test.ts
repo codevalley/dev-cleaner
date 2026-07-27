@@ -9,6 +9,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { renderCleanSummary, renderReport } from '../src/report.js';
+import { SECTION_LABELS } from '../src/ui/model.js';
 import type {
   CacheEntry,
   Category,
@@ -129,8 +130,11 @@ describe('renderReport', () => {
       preset: 'recommended',
     });
 
-    expect(out).toContain('ACTIVE');
-    // Dormant is marked, active is not: protection is the default (spec: activity scoring).
+    // Assert against the exported constant, not a literal: this test hard-coded
+    // 'ACTIVE (protected)' and so broke when the copy was corrected — a test that fails on
+    // wording rather than on behaviour.
+    expect(out).toContain(SECTION_LABELS.active);
+    // Dormant is checked, in-use is not: not-preselected is the default (spec: activity scoring).
     expect(out).toMatch(/\[x\]\s+tinysync/);
     expect(out).toMatch(/\[ \]\s+notchpad/);
     expect(out).toContain('committed 3d ago');

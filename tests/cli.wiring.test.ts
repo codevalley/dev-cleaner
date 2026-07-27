@@ -48,7 +48,7 @@ async function captureProps(): Promise<{ props: CapturedProps; clean: Mock }> {
     categoriesFor: (_preset: Preset) => new Set<Category>(['build', 'cache']),
     runApp: (async (props: CapturedProps) => {
       captured = props;
-      return { cleaned: false, outcomes: [] as CleanOutcome[], trashedBytes: 0 };
+      return { cleaned: false, outcomes: [] as CleanOutcome[], trashedBytes: 0, rounds: 0, trashEmptied: false };
     }) as unknown as never,
   });
 

@@ -19,7 +19,15 @@
  *    layer unreachable from the only path a user can actually invoke.
  */
 
-import type { CacheEntry, Category, CleanTarget, Preset, Project } from '../types.js';
+import { formatBytes } from './format.js';
+import type {
+  CacheEntry,
+  Category,
+  CleanOutcome,
+  CleanTarget,
+  Preset,
+  Project,
+} from '../types.js';
 
 /**
  * Why a row cannot be cleaned on this run, established *before* anything is selected.
@@ -52,10 +60,66 @@ export type Section = 'projects' | 'active' | 'caches';
 
 export const SECTION_ORDER: readonly Section[] = ['projects', 'active', 'caches'];
 
+/**
+ * What each section is called on screen.
+ *
+ * The middle one used to read `ACTIVE (protected)`, and both words were doing damage.
+ *
+ * "Protected" describes the *tool's* posture, not the user's situation, and it implies a
+ * lock that does not exist — the section is a default, and `toggleRow` has always treated
+ * these rows like any other. Worse, it invites the reading that the unprotected sections are
+ * dangerous, which is exactly backwards.
+ *
+ * "Active" asserted a judgement the code was not making. The label was written while
+ * `scoreActivity` was a stub that returned `active` for everything, so the header was simply
+ * false: it grouped nothing, because nothing was ever anything else. The scorer is authored
+ * now (see `src/activity.ts`), so the claim is true — but a user cannot know that, and a
+ * header that states a verdict without stating its ground is a header that gets distrusted.
+ *
+ * So the label says what dev-cleaner observed, in the tense it observed it: these projects
+ * were worked on recently. `SECTION_NOTES` says what follows from that, including the part
+ * the old label never said — that checking one of these boxes is safe.
+ */
 export const SECTION_LABELS: Record<Section, string> = {
   projects: 'PROJECTS',
-  active: 'ACTIVE (protected)',
+  active: 'IN USE RECENTLY',
   caches: 'CACHES',
+};
+
+/**
+ * Whether a section's rows start checked.
+ *
+ * A table rather than a condition inside `defaultSelection`, because the interface has to
+ * *say* this ("not checked by default") and a sentence that restates a rule written
+ * elsewhere is a sentence that goes stale. `defaultSelection` reads this table, so the copy
+ * and the behaviour are one fact.
+ */
+export const SECTION_PRESELECTED: Record<Section, boolean> = {
+  projects: true,
+  active: false,
+  caches: true,
+};
+
+/**
+ * The one thing a user needs to know before checking any box, and the answer to "it scares
+ * me to check this section".
+ *
+ * It is not reassurance, it is the allowlist restated: a row exists only because a pattern in
+ * `ARTIFACT_TABLE` named the directory, and every one of those patterns names build output or
+ * a cache. `src/` cannot be a row. `.git` cannot be a row. There is no keystroke in this
+ * interface that reaches them, which is why the worst outcome of a wrong check is a rebuild.
+ */
+export const SAFE_TO_CHECK =
+  'Only regenerable directories are ever listed — build output, dependencies, caches. ' +
+  'Never source, never git history. The worst a wrong check can cost you is a rebuild.';
+
+/** One line per section: what it is, whether it starts checked, and what checking it does. */
+export const SECTION_NOTES: Record<Section, string> = {
+  projects: 'No commits or edits for a while. Checked by default.',
+  active:
+    'Worked on recently, so these start unchecked — not locked. ' +
+    'Checking one costs a rebuild, nothing else.',
+  caches: 'Shared package and tool caches. They refill the next time you build.',
 };
 
 export type Row =
@@ -123,7 +187,7 @@ function bySizeThenName<T extends { bytes: number; label: string }>(a: T, b: T):
 }
 
 /**
- * The whole list, in render order: PROJECTS (dormant), ACTIVE (protected), CACHES — each
+ * The whole list, in render order: PROJECTS (dormant), IN USE RECENTLY, CACHES — each
  * sorted by size descending, each preceded by a header carrying the section total. Empty
  * sections are omitted entirely, header included, so a scan with no caches does not show a
  * bare `CACHES 0B`.
@@ -237,7 +301,10 @@ export function defaultSelection(rows: readonly Row[], blocks?: RowBlocks): Sele
 
   for (const row of rows) {
     if (rowBlock(row, blocks) !== undefined) continue;
-    if (row.kind === 'project' && row.section === 'projects') projects.add(row.project.root);
+    // Read from the same table the section note is written from, so "checked by default"
+    // cannot drift away from what is actually checked.
+    if (!SECTION_PRESELECTED[row.section]) continue;
+    if (row.kind === 'project') projects.add(row.project.root);
     else if (row.kind === 'cache') caches.add(row.cache.id);
   }
   return { projects, caches };
@@ -334,6 +401,25 @@ export function moveCursor(
 }
 
 /**
+ * Where the cursor is, as an index into `rows` — what `viewport.ts` needs and what a
+ * component would otherwise compute inline.
+ *
+ * Its fallback is deliberately the same as `moveCursor`'s: a cursor whose row has vanished
+ * reports the first selectable row, not `-1` and not "wherever that index now points". The
+ * two must agree, because one drives the scroll window and the other drives the keyboard;
+ * disagreeing means arrowing down from a row that is not the one highlighted.
+ *
+ * `0` when there is nothing to point at — a legal index into an empty window, which is what
+ * `windowFor` will make of it.
+ */
+export function cursorIndex(rows: readonly Row[], id: string | undefined): number {
+  const at = rows.findIndex((row) => row.id === id);
+  if (at !== -1) return at;
+  const first = rows.findIndex(isSelectable);
+  return first === -1 ? 0 : first;
+}
+
+/**
  * Replace a project with the same root, or append. `scanStream` yields each project once,
  * but a re-scan or a future incremental sizing pass would yield it again, and appending a
  * duplicate would double-count its bytes in every total on screen.
@@ -373,4 +459,164 @@ export function toTargets(input: TargetsInput): CleanTarget[] {
     }
   }
   return targets;
+}
+
+/* ------------------------------------------------------------------------------------- *
+ * A session: many rounds, not one shot.
+ * ------------------------------------------------------------------------------------- */
+
+/**
+ * Everything a run accumulates across rounds.
+ *
+ * The one-shot flow — scan, select, clean, print, exit — meant the interface could keep its
+ * list in a component and throw it away on the way out. A session cannot: after a clean the
+ * user is still here, looking at the same list, and that list must no longer offer what was
+ * just trashed. So "what has been found" and "what has been reclaimed" become state with a
+ * lifetime longer than one screen, and the transition between rounds becomes a function.
+ *
+ * `reclaimedBytes` is a *trashed* total and nothing else — the same rule invariant 8 imposes
+ * on the exit disclosure, for the same reason. A refused target is still on disk; counting it
+ * here would let a session that reclaimed nothing report a triumphant figure, and the figure
+ * would then contradict the disk gauge sitting next to it.
+ */
+export interface SessionState {
+  projects: readonly Project[];
+  caches: readonly CacheEntry[];
+  /** Bytes moved to the Trash across every round so far. Trashed only; never refused. */
+  reclaimedBytes: number;
+  /** Completed rounds. `0` until the first clean actually reports something. */
+  rounds: number;
+}
+
+export const EMPTY_SESSION: SessionState = {
+  projects: [],
+  caches: [],
+  reclaimedBytes: 0,
+  rounds: 0,
+};
+
+export interface RoundInput {
+  session: SessionState;
+  selection: Selection;
+  outcomes: readonly CleanOutcome[];
+}
+
+export interface RoundResult {
+  session: SessionState;
+  /** The selection with everything this round touched unchecked. */
+  selection: Selection;
+  /** Bytes trashed in **this** round, for the "cleaned 12.4G" line the round itself shows. */
+  reclaimedBytes: number;
+  trashed: number;
+  refused: number;
+  failed: number;
+}
+
+/** A byte count from an outcome, defensively. A NaN here would poison every later total. */
+function bytesOf(value: number): number {
+  return Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+/** Identity of a trashed artifact: the project it belongs to, and its absolute path. */
+function artifactKey(root: string, path: string): string {
+  return `${root}\0${path}`;
+}
+
+/**
+ * The next session, given what a clean actually did.
+ *
+ * Pure, and total: the shell hands over the previous state and the outcomes and takes back
+ * the whole next state, so "the list updates after a clean" is a property proved here rather
+ * than a sequence of `setState` calls that happen to be in the right order.
+ *
+ * Four rules, each of which is a way the obvious implementation lies:
+ *
+ * 1. **Only `trashed` removes a row.** A refused or failed target is still on the disk. Its
+ *    row stays, its bytes stay in every total, and the disk gauge keeps counting it — which
+ *    is the only version of events a `df` afterwards will agree with.
+ * 2. **A project loses the artifacts that went, not the project.** `bump/dist` being trashed
+ *    while `bump/node_modules` was refused leaves `bump` in the list at its remaining size.
+ *    A project with nothing left drops out entirely, header total and all.
+ * 3. **Everything the round touched is unchecked**, refusals included. Leaving a refused row
+ *    checked would re-promise it on the next round and refuse it again — the promise-then-
+ *    refuse loop `defaultSelection`'s block screening exists to break.
+ * 4. **An empty outcome list is not a round.** Nothing happened, so nothing is counted; a
+ *    clean that was cancelled or that had every target screened out must not inflate the
+ *    round counter the user reads as "how many times have I done this".
+ */
+export function applyRound(input: RoundInput): RoundResult {
+  const { session, selection, outcomes } = input;
+
+  const goneArtifacts = new Set<string>();
+  const goneCaches = new Set<string>();
+  let reclaimedBytes = 0;
+  let trashed = 0;
+  let refused = 0;
+  let failed = 0;
+
+  for (const outcome of outcomes) {
+    if (outcome.outcome === 'refused') refused += 1;
+    else if (outcome.outcome === 'failed') failed += 1;
+    else if (outcome.outcome === 'trashed') {
+      trashed += 1;
+      reclaimedBytes += bytesOf(outcome.bytes);
+      if (outcome.target.kind === 'project') {
+        goneArtifacts.add(artifactKey(outcome.target.project.root, outcome.target.artifact.path));
+      } else {
+        goneCaches.add(outcome.target.cache.id);
+      }
+    }
+  }
+
+  const projects: Project[] = [];
+  for (const project of session.projects) {
+    const artifacts = project.artifacts.filter(
+      (artifact) => !goneArtifacts.has(artifactKey(project.root, artifact.path)),
+    );
+    if (artifacts.length === 0) continue;
+    projects.push(
+      artifacts.length === project.artifacts.length
+        ? project
+        : {
+            ...project,
+            artifacts,
+            bytes: artifacts.reduce((sum, artifact) => sum + artifact.bytes, 0),
+          },
+    );
+  }
+
+  const nextProjects = new Set(selection.projects);
+  const nextCaches = new Set(selection.caches);
+  for (const outcome of outcomes) {
+    if (outcome.target.kind === 'project') nextProjects.delete(outcome.target.project.root);
+    else nextCaches.delete(outcome.target.cache.id);
+  }
+
+  return {
+    session: {
+      projects,
+      caches: session.caches.filter((cache) => !goneCaches.has(cache.id)),
+      reclaimedBytes: session.reclaimedBytes + reclaimedBytes,
+      rounds: session.rounds + (outcomes.length > 0 ? 1 : 0),
+    },
+    selection: { projects: nextProjects, caches: nextCaches },
+    reclaimedBytes,
+    trashed,
+    refused,
+    failed,
+  };
+}
+
+/**
+ * What the session has done so far, or `undefined` before it has done anything.
+ *
+ * `undefined` rather than "0B reclaimed": on the first pass there is no session to summarise,
+ * and a running total that starts at zero reads as a failure report rather than as an empty
+ * ledger. The wording says "trashed", not "freed", for the reason `diskbar.ts` states at
+ * length — the bytes are still on the volume until the Trash is emptied.
+ */
+export function sessionSummary(session: SessionState): string | undefined {
+  if (session.rounds === 0) return undefined;
+  const rounds = session.rounds === 1 ? '1 round' : `${session.rounds} rounds`;
+  return `${formatBytes(session.reclaimedBytes)} trashed this session · ${rounds}`;
 }

@@ -87,7 +87,13 @@ async function run(
   overrides: Partial<MainDeps> = {},
 ): Promise<RunResult> {
   const io = fakeIO();
-  const runApp = vi.fn(async () => ({ cleaned: false, outcomes: [] as CleanOutcome[], trashedBytes: 0 }));
+  const runApp = vi.fn(async () => ({
+    cleaned: false,
+    outcomes: [] as CleanOutcome[],
+    trashedBytes: 0,
+    rounds: 0,
+    trashEmptied: false,
+  }));
   const clean = vi.fn(async () => [] as CleanOutcome[]);
   const deps: MainDeps = {
     io,

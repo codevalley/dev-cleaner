@@ -7,9 +7,23 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { formatBytes, formatDate, formatIdle, truncateLabel } from '../src/ui/format.js';
 import {
+  formatBytes,
+  formatDate,
+  formatIdle,
+  formatPercent,
+  truncateLabel,
+} from '../src/ui/format.js';
+import {
+  EMPTY_SESSION,
+  SAFE_TO_CHECK,
+  SECTION_LABELS,
+  SECTION_NOTES,
+  SECTION_ORDER,
+  SECTION_PRESELECTED,
+  applyRound,
   buildRows,
+  cursorIndex,
   cyclePreset,
   defaultSelection,
   firstSelectableId,
@@ -20,14 +34,23 @@ import {
   selectedBytes,
   selectedCount,
   selectedRows,
+  sessionSummary,
   toTargets,
   toggleRow,
   toggleSection,
   upsertProject,
   type Row,
   type Selection,
+  type SessionState,
 } from '../src/ui/model.js';
-import type { Artifact, CacheEntry, Category, Project } from '../src/types.js';
+import type {
+  Artifact,
+  CacheEntry,
+  Category,
+  CleanOutcome,
+  CleanTarget,
+  Project,
+} from '../src/types.js';
 
 const KB = 1024;
 const MB = KB * 1024;
@@ -119,6 +142,103 @@ describe('formatDate', () => {
   });
 });
 
+describe('formatPercent', () => {
+  it('rounds to a whole percent for the disk gauge', () => {
+    expect(formatPercent(0.837)).toBe('84%');
+    expect(formatPercent(0)).toBe('0%');
+    expect(formatPercent(1)).toBe('100%');
+  });
+
+  it('never labels a bar with a number the bar cannot draw', () => {
+    // The gauge is clamped to its own width; a `120%` beside a full bar would read as a bug
+    // in the bar rather than as a surprising input.
+    expect(formatPercent(1.2)).toBe('100%');
+    expect(formatPercent(-0.5)).toBe('0%');
+    expect(formatPercent(Number.NaN)).toBe('0%');
+  });
+});
+
+/**
+ * The section header used to read `ACTIVE (protected)`, and the user's reaction to it was
+ * "it scares me to check the active section, because it feels like it may corrupt something".
+ *
+ * That is the header doing the opposite of its job. It asserted a verdict without its ground
+ * — and it asserted it while `scoreActivity` was a stub marking *everything* active, so it
+ * grouped nothing and was simply false. It also said nothing about the only question the user
+ * actually had, which is what happens if they check the box.
+ */
+describe('section copy: what the header says, and what it does not claim', () => {
+  it('names what dev-cleaner observed, not a verdict about the user’s work', () => {
+    expect(SECTION_LABELS.active).toBe('IN USE RECENTLY');
+  });
+
+  it('drops the word that implied a lock that never existed', () => {
+    // `toggleRow` has always treated these rows like any other; "protected" described a
+    // posture the code does not take, and implied the other sections were unsafe.
+    for (const label of Object.values(SECTION_LABELS)) {
+      expect(label.toLowerCase()).not.toContain('protected');
+    }
+  });
+
+  it('says in the section note that these start unchecked, and that checking is safe', () => {
+    expect(SECTION_NOTES.active).toMatch(/unchecked/);
+    expect(SECTION_NOTES.active).toMatch(/rebuild/);
+  });
+
+  it('gives every section a note, so no header is a bare assertion', () => {
+    for (const section of SECTION_ORDER) {
+      expect(SECTION_NOTES[section].length).toBeGreaterThan(0);
+      expect(SECTION_LABELS[section].length).toBeGreaterThan(0);
+    }
+  });
+
+  it('answers the fear directly: a row can only ever be build output', () => {
+    // The allowlist is the actual guarantee — `ARTIFACT_TABLE` names build and cache
+    // directories and nothing else, so there is no keystroke in this interface that reaches
+    // `src/`. The copy restates that rather than offering reassurance.
+    expect(SAFE_TO_CHECK).toMatch(/never source/i);
+    expect(SAFE_TO_CHECK).toMatch(/regenerable/i);
+    expect(SAFE_TO_CHECK).toMatch(/rebuild/);
+  });
+
+  it('keeps the copy out of the components that render it', () => {
+    // Every string above is exported. A component that spells one of them inline is a
+    // component that will keep saying "protected" after this file stops.
+    expect(typeof SECTION_LABELS.active).toBe('string');
+    expect(typeof SECTION_NOTES.active).toBe('string');
+    expect(typeof SAFE_TO_CHECK).toBe('string');
+  });
+});
+
+/**
+ * The note says "checked by default" and "start unchecked". `defaultSelection` decides which
+ * is true. One table feeds both, because a sentence restating a rule written elsewhere is a
+ * sentence that goes stale the first time the rule moves.
+ */
+describe('SECTION_PRESELECTED is the same fact as the default selection', () => {
+  const rows = rowsOf(
+    [
+      makeProject('dormant-one', 'dormant', [artifact('target', 'build', 4 * GB)]),
+      makeProject('active-one', 'active', [artifact('dist', 'build', 2 * GB)]),
+    ],
+    [makeCache('npm', 1 * GB)],
+  );
+  const selection = defaultSelection(rows);
+
+  it('preselects exactly the sections the table says it does', () => {
+    for (const row of rows) {
+      if (row.kind === 'header') continue;
+      expect(isSelected(selection, row)).toBe(SECTION_PRESELECTED[row.section]);
+    }
+  });
+
+  it('marks the recently-used section as the one that starts unchecked', () => {
+    expect(SECTION_PRESELECTED.projects).toBe(true);
+    expect(SECTION_PRESELECTED.active).toBe(false);
+    expect(SECTION_PRESELECTED.caches).toBe(true);
+  });
+});
+
 describe('projectBytes', () => {
   it('counts only artifacts in the enabled categories', () => {
     const project = makeProject('bump', 'dormant', [
@@ -147,7 +267,7 @@ describe('buildRows', () => {
       'header:PROJECTS',
       'project:big-dormant',
       'project:small-dormant',
-      'header:ACTIVE (protected)',
+      `header:${SECTION_LABELS.active}`,
       'project:busy',
       'header:CACHES',
       'cache:pnpm-store',
@@ -457,6 +577,38 @@ describe('cursor movement', () => {
   });
 });
 
+/**
+ * The index the scroll window is computed from. It has to agree with `moveCursor`, because
+ * one of them decides what is highlighted and the other decides what is on screen; disagree
+ * and the user arrows down from a row that is not the one they can see.
+ */
+describe('cursorIndex', () => {
+  const rows = rowsOf(
+    [
+      makeProject('a', 'dormant', [artifact('dist', 'build', 2 * GB)]),
+      makeProject('b', 'dormant', [artifact('dist', 'build', 1 * GB)]),
+    ],
+    [makeCache('npm', 1 * GB)],
+  );
+
+  it('finds the row, headers included in the count — they are rendered too', () => {
+    expect(cursorIndex(rows, rows[2]?.id)).toBe(2);
+    expect(cursorIndex(rows, rows[4]?.id)).toBe(4);
+  });
+
+  it('falls back exactly where moveCursor does when the row has vanished', () => {
+    const fallback = cursorIndex(rows, 'gone');
+    expect(rows[fallback]?.id).toBe(firstSelectableId(rows));
+    expect(cursorIndex(rows, undefined)).toBe(fallback);
+  });
+
+  it('reports a legal index for an empty list rather than -1', () => {
+    // -1 would slice from the end of the array, which is how an empty scan renders the
+    // bottom of a list that does not exist.
+    expect(cursorIndex([], undefined)).toBe(0);
+  });
+});
+
 describe('cyclePreset', () => {
   it('cycles between the two keyboard presets and rescues custom', () => {
     expect(cyclePreset('recommended')).toBe('aggressive');
@@ -530,5 +682,256 @@ describe('toTargets', () => {
   it('lists the selected rows for the confirmation screen', () => {
     const rows = rowsOf([project], [cache], AGGRESSIVE);
     expect(labels(selectedRows(rows, defaultSelection(rows)))).toEqual(['bump', 'pnpm-store']);
+  });
+});
+
+/**
+ * A session, not a one-shot run.
+ *
+ * The old flow was scan → select → clean → print → exit, and the user's complaint was exactly
+ * that: "no way for me to go back and forth, not like a UI with a home where I can do
+ * multiple select and purge". Staying on the screen after a clean is only honest if the screen
+ * changes to match what just happened — the trashed rows gone, the totals smaller, and a
+ * running figure for what the session has actually reclaimed.
+ *
+ * `applyRound` is that transition as a pure function, which is why it can be checked here
+ * without rendering anything. Every case below is a way the obvious implementation lies.
+ */
+describe('applyRound: the list after a clean', () => {
+  const bump = makeProject('bump', 'dormant', [
+    artifact('dist', 'build', 4 * GB),
+    artifact('node_modules', 'deps', 3 * GB),
+  ]);
+  const solo = makeProject('solo', 'dormant', [artifact('target', 'build', 9 * GB)]);
+  const npm = makeCache('npm', 2 * GB);
+  const store = makeCache('pnpm-store', 7 * GB);
+
+  const session: SessionState = {
+    ...EMPTY_SESSION,
+    projects: [bump, solo],
+    caches: [npm, store],
+  };
+
+  function projectTarget(project: Project, relPath: string): CleanTarget {
+    const found = project.artifacts.find((entry) => entry.relPath === relPath);
+    if (found === undefined) throw new Error(`no artifact ${relPath}`);
+    return { kind: 'project', project, artifact: found };
+  }
+
+  function outcome(
+    target: CleanTarget,
+    result: CleanOutcome['outcome'],
+    bytes: number,
+  ): CleanOutcome {
+    return { target, label: 'x', bytes, outcome: result };
+  }
+
+  const selection = defaultSelection(buildRows({ ...session, categories: AGGRESSIVE }));
+
+  it('removes a project whose every artifact was trashed', () => {
+    const result = applyRound({
+      session,
+      selection,
+      outcomes: [outcome(projectTarget(solo, 'target'), 'trashed', 9 * GB)],
+    });
+
+    expect(result.session.projects.map((entry) => entry.name)).toEqual(['bump']);
+  });
+
+  it('keeps a project that lost only some of its artifacts, at its new size', () => {
+    const result = applyRound({
+      session,
+      selection,
+      outcomes: [outcome(projectTarget(bump, 'dist'), 'trashed', 4 * GB)],
+    });
+
+    const survivor = result.session.projects.find((entry) => entry.name === 'bump');
+    expect(survivor?.artifacts.map((entry) => entry.relPath)).toEqual(['node_modules']);
+    expect(survivor?.bytes).toBe(3 * GB);
+  });
+
+  it('drops a trashed cache from the list', () => {
+    const result = applyRound({
+      session,
+      selection,
+      outcomes: [outcome({ kind: 'cache', cache: npm }, 'trashed', 2 * GB)],
+    });
+
+    expect(result.session.caches.map((entry) => entry.id)).toEqual(['pnpm-store']);
+  });
+
+  it('keeps a refused row — it is still on the disk, and the totals must still say so', () => {
+    const result = applyRound({
+      session,
+      selection,
+      outcomes: [
+        outcome(projectTarget(solo, 'target'), 'refused', 9 * GB),
+        outcome({ kind: 'cache', cache: store }, 'refused', 7 * GB),
+      ],
+    });
+
+    expect(result.session.projects.map((entry) => entry.name)).toContain('solo');
+    expect(result.session.caches.map((entry) => entry.id)).toContain('pnpm-store');
+    expect(result.reclaimedBytes).toBe(0);
+  });
+
+  it('keeps a failed row too', () => {
+    const result = applyRound({
+      session,
+      selection,
+      outcomes: [outcome(projectTarget(solo, 'target'), 'failed', 9 * GB)],
+    });
+
+    expect(result.session.projects.map((entry) => entry.name)).toContain('solo');
+    expect(result.reclaimedBytes).toBe(0);
+    expect(result.failed).toBe(1);
+  });
+
+  it('counts only trashed bytes, exactly as the exit disclosure must', () => {
+    const result = applyRound({
+      session,
+      selection,
+      outcomes: [
+        outcome(projectTarget(bump, 'dist'), 'trashed', 4 * GB),
+        outcome(projectTarget(bump, 'node_modules'), 'refused', 3 * GB),
+        outcome(projectTarget(solo, 'target'), 'failed', 9 * GB),
+      ],
+    });
+
+    expect(result.reclaimedBytes).toBe(4 * GB);
+    expect(result.session.reclaimedBytes).toBe(4 * GB);
+    expect({ trashed: result.trashed, refused: result.refused, failed: result.failed }).toEqual({
+      trashed: 1,
+      refused: 1,
+      failed: 1,
+    });
+  });
+
+  it('accumulates across rounds — the figure the user watches grow', () => {
+    const first = applyRound({
+      session,
+      selection,
+      outcomes: [outcome(projectTarget(bump, 'dist'), 'trashed', 4 * GB)],
+    });
+    const second = applyRound({
+      session: first.session,
+      selection: first.selection,
+      outcomes: [outcome({ kind: 'cache', cache: npm }, 'trashed', 2 * GB)],
+    });
+
+    expect(second.session.reclaimedBytes).toBe(6 * GB);
+    expect(second.reclaimedBytes).toBe(2 * GB); // this round alone
+    expect(second.session.rounds).toBe(2);
+  });
+
+  it('leaves the totals on screen smaller, because the rows are gone', () => {
+    const before = buildRows({ ...session, categories: AGGRESSIVE });
+    expect(selectedBytes(before, defaultSelection(before))).toBe(25 * GB);
+
+    const after = applyRound({
+      session,
+      selection,
+      outcomes: [
+        outcome(projectTarget(solo, 'target'), 'trashed', 9 * GB),
+        outcome({ kind: 'cache', cache: npm }, 'trashed', 2 * GB),
+      ],
+    });
+    const rows = buildRows({ ...after.session, categories: AGGRESSIVE });
+
+    expect(labels(rows)).not.toContain('solo');
+    expect(labels(rows)).not.toContain('npm');
+    expect(selectedBytes(rows, defaultSelection(rows))).toBe(14 * GB);
+  });
+
+  it('unchecks everything the round touched, refusals included', () => {
+    // A refused row that stayed checked would be re-promised and re-refused on the next
+    // round, which is the promise-then-refuse loop the block screening exists to break.
+    const result = applyRound({
+      session,
+      selection,
+      outcomes: [
+        outcome(projectTarget(bump, 'dist'), 'trashed', 4 * GB),
+        outcome(projectTarget(bump, 'node_modules'), 'refused', 3 * GB),
+        outcome({ kind: 'cache', cache: npm }, 'refused', 2 * GB),
+      ],
+    });
+
+    expect(result.selection.projects.has(bump.root)).toBe(false);
+    expect(result.selection.caches.has('npm')).toBe(false);
+    // Untouched rows keep whatever the user had chosen.
+    expect(result.selection.projects.has(solo.root)).toBe(true);
+  });
+
+  it('never mutates the session or the selection it was handed', () => {
+    const result = applyRound({
+      session,
+      selection,
+      outcomes: [outcome(projectTarget(bump, 'dist'), 'trashed', 4 * GB)],
+    });
+
+    expect(session.projects).toHaveLength(2);
+    expect(bump.artifacts).toHaveLength(2);
+    expect(bump.bytes).toBe(7 * GB);
+    expect(selection.projects.has(bump.root)).toBe(true);
+    expect(result.session).not.toBe(session);
+  });
+
+  it('does not count a round in which nothing happened', () => {
+    const result = applyRound({ session, selection, outcomes: [] });
+    expect(result.session.rounds).toBe(0);
+    expect(result.session.reclaimedBytes).toBe(0);
+    expect(result.session.projects).toEqual(session.projects);
+  });
+
+  it('ignores a degenerate byte count instead of poisoning the running total', () => {
+    const result = applyRound({
+      session,
+      selection,
+      outcomes: [
+        outcome(projectTarget(bump, 'dist'), 'trashed', Number.NaN),
+        outcome({ kind: 'cache', cache: npm }, 'trashed', -1),
+      ],
+    });
+
+    expect(result.session.reclaimedBytes).toBe(0);
+    // The rows still go: the delete happened, only its measurement was unusable.
+    expect(result.session.caches.map((entry) => entry.id)).toEqual(['pnpm-store']);
+  });
+
+  it('removes the artifact from the project it belonged to, not from every project', () => {
+    // Two projects, one with an artifact of the same name. Matching on the basename — or on
+    // the artifact object alone — would empty both rows on one delete.
+    const twin = makeProject('twin', 'dormant', [artifact('dist', 'build', 5 * GB)]);
+    const result = applyRound({
+      session: { ...EMPTY_SESSION, projects: [bump, twin] },
+      selection,
+      outcomes: [outcome(projectTarget(bump, 'dist'), 'trashed', 4 * GB)],
+    });
+
+    const survivor = result.session.projects.find((entry) => entry.name === 'twin');
+    expect(survivor?.artifacts.map((entry) => entry.relPath)).toEqual(['dist']);
+    expect(survivor?.bytes).toBe(5 * GB);
+  });
+});
+
+describe('sessionSummary', () => {
+  it('says nothing before the first round', () => {
+    // "0B reclaimed" reads as a failure report; an empty ledger has nothing to report.
+    expect(sessionSummary(EMPTY_SESSION)).toBeUndefined();
+  });
+
+  it('reports the running total and the round count', () => {
+    expect(sessionSummary({ ...EMPTY_SESSION, reclaimedBytes: 12 * GB, rounds: 1 })).toBe(
+      '12.0G trashed this session · 1 round',
+    );
+    expect(sessionSummary({ ...EMPTY_SESSION, reclaimedBytes: 12 * GB, rounds: 3 })).toBe(
+      '12.0G trashed this session · 3 rounds',
+    );
+  });
+
+  it('says "trashed", never "freed" — the bytes are still on the volume', () => {
+    const summary = sessionSummary({ ...EMPTY_SESSION, reclaimedBytes: GB, rounds: 1 }) ?? '';
+    expect(summary).toMatch(/trashed/);
+    expect(summary).not.toMatch(/freed/);
   });
 });

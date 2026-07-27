@@ -1,44 +1,60 @@
 /**
- * The two-pane interface.
+ * The Ink shell: a workspace the user returns to, not a wizard they fall out of.
  *
- * Four properties are worth stating, because each one is a decision rather than a detail.
+ * # What changed, and why it was the biggest change
+ *
+ * The original flow was one-shot — scan, select, confirm, clean, unmount, print, exit. Every
+ * part of that is defensible in isolation and the whole is not: the interface vanishes at the
+ * exact moment the user most wants it, and what replaces it is a block of plain text below a
+ * shell prompt. There is no way back to the list, so a second round means re-running the
+ * program and re-scanning a tree that takes minutes. The user's own words: "no way for me to
+ * go back and forth, not like a UI with a home where I can do multiple select and purge."
+ *
+ * So a clean now *returns to the list*. `applyRound` (in `model.ts`) takes the session and the
+ * outcomes and hands back the next session: cleaned rows gone, projects that lost only some
+ * artifacts still there at their remaining size, everything the round touched unchecked, and a
+ * running trashed-bytes total. The round reports itself in a pane inside the frame, and `q` —
+ * only `q` — leaves.
+ *
+ * # The properties that did not change, and must not
  *
  * **Progressive rendering.** The app consumes a `ScanEvent` stream and re-renders on every
- * event. It never awaits `done` before painting: on a 133 GB tree the first project is
- * known seconds before the last, and a UI that waits looks broken for the whole scan. The
- * scan indicator in the footer is what keeps a half-filled list honest.
+ * event; it never awaits `done` before painting. On a 133 GB tree the first project is known
+ * seconds before the last. `ScanStatus` is what keeps a half-filled list honest — an animated
+ * indicator with a running count, and an *unambiguous settled state*, because the absence of
+ * the word "scanning" is not something an eye can read as "finished".
  *
- * **Everything the app knows how to decide lives in `model.ts`.** This component owns
- * state and keys; row order, defaults, totals and target construction are pure functions
- * tested without a terminal.
+ * **Everything the app knows how to decide lives in a pure module.** Row order, defaults,
+ * totals, target construction and the round transition are `model.ts`; the scroll window is
+ * `viewport.ts`; the gauge arithmetic is `diskbar.ts`. This component owns state, keys and
+ * layout. None of the maths is repeated here.
  *
- * **Nothing is imported from `artifacts.ts` or `clean.ts`.** The preset→category policy
- * and the deletion itself arrive as props (`categoriesFor`, `onClean`), wired by `cli.ts`
- * to `categoriesForPreset` and `clean`. The UI is therefore renderable — and testable —
- * without touching a filesystem, and the module that can delete is reached through exactly
- * one, explicit seam.
+ * **Nothing that can delete or empty is imported.** `clean.ts` and `trash.ts` are reached
+ * through props (`onClean`, `onScreen`, `onEmptyTrash`) and referenced only as `import type`,
+ * which is erased at compile time. The UI is renderable and testable without a filesystem, and
+ * the modules that destroy things are reached through explicit seams the CLI wires up.
  *
- * **Consent is a snapshot, and it is the collision between the two properties above.**
- * Progressive rendering means the scan is still delivering projects while the confirmation
- * is on screen, and the default selection preselects each one as it lands. Read live, the
- * confirmation screen would grow a work list behind a question the user has already been
- * asked. `ConfirmSnapshot` freezes what was shown; arrivals are counted and disclosed, and
- * wait for the next pass.
+ * **Consent is a snapshot, frozen and single-use, and it is screened before it is shown.** The
+ * scan is still delivering projects while the confirmation is on screen, and the default
+ * preselects each one as it lands; read live, the confirmation would grow a work list behind a
+ * question already asked. `ConfirmSnapshot` freezes rows, targets and the total; arrivals are
+ * counted and disclosed and wait for the next pass. And because the list describes what is
+ * *selected* while `clean.ts` decides what is *deletable*, the frozen set is put through
+ * `onScreen` — the boundary's own guards — before the question is rendered, so the headline
+ * and the work list are the same fact.
  *
- * **The snapshot is screened before it is shown, and that is the whole point of freezing
- * it.** The list describes what is *selected*; `clean.ts` decides what is *deletable*. When
- * those two are computed by different code the tool promises space it then refuses — so the
- * moment the set stops moving is the moment to ask the boundary's own guards about it.
- * `enter` therefore opens a `screening` phase, not the question: `onScreen` (the CLI's bound
- * `screenTargets`) is run over exactly the frozen targets, first with the cheap tier and then
- * with the full one, and only then is the question rendered — with what will be trashed and
- * what will not, separately, and a headline counting only the former.
+ * **A new round takes a new snapshot.** `runClean` is handed the snapshot it is to act on;
+ * nothing is reused between rounds, and the second round is screened as freshly as the first.
+ * A retained snapshot would be consent given to a list that no longer exists.
  *
- * Screening reads the filesystem and the nested-repository scan is budgeted at 50,000
- * directories per candidate, so it is visible work: the `screening` phase says so rather than
- * letting the interface freeze, and — following the precedent set by `cleaning` — no
- * keystroke can advance out of it. The two keys that *abandon* it still work, because unlike
- * a clean in flight nothing has been touched yet and leaving is always honest.
+ * # The layout is a fixed budget
+ *
+ * The frame is exactly as tall as the terminal, and the list is the only part that gives. The
+ * header (three lines), the section note (one), the pane borders (two), the list's own scroll
+ * hint (one) and the footer (two) are subtracted from the terminal's rows and whatever is left
+ * is the window `viewport.ts` is asked for. That is what makes the footer *pinned*: it is not
+ * pinned by a flex property, it is pinned because nothing above it is ever allowed to be
+ * taller than the space it was given.
  */
 
 import { Box, Text, render, useApp, useInput, useStdin, useStdout } from 'ink';
@@ -46,12 +62,20 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { Confirm, type BlockedEntry, type ConfirmEntry } from './Confirm.js';
 import { Detail } from './Detail.js';
+import { Gauge } from './Gauge.js';
 import { Footer } from './Footer.js';
 import { List } from './List.js';
-import { formatBytes } from './format.js';
+import { RoundSummary, type ProblemEntry, type RoundReport } from './Round.js';
+import { ScanStatus } from './ScanStatus.js';
+import { EMPTY_TRASH_WORD, TrashConfirm, TrashResult, trashConfirmArmed } from './Trash.js';
+import { formatBytes, truncateLabel } from './format.js';
 import {
   EMPTY_SELECTION,
+  EMPTY_SESSION,
+  SECTION_NOTES,
+  applyRound,
   buildRows,
+  cursorIndex,
   cyclePreset,
   defaultSelection,
   firstSelectableId,
@@ -60,6 +84,7 @@ import {
   selectedBytes,
   selectedCount,
   selectedRows,
+  sessionSummary,
   toTargets,
   toggleRow,
   toggleSection,
@@ -67,23 +92,48 @@ import {
   upsertProject,
   type Row,
   type Selection,
+  type SessionState,
 } from './model.js';
+import { windowFor, type Viewport } from './viewport.js';
+import type { DiskUsage } from './diskbar.js';
 import type { ScanEvent } from '../scan.js';
 // Type-only, and deliberately so: `import type` is erased at compile time, so the UI still
-// never *loads* the module that can delete. The seam through which the screen is actually
-// reached is the `onScreen` prop, exactly as `onClean` is for the deletion itself.
+// never *loads* the modules that can delete or empty. The seams through which they are
+// actually reached are the `onScreen`, `onClean` and `onEmptyTrash` props.
 import type { Screening, ScreeningTier } from '../clean.js';
+import type { EmptyTrashResult, TrashSummary } from '../trash.js';
 import type { CacheEntry, Category, CleanOutcome, CleanTarget, Preset, Project } from '../types.js';
 
+/**
+ * What the whole session did, reported once, on the way out.
+ *
+ * `trashedBytes` is the session's accumulated **trashed** total and nothing else — invariant
+ * 8's number. It comes from `applyRound`, which counts an outcome only when it is `trashed`,
+ * because `refused` and `failed` mean the directory is still exactly where it was. A user told
+ * that 10 G is waiting in the Trash when 2 G is will empty it, expect 10 G back, and get 2 G.
+ */
 export interface ExitSummary {
   cleaned: boolean;
+  /** Every outcome from every round, in the order they happened. */
   outcomes: CleanOutcome[];
-  /** Bytes now sitting in the Trash — the number invariant 8 requires be disclosed. */
+  /** Bytes now sitting in the Trash because of this session. Trashed only; never refused. */
   trashedBytes: number;
+  /** Completed rounds. `0` when the user only looked. */
+  rounds: number;
+  /** Whether the user emptied the Trash from inside the interface. */
+  trashEmptied: boolean;
 }
 
+const NOTHING_HAPPENED: ExitSummary = {
+  cleaned: false,
+  outcomes: [],
+  trashedBytes: 0,
+  rounds: 0,
+  trashEmptied: false,
+};
+
 export interface AppProps {
-  /** Live scan events. Rendered as they arrive; `done` only stops the indicator. */
+  /** Live scan events. Rendered as they arrive; `done` only settles the indicator. */
   stream: AsyncIterable<ScanEvent>;
   /** `categoriesForPreset` from src/artifacts.ts, injected by the CLI. */
   categoriesFor: (preset: Preset) => Set<Category>;
@@ -97,8 +147,7 @@ export interface AppProps {
    * immediate partial answer, `'full'` (cheap plus the nested-repository scan) for the
    * verdict the question is rendered from. The binding must recompute
    * `unselectedNodeModules` from the targets it is handed — invariant 5 is a property of the
-   * whole run, so a screen of a hypothetical selection has to be told what that selection is
-   * (see `ScreeningOptions.unselectedNodeModules`).
+   * whole run, so a screen of a hypothetical selection has to be told what that selection is.
    *
    * Optional only so that a caller which cannot vet — a test, a harness — still renders. An
    * app without it confirms exactly what it lists, which is the dishonest total this prop
@@ -107,6 +156,18 @@ export interface AppProps {
   onScreen?:
     | ((targets: readonly CleanTarget[], tier: ScreeningTier) => Promise<readonly Screening[]>)
     | undefined;
+  /**
+   * The volume's usage, re-read after every round and after an empty. Optional: a gauge is a
+   * decoration and a tool that refused to start because it could not draw one would be absurd.
+   */
+  readDisk?: (() => Promise<DiskUsage | undefined>) | undefined;
+  /**
+   * `readTrashSummary` from src/trash.ts. Its figures — the **whole** Trash, never this run's
+   * — are what the empty prompt is required to display. Absent means the offer is not made.
+   */
+  readTrash?: (() => Promise<TrashSummary>) | undefined;
+  /** `emptyTrash` from src/trash.ts. Irreversible; reached only through the typed word. */
+  onEmptyTrash?: (() => Promise<EmptyTrashResult>) | undefined;
   onExit?: ((summary: ExitSummary) => void) | undefined;
   preset?: Preset | undefined;
   nowMs?: number | undefined;
@@ -150,16 +211,21 @@ interface ConfirmSnapshot extends Candidate {
 }
 
 /**
- * Modelled as a union rather than a string plus a nullable snapshot: `screening`, `confirm`
- * and `cleaning` cannot exist without the frozen list, and the type is what says so. The
- * `screening` phase carries the *unscreened* candidate — it is the state of not yet knowing
- * — while `confirm` and `cleaning` can only be built from a screened one.
+ * Modelled as a union rather than a string plus a pile of nullable fields: `screening`,
+ * `confirm` and `cleaning` cannot exist without the frozen list, `result` cannot exist without
+ * a round to report, and `trash-confirm` cannot exist without the summary whose figures the
+ * prompt is required to show. The type is what says so.
  */
 type Phase =
   | { kind: 'list' }
   | { kind: 'screening'; candidate: Candidate; provisional: readonly BlockedEntry[] }
   | { kind: 'confirm'; snapshot: ConfirmSnapshot }
-  | { kind: 'cleaning'; snapshot: ConfirmSnapshot };
+  | { kind: 'cleaning'; snapshot: ConfirmSnapshot }
+  | { kind: 'result'; report: RoundReport }
+  | { kind: 'trash-check' }
+  | { kind: 'trash-confirm'; summary: TrashSummary; typed: string }
+  | { kind: 'emptying' }
+  | { kind: 'trash-result'; ok: boolean; detail: string | undefined; summary: TrashSummary | undefined };
 
 /**
  * Identity of a target for matching a `Screening` back to the target it judged.
@@ -231,10 +297,7 @@ function blockedEntriesOf(
  * them is also the fail-closed direction for invariant 5, since a `node_modules` that will
  * not be trashed is then correctly counted as one still on disk when the run ends.
  */
-function screenedSnapshot(
-  candidate: Candidate,
-  screenings: readonly Screening[],
-): ConfirmSnapshot {
+function screenedSnapshot(candidate: Candidate, screenings: readonly Screening[]): ConfirmSnapshot {
   const blocked = blockedEntriesOf(candidate.targets, screenings);
   const blockedKeys = new Set(blocked.map((entry) => entry.id));
   const targets = candidate.targets.filter((target) => !blockedKeys.has(targetKey(target)));
@@ -262,16 +325,60 @@ function screenedSnapshot(
   };
 }
 
+/** What was selected, consented to, and did not move — for the round summary. */
+function problemsOf(outcomes: readonly CleanOutcome[]): ProblemEntry[] {
+  return outcomes.flatMap((outcome) =>
+    outcome.outcome === 'trashed'
+      ? []
+      : [
+          {
+            id: targetKey(outcome.target),
+            label: outcome.label,
+            bytes: outcome.bytes,
+            outcome: outcome.outcome,
+            detail: outcome.detail,
+          },
+        ],
+  );
+}
+
 const MIN_LIST_WIDTH = 28;
 const MAX_LIST_WIDTH = 52;
-/** Border, padding, title and footer, subtracted from the terminal's rows. */
-const CHROME_HEIGHT = 7;
+
+/**
+ * The fixed part of the frame, in lines. Everything here is drawn on every list frame, so the
+ * list gets the terminal's rows minus this and not one line more.
+ *
+ * - 3 header: the title-and-scan line, and the two lines of the disk gauge.
+ * - 1 section note.
+ * - 2 pane borders (top and bottom).
+ * - 1 scroll hint, drawn *inside* the list pane by `List` whether or not it has anything to
+ *   say — a line that came and went would change the frame height as the user scrolled.
+ * - 2 footer: the key hints and the status line.
+ */
+const HEADER_HEIGHT = 3;
+const NOTE_HEIGHT = 1;
+const PANE_BORDER_HEIGHT = 2;
+const SCROLL_HINT_HEIGHT = 1;
+const FOOTER_HEIGHT = 2;
+const CHROME_HEIGHT =
+  HEADER_HEIGHT + NOTE_HEIGHT + PANE_BORDER_HEIGHT + SCROLL_HINT_HEIGHT + FOOTER_HEIGHT;
+
+/** Below this the pane is unusable anyway, and a negative window is not a window. */
+const MIN_LIST_HEIGHT = 3;
+
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
 
 export function App({
   stream,
   categoriesFor,
   onClean,
   onScreen,
+  readDisk,
+  readTrash,
+  onEmptyTrash,
   onExit,
   preset: initialPreset,
   width,
@@ -284,14 +391,39 @@ export function App({
   // keeps a stranger pairing — piped stdin, TTY stdout — from crashing on the first frame.
   const { isRawModeSupported } = useStdin();
 
-  const [projects, setProjects] = useState<Project[]>([]);
-  const [caches, setCaches] = useState<CacheEntry[]>([]);
+  /**
+   * The session — what has been found and what has been reclaimed — with a ref beside it.
+   *
+   * The ref is not an optimisation. `runClean` awaits `onClean`, and during that await the
+   * scan can deliver more projects; the state closed over when the key was pressed is
+   * therefore stale by the time the round is applied, and applying the round to it would
+   * silently drop every arrival. Writes go through `writeSession`, which updates both, so the
+   * ref is always the current value and always synchronously so.
+   */
+  const [session, setSession] = useState<SessionState>(EMPTY_SESSION);
+  const sessionRef = useRef<SessionState>(EMPTY_SESSION);
+  const writeSession = useCallback((next: (current: SessionState) => SessionState): void => {
+    sessionRef.current = next(sessionRef.current);
+    setSession(sessionRef.current);
+  }, []);
+
+  const [selection, setSelection] = useState<Selection>(EMPTY_SELECTION);
+  const selectionRef = useRef<Selection>(EMPTY_SELECTION);
+  const writeSelection = useCallback((next: (current: Selection) => Selection): void => {
+    selectionRef.current = next(selectionRef.current);
+    setSelection(selectionRef.current);
+  }, []);
+
   const [scanning, setScanning] = useState(true);
   const [preset, setPreset] = useState<Preset>(initialPreset ?? 'recommended');
-  const [selection, setSelection] = useState<Selection>(EMPTY_SELECTION);
   const [cursorId, setCursorId] = useState<string | undefined>(undefined);
   const [phase, setPhase] = useState<Phase>({ kind: 'list' });
   const [message, setMessage] = useState<string | undefined>(undefined);
+  const [disk, setDisk] = useState<DiskUsage | undefined>(undefined);
+
+  /** Every outcome of every round, for the exit summary. A ref: only read on the way out. */
+  const outcomesRef = useRef<CleanOutcome[]>([]);
+  const trashEmptiedRef = useRef(false);
 
   /** Rows whose default selection has already been applied, so a user's `space` sticks. */
   const seen = useRef<Set<string>>(new Set());
@@ -307,8 +439,15 @@ export function App({
    * `await`, makes the transition single-use. Trashing the same path twice is mostly
    * idempotent, but the reported summary would describe the second run, and a trash backend
    * that is not idempotent would delete twice.
+   *
+   * Released when the round finishes, because the *run* is what it spends, not the app: a
+   * session has many rounds and each is a fresh decision over a fresh snapshot. The screen
+   * that sits between two rounds refuses `enter` outright (see `Round.tsx`), which is what
+   * keeps a held key from chaining one round into the next.
    */
   const cleanStarted = useRef(false);
+  /** The same discipline for the one irreversible action. */
+  const emptyStarted = useRef(false);
 
   /**
    * Which screening run owns the screen.
@@ -321,6 +460,8 @@ export function App({
    * dropped. Freezing the set is worth nothing if a stale verdict can unfreeze it.
    */
   const screenRun = useRef(0);
+  /** The same, for the Trash read, which walks `~/.Trash` and is just as abandonable. */
+  const trashRun = useRef(0);
   const mounted = useRef(true);
   useEffect(
     () => () => {
@@ -330,14 +471,26 @@ export function App({
   );
 
   const columns = width ?? stdout?.columns ?? 80;
-  const listWidth = Math.min(MAX_LIST_WIDTH, Math.max(MIN_LIST_WIDTH, Math.floor(columns * 0.55)));
-  const detailWidth = Math.max(MIN_LIST_WIDTH, columns - listWidth);
-  const listHeight = Math.max(5, (height ?? stdout?.rows ?? 24) - CHROME_HEIGHT);
+  // Two panes only fit when both can meet their minimum. Below that, one pane takes the
+  // full width and the detail is dropped rather than squeezed.
+  //
+  // The previous form clamped each pane independently — `min(52, max(28, columns*0.55))`
+  // for the list and `max(28, columns - listWidth)` for the detail — so between 40 and 60
+  // columns the second clamp fired and the two widths summed to MORE than the terminal.
+  // Yoga then wrapped every row, and the frame rendered ~1.7x the declared height, which
+  // defeats the pinned footer the viewport work exists to guarantee.
+  const twoPane = columns >= MIN_LIST_WIDTH * 2;
+  const listWidth = twoPane
+    ? Math.min(MAX_LIST_WIDTH, Math.max(MIN_LIST_WIDTH, columns - MIN_LIST_WIDTH))
+    : columns;
+  const detailWidth = twoPane ? columns - listWidth : 0;
+  const rowsAvailable = height ?? stdout?.rows ?? 24;
+  const listHeight = Math.max(MIN_LIST_HEIGHT, rowsAvailable - CHROME_HEIGHT);
 
   const categories = useMemo(() => categoriesFor(preset), [categoriesFor, preset]);
   const rows = useMemo(
-    () => buildRows({ projects, caches, categories }),
-    [projects, caches, categories],
+    () => buildRows({ projects: session.projects, caches: session.caches, categories }),
+    [session.projects, session.caches, categories],
   );
 
   // Progressive rendering: one setState per event, no buffering, no wait for `done`.
@@ -349,15 +502,19 @@ export function App({
         for await (const event of stream) {
           if (cancelled) return;
           if (event.kind === 'project') {
-            setProjects((current) => upsertProject(current, event.project));
+            writeSession((current) => ({
+              ...current,
+              projects: upsertProject(current.projects, event.project),
+            }));
           } else if (event.kind === 'cache') {
-            setCaches((current) => upsertCache(current, event.cache));
+            writeSession((current) => ({
+              ...current,
+              caches: upsertCache(current.caches, event.cache),
+            }));
           }
         }
       } catch (error) {
-        if (!cancelled) {
-          setMessage(`scan failed: ${error instanceof Error ? error.message : String(error)}`);
-        }
+        if (!cancelled) setMessage(`scan failed: ${messageOf(error)}`);
       } finally {
         if (!cancelled) setScanning(false);
       }
@@ -366,7 +523,7 @@ export function App({
     return () => {
       cancelled = true;
     };
-  }, [stream]);
+  }, [stream, writeSession]);
 
   // Apply the default only to rows never seen before, so arrivals do not undo a choice.
   useEffect(() => {
@@ -375,13 +532,13 @@ export function App({
 
     for (const row of fresh) seen.current.add(row.id);
     const defaults = defaultSelection(fresh);
-    setSelection((current) => ({
+    writeSelection((current) => ({
       projects: new Set([...current.projects, ...defaults.projects]),
       caches: new Set([...current.caches, ...defaults.caches]),
     }));
-  }, [rows]);
+  }, [rows, writeSelection]);
 
-  // Keep the cursor on a row that exists — a preset change can remove the one it was on.
+  // Keep the cursor on a row that exists — a preset change or a completed round removes rows.
   useEffect(() => {
     setCursorId((current) =>
       current !== undefined && rows.some((row) => row.id === current)
@@ -399,13 +556,56 @@ export function App({
     [rows, selection, categories],
   );
 
+  /**
+   * The scroll window, carried across renders so it is *stable*: `windowFor` keeps the window
+   * it is given unless the cursor would leave it, which is what stops every `j` from scrolling
+   * the whole list around a cursor that never appears to move. A stale window cannot corrupt
+   * the result — `windowFor` clamps its `start` into range — so a round that removed half the
+   * rows simply pulls the window back to the end of the new list.
+   */
+  const viewRef = useRef<Viewport | undefined>(undefined);
+  const view = windowFor(rows.length, cursorIndex(rows, cursorId), listHeight, viewRef.current);
+  viewRef.current = view;
+
+  const canEmptyTrash = readTrash !== undefined && onEmptyTrash !== undefined;
+
+  const refreshDisk = useCallback(async (): Promise<void> => {
+    if (readDisk === undefined) return;
+    try {
+      const usage = await readDisk();
+      if (mounted.current) setDisk(usage);
+    } catch {
+      // A gauge that could not be read is a gauge that is not drawn. It is never worth a crash.
+    }
+  }, [readDisk]);
+
+  useEffect(() => {
+    void refreshDisk();
+  }, [refreshDisk]);
+
   const quit = useCallback(() => {
-    onExit?.({ cleaned: false, outcomes: [], trashedBytes: 0 });
+    // Read from the refs: `quit` is called from an input handler that may have been created
+    // several rounds ago, and the summary has to describe the session as it actually is.
+    onExit?.({
+      cleaned: sessionRef.current.rounds > 0,
+      outcomes: [...outcomesRef.current],
+      trashedBytes: sessionRef.current.reclaimedBytes,
+      rounds: sessionRef.current.rounds,
+      trashEmptied: trashEmptiedRef.current,
+    });
     exit();
   }, [exit, onExit]);
 
-  // Takes the snapshot as an argument rather than reading state: the work list handed to
-  // `clean` is the one the user saw, not whatever the stream has made of it since.
+  /**
+   * Run the clean, then **return to the list**.
+   *
+   * Takes the snapshot as an argument rather than reading state: the work list handed to
+   * `clean` is the one the user saw, not whatever the stream has made of it since.
+   *
+   * `applyRound` is handed `sessionRef.current` rather than the closed-over `session` for the
+   * reason given where the ref is declared — the scan does not pause for the deletion, and a
+   * round applied to a stale session drops every project that arrived during it.
+   */
   const runClean = useCallback(
     async (snapshot: ConfirmSnapshot) => {
       // Latched here, synchronously: everything above the first `await` runs before the
@@ -415,21 +615,45 @@ export function App({
 
       setPhase({ kind: 'cleaning', snapshot });
       try {
-        const result = await onClean(snapshot.targets);
-        const trashedBytes = result
-          .filter((outcome) => outcome.outcome === 'trashed')
-          .reduce((sum, outcome) => sum + outcome.bytes, 0);
-        onExit?.({ cleaned: true, outcomes: result, trashedBytes });
-        exit();
+        const outcomes = await onClean(snapshot.targets);
+        if (!mounted.current) return;
+
+        const round = applyRound({
+          session: sessionRef.current,
+          selection: selectionRef.current,
+          outcomes,
+        });
+        writeSession(() => round.session);
+        writeSelection(() => round.selection);
+        outcomesRef.current = [...outcomesRef.current, ...outcomes];
+
+        setPhase({
+          kind: 'result',
+          report: {
+            // From `applyRound`, which counts `trashed` and nothing else. Invariant 8.
+            reclaimedBytes: round.reclaimedBytes,
+            trashed: round.trashed,
+            refused: round.refused,
+            failed: round.failed,
+            problems: problemsOf(outcomes),
+            sessionBytes: round.session.reclaimedBytes,
+            rounds: round.session.rounds,
+          },
+        });
+        // The volume did not actually change — the bytes are in the Trash — but the *selection*
+        // did, so the projection segment must be redrawn from a fresh reading rather than left
+        // describing a set of rows that no longer exists.
+        void refreshDisk();
       } catch (error) {
-        // The run is over and nothing was reported, so the next one is a new decision:
-        // release the latch or a failed clean would leave the app unable to retry.
-        cleanStarted.current = false;
         setPhase({ kind: 'list' });
-        setMessage(`clean failed: ${error instanceof Error ? error.message : String(error)}`);
+        setMessage(`clean failed: ${messageOf(error)}`);
+      } finally {
+        // The latch spends the *round*, not the app: the next one is a new decision over a new
+        // snapshot, and a latch left set would make every later enter silently inert.
+        cleanStarted.current = false;
       }
     },
-    [exit, onClean, onExit],
+    [onClean, refreshDisk, writeSelection, writeSession],
   );
 
   /**
@@ -476,27 +700,126 @@ export function App({
       } catch (error) {
         if (stale()) return;
         setPhase({ kind: 'list' });
-        setMessage(`check failed: ${error instanceof Error ? error.message : String(error)}`);
+        setMessage(`check failed: ${messageOf(error)}`);
       }
     },
     [onScreen],
   );
 
+  /**
+   * Read the Trash, then show what emptying it would destroy.
+   *
+   * The read is a directory walk and can take seconds, so it gets a phase of its own and an
+   * abandonment counter, exactly like the screening. It is also the only source of the figures
+   * the prompt may show: `trash.ts` is explicit that the **whole** Trash must be disclosed,
+   * never this run's contribution, because emptying takes the user's holiday photos along with
+   * the `node_modules`.
+   */
+  const beginTrash = useCallback(async () => {
+    if (readTrash === undefined) return;
+    const run = trashRun.current + 1;
+    trashRun.current = run;
+    const stale = (): boolean => !mounted.current || trashRun.current !== run;
+
+    setPhase({ kind: 'trash-check' });
+    try {
+      const summary = await readTrash();
+      if (stale()) return;
+      setPhase({ kind: 'trash-confirm', summary, typed: '' });
+    } catch (error) {
+      if (stale()) return;
+      setPhase({ kind: 'list' });
+      setMessage(`could not read the Trash: ${messageOf(error)}`);
+    }
+  }, [readTrash]);
+
+  /**
+   * Empty the Trash. Irreversible, and total — everything in it, not this run's items.
+   *
+   * Re-reads the summary afterwards rather than trusting the attempt's own verdict: Finder may
+   * have emptied part of the Trash before erroring, and a timeout on a very large empty means
+   * "still working" more often than it means "failed". Then re-reads the disk, because seeing
+   * the free space actually move is the entire reason this action exists.
+   */
+  const runEmptyTrash = useCallback(async () => {
+    if (onEmptyTrash === undefined) return;
+    if (emptyStarted.current) return;
+    emptyStarted.current = true;
+
+    setPhase({ kind: 'emptying' });
+    try {
+      const result = await onEmptyTrash();
+      let after: TrashSummary | undefined;
+      try {
+        after = await readTrash?.();
+      } catch {
+        after = undefined;
+      }
+      if (!mounted.current) return;
+      if (result.ok) trashEmptiedRef.current = true;
+      setPhase({ kind: 'trash-result', ok: result.ok, detail: result.detail, summary: after });
+      void refreshDisk();
+    } catch (error) {
+      if (!mounted.current) return;
+      setPhase({ kind: 'trash-result', ok: false, detail: messageOf(error), summary: undefined });
+    } finally {
+      emptyStarted.current = false;
+    }
+  }, [onEmptyTrash, readTrash, refreshDisk]);
+
   useInput(
     (input, key) => {
-      if (phase.kind === 'cleaning') return;
+      // Guard: while directories are being moved, or the Trash is being destroyed, the
+      // keyboard is dead. `q` is the key that proves why — let through mid-clean it reports
+      // "nothing was cleaned" to the CLI while `onClean` is still working, so the invariant-8
+      // disclosure is skipped entirely and the user is never told what is in their Trash.
+      // `phase` is React state, and state does not commit within the tick that scheduled it.
+      // Two keys delivered in one read — a double-tap, a held key, a terminal batching two
+      // events — both reach the handler closure from the render BEFORE the clean started, so
+      // this test still sees `confirm` and lets the second key through. The `cleanStarted`
+      // ref is set synchronously inside `runClean`, so it is the only thing that is already
+      // true by then; the phase test stays because the ref is cleared when a round ends and
+      // the phase covers `emptying` too.
+      if (phase.kind === 'cleaning' || phase.kind === 'emptying' || cleanStarted.current) return;
 
       // Mid-screen, the keyboard is as inert as it is mid-clean — no key may advance to the
       // question, and none may reach the list underneath and change what is being screened.
       // The exception is leaving: nothing has been touched yet, so `q` reports the truth and
       // `esc` abandons a check whose result is then dropped by the run counter.
-      if (phase.kind === 'screening') {
+      if (phase.kind === 'screening' || phase.kind === 'trash-check') {
         if (input === 'q' || (key.ctrl && input === 'c')) {
           screenRun.current += 1;
+          trashRun.current += 1;
           quit();
         } else if (key.escape) {
           screenRun.current += 1;
+          trashRun.current += 1;
           setPhase({ kind: 'list' });
+        }
+        return;
+      }
+
+      /**
+       * Typing the word. Placed above the global `q` handler on purpose: while the user is
+       * spelling a word, letters are text, and a `q` that quit the application mid-word would
+       * be indistinguishable from a typo. Ctrl-C still leaves, because it always does.
+       */
+      if (phase.kind === 'trash-confirm') {
+        if (key.ctrl && input === 'c') {
+          quit();
+        } else if (key.escape) {
+          setPhase({ kind: 'list' });
+        } else if (key.backspace || key.delete) {
+          setPhase({ ...phase, typed: phase.typed.slice(0, -1) });
+        } else if (key.return) {
+          // Exact equality, never a prefix, and only when a total was actually disclosed:
+          // an empty offered without a figure is an offer the user cannot evaluate.
+          if (trashConfirmArmed(phase.summary, phase.typed)) void runEmptyTrash();
+        } else if (/^[a-z]+$/i.test(input)) {
+          setPhase({
+            ...phase,
+            typed: (phase.typed + input.toLowerCase()).slice(0, EMPTY_TRASH_WORD.length),
+          });
         }
         return;
       }
@@ -515,6 +838,25 @@ export function App({
         return;
       }
 
+      /**
+       * The round summary, and the one screen in this application where `enter` does nothing.
+       *
+       * `enter` is the commit key: it opens the confirmation and it spends consent. A held
+       * `enter` — and the confirmation dialog is exactly where people hold keys — would
+       * otherwise chain *dismiss → list → enter → screening → confirm → enter* and run a
+       * second round nobody asked for. The screen that sits between two rounds therefore
+       * refuses the key that starts them.
+       */
+      if (phase.kind === 'result' || phase.kind === 'trash-result') {
+        if (key.escape || input === ' ') {
+          setPhase({ kind: 'list' });
+          setMessage(undefined);
+        } else if (input === 't' && phase.kind === 'result' && canEmptyTrash) {
+          void beginTrash();
+        }
+        return;
+      }
+
       setMessage(undefined);
 
       if (key.upArrow || input === 'k') {
@@ -523,21 +865,30 @@ export function App({
         setCursorId((current) => moveCursor(rows, current, 1));
       } else if (input === ' ') {
         if (currentRow !== undefined) {
-          setSelection((current) => toggleRow(current, currentRow));
+          writeSelection((current) => toggleRow(current, currentRow));
         }
       } else if (input === 'a') {
         if (currentRow !== undefined) {
-          setSelection((current) => toggleSection(current, rows, currentRow.section));
+          writeSelection((current) => toggleSection(current, rows, currentRow.section));
         }
       } else if (input === 'p') {
         setPreset(cyclePreset);
+      } else if (input === 't') {
+        if (canEmptyTrash) void beginTrash();
+        else setMessage('Emptying the Trash is not available here');
       } else if (key.return) {
         if (targets.length === 0) setMessage('Nothing selected');
+        // A *new* snapshot, every time. Nothing is carried over from a previous round: the
+        // rows, the targets and the total are read fresh and screened fresh.
         else void beginScreening({ rows: chosen, targets, bytes: totalBytes });
       }
     },
     { isActive: isRawModeSupported },
   );
+
+  // Wide enough for the Trash prompt's disclosure sentences to land on one line each: a
+  // warning that wraps mid-clause is a warning people skim.
+  const paneWidth = Math.min(columns - 4, 72);
 
   if (phase.kind === 'screening') {
     const { candidate, provisional } = phase;
@@ -601,29 +952,101 @@ export function App({
     );
   }
 
+  if (phase.kind === 'result') {
+    return <RoundSummary report={phase.report} width={paneWidth} canEmptyTrash={canEmptyTrash} />;
+  }
+
+  if (phase.kind === 'trash-check') {
+    return (
+      <Box flexDirection="column" paddingX={1}>
+        <Text bold color="cyan">
+          Reading the Trash…
+        </Text>
+        <Text dimColor>measuring everything in it, so you can see what emptying would destroy</Text>
+        <Text dimColor>esc cancel · q quit</Text>
+      </Box>
+    );
+  }
+
+  if (phase.kind === 'trash-confirm') {
+    return <TrashConfirm summary={phase.summary} typed={phase.typed} width={paneWidth} />;
+  }
+
+  if (phase.kind === 'emptying') {
+    return (
+      <Box flexDirection="column" paddingX={1}>
+        <Text bold color="red">
+          Emptying the Trash…
+        </Text>
+        <Text dimColor>this can take a while for a Trash full of small files</Text>
+      </Box>
+    );
+  }
+
+  if (phase.kind === 'trash-result') {
+    return (
+      <TrashResult ok={phase.ok} detail={phase.detail} summary={phase.summary} width={paneWidth} />
+    );
+  }
+
+  const foundBytes = rows.reduce((sum, row) => (row.kind === 'header' ? sum + row.bytes : sum), 0);
+  const note = currentRow === undefined ? ' ' : SECTION_NOTES[currentRow.section];
+
   return (
     <Box flexDirection="column">
+      <Box paddingX={1} flexDirection="column">
+        {/* Truncated like every other full-width line: the status grows with the project
+            count and the bytes found, and at a narrow terminal it wraps to two lines and
+            pushes the whole frame past the height budget. */}
+        <Box width={Math.max(0, columns - 2)}>
+          {/* flexShrink={0}: the product name is the one thing on this line that must not
+              be eaten. Everything after it is a status that degrades gracefully. */}
+          <Box flexShrink={0}>
+            <Text bold>dev-cleaner </Text>
+          </Box>
+          <ScanStatus
+            scanning={scanning}
+            projects={session.projects.length}
+            caches={session.caches.length}
+            bytes={foundBytes}
+          />
+        </Box>
+        <Gauge usage={disk} reclaiming={totalBytes} width={columns - 2} />
+      </Box>
       <Box>
         <Box borderStyle="round" flexDirection="column" paddingX={1} width={listWidth}>
-          <Text bold>dev-cleaner</Text>
           <List
             rows={rows}
             cursorId={cursorId}
             selection={selection}
             width={listWidth - 4}
-            height={listHeight}
+            view={view}
           />
         </Box>
-        <Box borderStyle="round" flexDirection="column" paddingX={1} width={detailWidth}>
-          <Detail row={currentRow} categories={categories} width={detailWidth - 4} />
-        </Box>
+        {/* Narrow terminals get the list at full width rather than two squeezed panes.
+            A detail pane below ~28 columns wraps every line it holds, which costs more
+            rows than the information is worth. */}
+        {twoPane ? (
+          <Box borderStyle="round" flexDirection="column" paddingX={1} width={detailWidth}>
+            <Detail
+              row={currentRow}
+              categories={categories}
+              width={detailWidth - 4}
+              height={listHeight + SCROLL_HINT_HEIGHT}
+            />
+          </Box>
+        ) : null}
+      </Box>
+      <Box paddingX={1}>
+        <Text dimColor>{truncateLabel(note, Math.max(0, columns - 2))}</Text>
       </Box>
       <Footer
         preset={preset}
         selectedCount={count}
         selectedBytes={totalBytes}
-        scanning={scanning}
+        session={sessionSummary(session)}
         message={message}
+        width={columns}
       />
     </Box>
   );
@@ -635,7 +1058,7 @@ export interface RunOptions extends AppProps {
 }
 
 /**
- * Mount the app and resolve once it exits, with what happened.
+ * Mount the app and resolve once it exits, with what the whole session did.
  *
  * `cli.ts` is a `.ts` file and cannot write JSX, so the mounting lives here rather than
  * there — and with it the knowledge that the summary must be captured from `onExit`
@@ -645,7 +1068,7 @@ export interface RunOptions extends AppProps {
  */
 export async function runApp(options: RunOptions): Promise<ExitSummary> {
   const { stdout, stdin, ...props } = options;
-  let summary: ExitSummary = { cleaned: false, outcomes: [], trashedBytes: 0 };
+  let summary: ExitSummary = NOTHING_HAPPENED;
 
   const instance = render(
     React.createElement(App, {
