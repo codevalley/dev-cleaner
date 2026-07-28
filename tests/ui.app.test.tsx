@@ -115,6 +115,20 @@ const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout
 const RENDER_TIMEOUT = process.env['CI'] === undefined ? 1_000 : 15_000;
 
 /**
+ * A note on `selected N` assertions, because there were 22 of them and they were the single
+ * biggest source of CI-only failure in this file.
+ *
+ * A row is PAINTED one commit before the effect that preselects it runs. So an assertion
+ * made straight after `waitForText('some-project')` sees the row and not its selection, and
+ * fails describing a guard that is working perfectly. Locally the two commits land inside the
+ * same tick often enough that it never shows; on a shared runner it shows on one job out of
+ * four, differently each run.
+ *
+ * They are therefore all `vi.waitFor`, waiting on the count the footer reports — the same
+ * signal a person uses to decide the interface is ready.
+ */
+
+/**
  * Ceiling for `press` to observe its own effect. Not a delay — it returns as soon as the
  * frame changes — so a key that repaints costs a few milliseconds and only a genuine no-op
  * pays the full amount.
@@ -588,7 +602,10 @@ describe('selection', () => {
     expect(ui.line('big-dormant')).toContain(MARK_ON);
     expect(ui.line('small-dormant')).toContain(MARK_ON);
     expect(ui.line('busy')).toContain(MARK_OFF);
-    expect(ui.frame()).toContain('selected 2');
+    await vi.waitFor(() => expect(ui.frame()).toContain('selected 2'), {
+      timeout: RENDER_TIMEOUT,
+      interval: 10,
+    });
   });
 
   it('space toggles the row under the cursor', async () => {
@@ -598,11 +615,17 @@ describe('selection', () => {
 
     await ui.press(SPACE);
     expect(ui.line('big-dormant')).toContain(MARK_OFF);
-    expect(ui.frame()).toContain('selected 1');
+    await vi.waitFor(() => expect(ui.frame()).toContain('selected 1'), {
+      timeout: RENDER_TIMEOUT,
+      interval: 10,
+    });
 
     await ui.press(SPACE);
     expect(ui.line('big-dormant')).toContain(MARK_ON);
-    expect(ui.frame()).toContain('selected 2');
+    await vi.waitFor(() => expect(ui.frame()).toContain('selected 2'), {
+      timeout: RENDER_TIMEOUT,
+      interval: 10,
+    });
   });
 
   it('moves with j/k and the arrow keys, skipping headers', async () => {
@@ -633,7 +656,10 @@ describe('selection', () => {
 
     await ui.press(SPACE);
     expect(ui.line('busy')).toContain(MARK_ON);
-    expect(ui.frame()).toContain('selected 3');
+    await vi.waitFor(() => expect(ui.frame()).toContain('selected 3'), {
+      timeout: RENDER_TIMEOUT,
+      interval: 10,
+    });
   });
 
   it('a toggles every row in the section under the cursor', async () => {
@@ -641,11 +667,17 @@ describe('selection', () => {
     await ui.waitForText('big-dormant');
 
     await ui.press('a');
-    expect(ui.frame()).toContain('selected 0');
+    await vi.waitFor(() => expect(ui.frame()).toContain('selected 0'), {
+      timeout: RENDER_TIMEOUT,
+      interval: 10,
+    });
     expect(ui.line('big-dormant')).toContain(MARK_OFF);
 
     await ui.press('a');
-    expect(ui.frame()).toContain('selected 2');
+    await vi.waitFor(() => expect(ui.frame()).toContain('selected 2'), {
+      timeout: RENDER_TIMEOUT,
+      interval: 10,
+    });
   });
 
   it('p cycles the preset, which changes what is counted', async () => {
@@ -723,7 +755,10 @@ describe('the default selection is applied once per row', () => {
     expect(ui.line('newcomer')).toContain(MARK_ON);
     expect(ui.line('kept')).toContain(MARK_ON);
     expect(ui.line('dropped')).toContain(MARK_OFF);
-    expect(ui.frame()).toContain('selected 2');
+    await vi.waitFor(() => expect(ui.frame()).toContain('selected 2'), {
+      timeout: RENDER_TIMEOUT,
+      interval: 10,
+    });
 
     // And the deselection reaches the thing that matters: the work list.
     await ui.press(ENTER);
@@ -748,7 +783,10 @@ describe('the default selection is applied once per row', () => {
     await source.push(projectEvent(makeProject('busy', 'active', [artifact('dist', 'build', 4 * GB)])));
     await source.push(cacheEvent(makeCache('npm cache', 2 * GB)));
     await ui.waitForText('npm cache');
-    expect(ui.frame()).toContain('selected 2'); // dormant project + cache
+    await vi.waitFor(() => expect(ui.frame()).toContain('selected 2'), {
+      timeout: RENDER_TIMEOUT,
+      interval: 10,
+    }); // dormant project + cache
 
     await ui.press(SPACE); // clear `dropped`
     await ui.press('j'); // onto `busy`, protected and unselected
@@ -778,7 +816,10 @@ describe('the default selection is applied once per row', () => {
     // The cleared cache is asserted through the count and the work list below rather than
     // its glyph: the detail pane prints `/caches/npm cache`, which shares a physical line
     // with an unrelated list row, so the glyph on that line belongs to someone else.
-    expect(ui.frame()).toContain('selected 4'); // busy + the three arrivals
+    await vi.waitFor(() => expect(ui.frame()).toContain('selected 4'), {
+      timeout: RENDER_TIMEOUT,
+      interval: 10,
+    }); // busy + the three arrivals
 
     await ui.press(ENTER);
     await ui.press(ENTER);
@@ -1132,7 +1173,10 @@ describe('confirmation and exit', () => {
     await ui.press('a'); // clear the project section
     await ui.press('j');
     await ui.press('a'); // clear the caches section
-    expect(ui.frame()).toContain('selected 0');
+    await vi.waitFor(() => expect(ui.frame()).toContain('selected 0'), {
+      timeout: RENDER_TIMEOUT,
+      interval: 10,
+    });
 
     await ui.press(ENTER);
     expect(ui.frame()).not.toContain('Move to Trash?');
@@ -1160,7 +1204,10 @@ describe('the confirmation is a snapshot', () => {
 
     await source.push(projectEvent(shown()));
     await ui.waitForText('shown');
-    expect(ui.frame()).toContain('selected 1');
+    await vi.waitFor(() => expect(ui.frame()).toContain('selected 1'), {
+      timeout: RENDER_TIMEOUT,
+      interval: 10,
+    });
 
     await ui.press(ENTER);
     expect(ui.frame()).toContain('Move to Trash?');
@@ -1245,7 +1292,10 @@ describe('the confirmation is a snapshot', () => {
     await ui.press(ESCAPE);
 
     expect(ui.frame()).toContain('latecomer');
-    expect(ui.frame()).toContain('selected 2');
+    await vi.waitFor(() => expect(ui.frame()).toContain('selected 2'), {
+      timeout: RENDER_TIMEOUT,
+      interval: 10,
+    });
 
     await ui.press(ENTER);
     expect(ui.frame()).toContain('Move to Trash?');
@@ -1421,7 +1471,10 @@ describe('the confirmation is screened before it is asked', () => {
     const held = gate();
     const ui = mount(stream(), { screen: { holdFull: held } });
     await ready(ui);
-    expect(ui.frame()).toContain('selected 3');
+    await vi.waitFor(() => expect(ui.frame()).toContain('selected 3'), {
+      timeout: RENDER_TIMEOUT,
+      interval: 10,
+    });
 
     await ui.press(ENTER);
 
@@ -1442,7 +1495,10 @@ describe('the confirmation is screened before it is asked', () => {
     expect(ui.frame()).toContain('80.0G across 4 directories');
 
     await ui.press(ESCAPE);
-    expect(ui.frame()).toContain('selected 3');
+    await vi.waitFor(() => expect(ui.frame()).toContain('selected 3'), {
+      timeout: RENDER_TIMEOUT,
+      interval: 10,
+    });
     expect(ui.frame()).toContain('preset recommended');
   });
 
@@ -1933,9 +1989,15 @@ describe('the session survives a clean', () => {
 
     // Clear the section, then take just `alpha`.
     await ui.press('a');
-    expect(ui.frame()).toContain('selected 0');
+    await vi.waitFor(() => expect(ui.frame()).toContain('selected 0'), {
+      timeout: RENDER_TIMEOUT,
+      interval: 10,
+    });
     await ui.press(SPACE);
-    expect(ui.frame()).toContain('selected 1');
+    await vi.waitFor(() => expect(ui.frame()).toContain('selected 1'), {
+      timeout: RENDER_TIMEOUT,
+      interval: 10,
+    });
     await settle();
 
     await ui.press(ENTER);
@@ -1982,7 +2044,10 @@ describe('the session survives a clean', () => {
 
     // Round two: a different selection, taken now, over the list as it stands.
     await ui.press(SPACE); // beta, 5.0G — the cursor fell to the first surviving row
-    expect(ui.frame()).toContain('selected 1');
+    await vi.waitFor(() => expect(ui.frame()).toContain('selected 1'), {
+      timeout: RENDER_TIMEOUT,
+      interval: 10,
+    });
     await settle();
     await ui.press(ENTER);
     await ui.waitForText('Move to Trash?');
@@ -2041,7 +2106,10 @@ describe('the session survives a clean', () => {
     expect(ui.frame()).not.toContain('alpha');
     expect(ui.line('beta')).toContain('5.0G');
     expect(ui.line('beta')).toContain(MARK_OFF);
-    expect(ui.frame()).toContain('selected 0');
+    await vi.waitFor(() => expect(ui.frame()).toContain('selected 0'), {
+      timeout: RENDER_TIMEOUT,
+      interval: 10,
+    });
     expect(ui.frame()).toContain('11.0G trashed this session');
   });
 
@@ -2123,7 +2191,10 @@ describe('the disk gauge', () => {
     // it; a second press is what clears it.)
     await ui.press('a');
     await ui.press('a');
-    expect(ui.frame()).toContain('selected 0');
+    await vi.waitFor(() => expect(ui.frame()).toContain('selected 0'), {
+      timeout: RENDER_TIMEOUT,
+      interval: 10,
+    });
     expect(ui.frame()).not.toContain('once emptied');
     expect(ui.frame()).toContain('this selection');
   });
@@ -2774,7 +2845,10 @@ describe('the selection total is the headline', () => {
     expect(drawnAt(ui.frame(), 11 * GB)).toBeGreaterThanOrEqual(0);
 
     await ui.press(SPACE); // clear `big`, 6 G
-    expect(ui.frame()).toContain('selected 1');
+    await vi.waitFor(() => expect(ui.frame()).toContain('selected 1'), {
+      timeout: RENDER_TIMEOUT,
+      interval: 10,
+    });
     expect(drawnAt(ui.frame(), 5 * GB)).toBeGreaterThanOrEqual(0);
     expect(drawnAt(ui.frame(), 11 * GB)).toBe(-1);
 
@@ -2793,7 +2867,10 @@ describe('the selection total is the headline', () => {
     await settle();
 
     await ui.press('a');
-    expect(ui.frame()).toContain('selected 0');
+    await vi.waitFor(() => expect(ui.frame()).toContain('selected 0'), {
+      timeout: RENDER_TIMEOUT,
+      interval: 10,
+    });
     expect(drawnAt(ui.frame(), 0)).toBeGreaterThanOrEqual(0);
   });
 
@@ -2923,7 +3000,10 @@ describe('the command bar', () => {
     const before = ui.lines().length;
 
     await ui.press('a'); // clear the section
-    expect(ui.frame()).toContain('selected 0');
+    await vi.waitFor(() => expect(ui.frame()).toContain('selected 0'), {
+      timeout: RENDER_TIMEOUT,
+      interval: 10,
+    });
     await ui.press(ENTER);
 
     const lines = ui.lines();
