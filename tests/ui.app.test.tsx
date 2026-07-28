@@ -741,17 +741,20 @@ describe('the default selection is applied once per row', () => {
 
     // The scan is still running. One more project lands, which re-runs the default.
     await source.push(projectEvent(makeProject('newcomer', 'dormant', [artifact('out', 'build', GB)])));
-    // Wait for the SELECTION to settle, not merely for the row to be painted. A row is
-    // rendered one commit before the effect that preselects it runs, so a snapshot frozen on
-    // the text alone can hold the row without its selection — the confirmation then lists one
-    // directory where the test expects two, which is what failed on the ubuntu runner while
-    // three other jobs passed.
-    await vi.waitFor(() => expect(ui.frame()).toContain('selected 2'), {
+    // Wait for the ROW'S OWN MARK, not the count.
+    //
+    // `selected 2` is true both before and after this arrival — it was 2 with dropped+kept,
+    // became 1 when dropped was cleared, and returns to 2 when newcomer is preselected. So a
+    // wait on the count can match a frame in which newcomer exists but has not been selected
+    // yet, and the snapshot taken next holds one directory where the test expects two. That
+    // is the failure that survived three earlier fixes, each of which moved it rather than
+    // removing it. The row's mark is unambiguous in a way the aggregate is not.
+    await vi.waitFor(() => expect(ui.line('newcomer')).toContain(MARK_ON), {
       timeout: RENDER_TIMEOUT,
       interval: 10,
     });
 
-    // The arrival is preselected, as it should be. The user's choice is not overwritten.
+    // The user's choice is not overwritten.
     expect(ui.line('newcomer')).toContain(MARK_ON);
     expect(ui.line('kept')).toContain(MARK_ON);
     expect(ui.line('dropped')).toContain(MARK_OFF);
