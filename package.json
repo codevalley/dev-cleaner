@@ -1,5 +1,5 @@
 {
-  "name": "dev-cleaner",
+  "name": "@nynb/dev-cleaner",
   "version": "0.1.0",
   "description": "Interactive TUI that finds regenerable build artifacts across a projects directory and moves them to the Trash.",
   "keywords": [

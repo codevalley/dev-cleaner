@@ -6,7 +6,7 @@ and moves it to the system Trash. It protects work you are still doing, refuses 
 that isn't plainly rebuildable, and shows you the list before it touches a thing.
 
 ```sh
-npx dev-cleaner ~/develop
+npx @nynb/dev-cleaner ~/develop
 ```
 
 Node ≥ 20. Developed and used on macOS; the per-platform cache table also covers Linux and
@@ -368,8 +368,15 @@ working.
 ## Installing
 
 ```sh
-npx dev-cleaner ~/develop        # no install
-npm install -g dev-cleaner       # then: dev-cleaner ~/develop
+npx @nynb/dev-cleaner ~/develop   # no install
+npm install -g @nynb/dev-cleaner # then: dev-cleaner ~/develop
+```
+
+The package is scoped; the command is not. npm rejects the unscoped name `dev-cleaner` as
+too similar to an existing `devcleaner`, so the package lives under `@nynb`. Once installed
+the binary on your PATH is plain `dev-cleaner`.
+
+```sh
 ```
 
 Requires Node ≥ 20. Runtime dependencies are `ink`, `react` and `trash`, and nothing else.

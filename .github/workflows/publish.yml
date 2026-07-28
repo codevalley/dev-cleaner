@@ -18,7 +18,7 @@
 #   https://github.blog/changelog/2026-07-08-npm-install-time-security-and-gat-bypass2fa-deprecation/
 #
 #   ONE-TIME SETUP, after 0.1.0 exists on the registry:
-#     npmjs.com → dev-cleaner → Settings → Trusted publishers → GitHub Actions
+#     npmjs.com → @nynb/dev-cleaner → Settings → Trusted publishers → GitHub Actions
 #       Organization or user:  codevalley
 #       Repository:            dev-cleaner
 #       Workflow filename:     publish.yml

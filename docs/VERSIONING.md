@@ -48,7 +48,7 @@ breaking, nothing is.
 The honest case *against* pretending the version number solves it is just as important, and
 it is the reason the rule below exists:
 
-**A version number protects nobody who runs `npx dev-cleaner`.** `npx` fetches the latest
+**A version number protects nobody who runs `npx @nynb/dev-cleaner`.** `npx` fetches the latest
 published version every time. Major, minor, patch — the user gets the new table either way,
 and no range specifier stands between them and it. Version numbers only gate the small
 minority of users who pin dev-cleaner as a devDependency.
@@ -203,7 +203,7 @@ The workflow holds no npm credential. It authenticates with a short-lived OIDC t
 mints for that specific repository, workflow and run, which npm checks against a trusted
 publisher configured once on the package page:
 
-> npmjs.com → **dev-cleaner** → Settings → Trusted publishers → GitHub Actions
+> npmjs.com → **@nynb/dev-cleaner** → Settings → Trusted publishers → GitHub Actions
 > organization `codevalley`, repository `dev-cleaner`, workflow `publish.yml`
 
 Nothing is stored in repository secrets and nothing needs rotating. Provenance is attached
@@ -224,5 +224,5 @@ configure the trusted publisher, and every release after that is hands-off.
 To verify afterwards:
 
 ```sh
-npm view dev-cleaner version
+npm view @nynb/dev-cleaner version
 ```
