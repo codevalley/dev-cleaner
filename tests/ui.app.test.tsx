@@ -680,7 +680,14 @@ describe('the default selection is applied once per row', () => {
     expect(ui.line('dropped')).toContain(CURSOR);
     await ui.press(SPACE);
     expect(ui.line('dropped')).toContain(MARK_OFF);
-    expect(ui.frame()).toContain('selected 1');
+    // Wait for the deselection to be reflected in the footer before letting the next row
+    // land. `press` returns once the key is written, not once React has committed the state,
+    // so on a slow runner the arrival below could re-run the default against a selection that
+    // still held 'dropped' — failing an assertion that is about the guard, not about timing.
+    await vi.waitFor(() => expect(ui.frame()).toContain('selected 1'), {
+      timeout: RENDER_TIMEOUT,
+      interval: 10,
+    });
 
     // The scan is still running. One more project lands, which re-runs the default.
     await source.push(projectEvent(makeProject('newcomer', 'dormant', [artifact('out', 'build', GB)])));
@@ -2339,10 +2346,16 @@ describe('runApp', () => {
       stdin: stdin as unknown as NodeJS.ReadStream,
     });
 
-    await vi.waitFor(() => expect(stdout.written.join('')).toContain('bump'), {
+    // Deliberately NOT gated on rendered text. Ink detects CI and suppresses intermediate
+    // frames, writing only on unmount, so `stdout.written` holds nothing but the hide-cursor
+    // escape until the app exits — a readiness gate on 'bump' passes locally and can never
+    // pass on a runner. The subject here is the RESOLVED SUMMARY, not the painting: give the
+    // stream a moment to drain, quit, and assert what `runApp` resolves with.
+    await vi.waitFor(() => expect(stdin.listenerCount('readable')).toBeGreaterThan(0), {
       timeout: RENDER_TIMEOUT,
       interval: 10,
     });
+    await settle();
 
     stdin.write('q');
     await expect(promise).resolves.toEqual({
