@@ -15,6 +15,23 @@ One extra section type is used, and it is the important one:
 
 ## [Unreleased]
 
+## [0.1.1] — 2026-07-28
+
+No functional change. Identical code to 0.1.0; cut to exercise the automated release path
+end to end — a tagged push publishing through GitHub Actions with trusted publishing (OIDC),
+holding no npm credential — on a version where a failure costs nothing.
+
+### Changed
+
+- Publishing moved from a long-lived `NPM_TOKEN` to trusted publishing. npm is retiring the
+  alternative: from early August 2026 a 2FA-bypass token stops bypassing 2FA for account
+  operations, and from around January 2027 such tokens cannot publish at all. The workflow
+  now authenticates with a short-lived OIDC token minted per run and scoped to this
+  repository and `publish.yml` specifically, and provenance is attached automatically.
+- Published under the `@nynb` scope. npm rejects the unscoped name as too similar to an
+  existing `devcleaner`. **The command is unchanged**: installing puts plain `dev-cleaner`
+  on your PATH, because `bin` is independent of package name.
+
 ## [0.1.0] — 2026-07-27
 
 First release.
