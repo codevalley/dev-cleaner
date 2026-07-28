@@ -115,6 +115,17 @@ const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout
 const RENDER_TIMEOUT = process.env['CI'] === undefined ? 1_000 : 15_000;
 
 /**
+ * Ceiling for `press` to observe its own effect. Not a delay — it returns as soon as the
+ * frame changes — so a key that repaints costs a few milliseconds and only a genuine no-op
+ * pays the full amount.
+ *
+ * The same on CI as locally, deliberately. A 3s ceiling was tried and took the suite from
+ * 15s to 243s: no-op presses are common enough that the ceiling, not the commit, dominated.
+ * 400ms is twenty times the flat 20ms delay this replaced, which is the margin that was
+ * missing, without paying for it on every key that legitimately changes nothing.
+ */
+
+/**
  * Wait for the frame on screen and the handler that will act on it to be the same generation.
  *
  * A frame is painted at commit; `useInput` re-subscribes in a *passive* effect, which React
@@ -471,10 +482,17 @@ function mount(
     },
     async press(data: string): Promise<void> {
       instance.stdin.write(data);
-      // Let Ink's reconciler flush the state update into a new frame.
-      await delay(20);
+      // A flat settle, deliberately. Waiting for the frame to CHANGE was tried and is the
+      // wrong trade: keys that legitimately repaint nothing — `q`, anything ignored by a
+      // phase guard — then pay the full ceiling, and the suite went from 15s to 243s.
+      //
+      // 20ms was too tight and produced CI-only flakes; 60ms is the margin without the cost.
+      // Where a test genuinely depends on a commit having landed, it says so explicitly with
+      // `waitForText` rather than trusting this number — which is the honest way to express
+      // "wait until the interface actually shows X" in any case.
+      await delay(60);
     },
-    async waitForText(text: string, timeout = 1_000): Promise<void> {
+    async waitForText(text: string, timeout = RENDER_TIMEOUT): Promise<void> {
       await vi.waitFor(() => expect(frame()).toContain(text), { timeout, interval: 10 });
     },
   };
@@ -701,7 +719,7 @@ describe('the default selection is applied once per row', () => {
 
     // And the deselection reaches the thing that matters: the work list.
     await ui.press(ENTER);
-    expect(ui.frame()).toContain('Move to Trash?');
+    await ui.waitForText('Move to Trash?');
     expect(ui.frame()).not.toContain('dropped');
 
     await ui.press(ENTER);
