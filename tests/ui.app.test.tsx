@@ -104,6 +104,17 @@ function makeCache(id: string, bytes: number): CacheEntry {
 const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
+ * How long to wait for a frame.
+ *
+ * One second is generous on a developer's machine and marginal on a shared CI runner, where
+ * the first Ink commit competes with three other Node processes in the matrix. Every one of
+ * these waits is for a render that either happens or does not — a longer ceiling costs
+ * nothing when the render arrives promptly, and it is the difference between a green suite
+ * and a flake that only ever reproduces on someone else's hardware.
+ */
+const RENDER_TIMEOUT = process.env['CI'] === undefined ? 1_000 : 15_000;
+
+/**
  * Wait for the frame on screen and the handler that will act on it to be the same generation.
  *
  * A frame is painted at commit; `useInput` re-subscribes in a *passive* effect, which React
@@ -499,7 +510,7 @@ describe('progressive rendering', () => {
     held.open();
 
     await vi.waitFor(() => expect(ui.frame()).not.toContain('scanning'), {
-      timeout: 1_000,
+      timeout: RENDER_TIMEOUT,
       interval: 10,
     });
   });
@@ -687,7 +698,7 @@ describe('the default selection is applied once per row', () => {
     expect(ui.frame()).not.toContain('dropped');
 
     await ui.press(ENTER);
-    await vi.waitFor(() => expect(ui.cleaned).toHaveLength(1), { timeout: 1_000, interval: 10 });
+    await vi.waitFor(() => expect(ui.cleaned).toHaveLength(1), { timeout: RENDER_TIMEOUT, interval: 10 });
     expect(targetPaths(ui.cleaned[0] ?? [])).toEqual(['/dev/kept/dist', '/dev/newcomer/out']);
   });
 
@@ -730,7 +741,7 @@ describe('the default selection is applied once per row', () => {
 
     await ui.press(ENTER);
     await ui.press(ENTER);
-    await vi.waitFor(() => expect(ui.cleaned).toHaveLength(1), { timeout: 1_000, interval: 10 });
+    await vi.waitFor(() => expect(ui.cleaned).toHaveLength(1), { timeout: RENDER_TIMEOUT, interval: 10 });
     expect(targetPaths(ui.cleaned[0] ?? [])).toEqual([
       '/dev/busy/dist',
       '/dev/extra1/out',
@@ -815,7 +826,7 @@ describe('confirmation and exit', () => {
     await ui.press(ENTER);
     await ui.press(ENTER);
 
-    await vi.waitFor(() => expect(ui.cleaned).toHaveLength(1), { timeout: 1_000, interval: 10 });
+    await vi.waitFor(() => expect(ui.cleaned).toHaveLength(1), { timeout: RENDER_TIMEOUT, interval: 10 });
 
     const targets = ui.cleaned[0] ?? [];
     // Under `recommended`, `node_modules` (deps) is not in play.
@@ -840,7 +851,7 @@ describe('confirmation and exit', () => {
     // Only `q` ends the session, and the figure it carries is the one the round trashed.
     await ui.press(ESCAPE);
     await ui.press('q');
-    await vi.waitFor(() => expect(ui.exits).toHaveLength(1), { timeout: 1_000, interval: 10 });
+    await vi.waitFor(() => expect(ui.exits).toHaveLength(1), { timeout: RENDER_TIMEOUT, interval: 10 });
     expect(ui.exits[0]?.cleaned).toBe(true);
     expect(ui.exits[0]?.trashedBytes).toBe(5 * GB);
     expect(ui.exits[0]?.outcomes).toHaveLength(2);
@@ -884,7 +895,7 @@ describe('confirmation and exit', () => {
 
     // And the key that does mean yes, still means yes.
     await ui.press(ENTER);
-    await vi.waitFor(() => expect(ui.cleaned).toHaveLength(1), { timeout: 1_000, interval: 10 });
+    await vi.waitFor(() => expect(ui.cleaned).toHaveLength(1), { timeout: RENDER_TIMEOUT, interval: 10 });
     expect(targetPaths(ui.cleaned[0] ?? [])).toEqual(['/caches/npm cache', '/dev/bump/dist']);
   });
 
@@ -917,7 +928,7 @@ describe('confirmation and exit', () => {
 
     await ui.press(ESCAPE);
     await ui.press('q');
-    await vi.waitFor(() => expect(ui.exits).toHaveLength(1), { timeout: 1_000, interval: 10 });
+    await vi.waitFor(() => expect(ui.exits).toHaveLength(1), { timeout: RENDER_TIMEOUT, interval: 10 });
     expect(ui.exits[0]?.trashedBytes).toBe(5 * GB);
     expect(ui.exits[0]?.rounds).toBe(1);
   });
@@ -950,7 +961,7 @@ describe('confirmation and exit', () => {
 
     await ui.press(ESCAPE);
     await ui.press('q');
-    await vi.waitFor(() => expect(ui.exits).toHaveLength(1), { timeout: 1_000, interval: 10 });
+    await vi.waitFor(() => expect(ui.exits).toHaveLength(1), { timeout: RENDER_TIMEOUT, interval: 10 });
     expect(ui.exits[0]?.cleaned).toBe(true);
     expect(ui.exits[0]?.trashedBytes).toBe(5 * GB);
   });
@@ -977,7 +988,7 @@ describe('confirmation and exit', () => {
     await ui.press(ENTER);
 
     // In flight: `onClean` has been called and is blocked on the gate.
-    await vi.waitFor(() => expect(ui.cleaned).toHaveLength(1), { timeout: 1_000, interval: 10 });
+    await vi.waitFor(() => expect(ui.cleaned).toHaveLength(1), { timeout: RENDER_TIMEOUT, interval: 10 });
     expect(ui.frame()).toContain('to the Trash…');
     expect(ui.exits).toEqual([]);
 
@@ -1006,7 +1017,7 @@ describe('confirmation and exit', () => {
 
     await ui.press(ESCAPE);
     await ui.press('q');
-    await vi.waitFor(() => expect(ui.exits).toHaveLength(1), { timeout: 1_000, interval: 10 });
+    await vi.waitFor(() => expect(ui.exits).toHaveLength(1), { timeout: RENDER_TIMEOUT, interval: 10 });
     expect(ui.exits[0]?.cleaned).toBe(true);
     expect(ui.exits[0]?.trashedBytes).toBe(5 * GB);
   });
@@ -1057,7 +1068,7 @@ describe('confirmation and exit', () => {
 
     await ui.press(ESCAPE);
     await ui.press('q');
-    await vi.waitFor(() => expect(ui.exits).toHaveLength(1), { timeout: 1_000, interval: 10 });
+    await vi.waitFor(() => expect(ui.exits).toHaveLength(1), { timeout: RENDER_TIMEOUT, interval: 10 });
 
     const summary = ui.exits[0];
     expect(summary?.cleaned).toBe(true);
@@ -1124,14 +1135,14 @@ describe('the confirmation is a snapshot', () => {
     expect(ui.frame()).not.toContain('43.0G');
 
     await ui.press(ENTER);
-    await vi.waitFor(() => expect(ui.cleaned).toHaveLength(1), { timeout: 1_000, interval: 10 });
+    await vi.waitFor(() => expect(ui.cleaned).toHaveLength(1), { timeout: RENDER_TIMEOUT, interval: 10 });
 
     expect(targetPaths(ui.cleaned[0] ?? [])).toEqual(['/dev/shown/dist']);
 
     await ui.waitForText('Moved 3.0G to the Trash.');
     await ui.press(ESCAPE);
     await ui.press('q');
-    await vi.waitFor(() => expect(ui.exits).toHaveLength(1), { timeout: 1_000, interval: 10 });
+    await vi.waitFor(() => expect(ui.exits).toHaveLength(1), { timeout: RENDER_TIMEOUT, interval: 10 });
     expect(ui.exits[0]?.trashedBytes).toBe(3 * GB);
   });
 
@@ -1142,6 +1153,11 @@ describe('the confirmation is a snapshot', () => {
     await source.push(projectEvent(shown()));
     await ui.waitForText('shown');
     await ui.press(ENTER);
+    // Wait for the confirmation to actually be on screen. `press` returns once the key has
+    // been written, not once React has committed the phase change — so on a slow runner the
+    // cache below could arrive while the app was still showing the list, and be rendered
+    // there perfectly correctly, failing an assertion that was really about the snapshot.
+    await ui.waitForText('Move to Trash?');
 
     await source.push(cacheEvent(makeCache('gradle', 7 * GB)));
     await delay(50);
@@ -1150,7 +1166,7 @@ describe('the confirmation is a snapshot', () => {
     expect(ui.frame()).toContain('3.0G across 1 directory');
 
     await ui.press(ENTER);
-    await vi.waitFor(() => expect(ui.cleaned).toHaveLength(1), { timeout: 1_000, interval: 10 });
+    await vi.waitFor(() => expect(ui.cleaned).toHaveLength(1), { timeout: RENDER_TIMEOUT, interval: 10 });
     expect(targetPaths(ui.cleaned[0] ?? [])).toEqual(['/dev/shown/dist']);
   });
 
@@ -1196,7 +1212,7 @@ describe('the confirmation is a snapshot', () => {
     expect(ui.frame()).toContain('across 2 directories');
 
     await ui.press(ENTER);
-    await vi.waitFor(() => expect(ui.cleaned).toHaveLength(1), { timeout: 1_000, interval: 10 });
+    await vi.waitFor(() => expect(ui.cleaned).toHaveLength(1), { timeout: RENDER_TIMEOUT, interval: 10 });
     expect(targetPaths(ui.cleaned[0] ?? [])).toEqual([
       '/dev/latecomer/target',
       '/dev/shown/dist',
@@ -1306,7 +1322,7 @@ describe('the confirmation is screened before it is asked', () => {
     expect(ui.frame()).toContain('a node_modules still links into it');
 
     await ui.press(ENTER);
-    await vi.waitFor(() => expect(ui.cleaned).toHaveLength(1), { timeout: 1_000, interval: 10 });
+    await vi.waitFor(() => expect(ui.cleaned).toHaveLength(1), { timeout: RENDER_TIMEOUT, interval: 10 });
 
     // And the promise is kept: the work list is the two directories the headline described.
     expect(targetPaths(ui.cleaned[0] ?? [])).toEqual(['/caches/npm cache', '/dev/tinysync/dist']);
@@ -1314,7 +1330,7 @@ describe('the confirmation is screened before it is asked', () => {
     await ui.waitForText('Moved 5.0G to the Trash.');
     await ui.press(ESCAPE);
     await ui.press('q');
-    await vi.waitFor(() => expect(ui.exits).toHaveLength(1), { timeout: 1_000, interval: 10 });
+    await vi.waitFor(() => expect(ui.exits).toHaveLength(1), { timeout: RENDER_TIMEOUT, interval: 10 });
     expect(ui.exits[0]?.trashedBytes).toBe(5 * GB);
   });
 
@@ -1511,7 +1527,7 @@ describe('the confirmation is screened before it is asked', () => {
     expect(ui.frame()).toContain('1 more found while confirming');
 
     await ui.press(ENTER);
-    await vi.waitFor(() => expect(ui.cleaned).toHaveLength(1), { timeout: 1_000, interval: 10 });
+    await vi.waitFor(() => expect(ui.cleaned).toHaveLength(1), { timeout: RENDER_TIMEOUT, interval: 10 });
     expect(targetPaths(ui.cleaned[0] ?? [])).toEqual(['/dev/shown/dist']);
   });
 });
@@ -1950,7 +1966,7 @@ describe('the session survives a clean', () => {
 
     await ui.press(ESCAPE);
     await ui.press('q');
-    await vi.waitFor(() => expect(ui.exits).toHaveLength(1), { timeout: 1_000, interval: 10 });
+    await vi.waitFor(() => expect(ui.exits).toHaveLength(1), { timeout: RENDER_TIMEOUT, interval: 10 });
     expect(ui.exits[0]?.trashedBytes).toBe(14 * GB);
     expect(ui.exits[0]?.rounds).toBe(2);
     expect(ui.exits[0]?.outcomes).toHaveLength(2);
@@ -2108,7 +2124,7 @@ describe('the disk gauge', () => {
     await ui.press(ESCAPE);
 
     await vi.waitFor(() => expect(ui.frame()).toContain('70.0G used of 100G'), {
-      timeout: 1_000,
+      timeout: RENDER_TIMEOUT,
       interval: 10,
     });
   });
@@ -2265,7 +2281,7 @@ describe('emptying the Trash', () => {
 
     await ui.press(ESCAPE);
     await ui.press('q');
-    await vi.waitFor(() => expect(ui.exits).toHaveLength(1), { timeout: 1_000, interval: 10 });
+    await vi.waitFor(() => expect(ui.exits).toHaveLength(1), { timeout: RENDER_TIMEOUT, interval: 10 });
     expect(ui.exits[0]?.trashEmptied).toBe(true);
     expect(ui.exits[0]?.trashedBytes).toBe(3 * GB);
   });
@@ -2324,7 +2340,7 @@ describe('runApp', () => {
     });
 
     await vi.waitFor(() => expect(stdout.written.join('')).toContain('bump'), {
-      timeout: 1_000,
+      timeout: RENDER_TIMEOUT,
       interval: 10,
     });
 
@@ -2592,7 +2608,7 @@ describe('the frame leaves the terminal a spare row', () => {
     inkRendered.push(instance);
 
     await vi.waitFor(() => expect(stdout.lastFrame()).toContain('scan complete'), {
-      timeout: 1_000,
+      timeout: RENDER_TIMEOUT,
       interval: 10,
     });
 
@@ -2775,7 +2791,7 @@ describe('the wordmark', () => {
 
     await ui.press(ENTER);
     await ui.press(ENTER);
-    await vi.waitFor(() => expect(ui.cleaned).toHaveLength(1), { timeout: 1_000, interval: 10 });
+    await vi.waitFor(() => expect(ui.cleaned).toHaveLength(1), { timeout: RENDER_TIMEOUT, interval: 10 });
 
     const [top, bottom] = bigText(LOGO_TEXT);
     expect(ui.frame()).toContain(top);
@@ -2819,14 +2835,14 @@ describe('the wordmark', () => {
     inkRendered.push(instance);
 
     await vi.waitFor(() => expect(stdout.lastFrame()).toContain('selected 1'), {
-      timeout: 1_000,
+      timeout: RENDER_TIMEOUT,
       interval: 10,
     });
     await settle();
     stdin.write(ENTER);
     await delay(30);
     stdin.write(ENTER);
-    await vi.waitFor(() => expect(cleanedOnce).toBe(true), { timeout: 1_000, interval: 10 });
+    await vi.waitFor(() => expect(cleanedOnce).toBe(true), { timeout: RENDER_TIMEOUT, interval: 10 });
 
     const frame = stdout.lastFrame();
     expect(frame).not.toContain(bigText(LOGO_TEXT)[0]);
