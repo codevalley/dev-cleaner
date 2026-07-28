@@ -709,7 +709,15 @@ describe('the default selection is applied once per row', () => {
 
     // The scan is still running. One more project lands, which re-runs the default.
     await source.push(projectEvent(makeProject('newcomer', 'dormant', [artifact('out', 'build', GB)])));
-    await ui.waitForText('newcomer');
+    // Wait for the SELECTION to settle, not merely for the row to be painted. A row is
+    // rendered one commit before the effect that preselects it runs, so a snapshot frozen on
+    // the text alone can hold the row without its selection — the confirmation then lists one
+    // directory where the test expects two, which is what failed on the ubuntu runner while
+    // three other jobs passed.
+    await vi.waitFor(() => expect(ui.frame()).toContain('selected 2'), {
+      timeout: RENDER_TIMEOUT,
+      interval: 10,
+    });
 
     // The arrival is preselected, as it should be. The user's choice is not overwritten.
     expect(ui.line('newcomer')).toContain(MARK_ON);
@@ -747,14 +755,22 @@ describe('the default selection is applied once per row', () => {
     await ui.press(SPACE); // opt it in
     await ui.press('j'); // onto the cache
     await ui.press(SPACE); // clear it
-    expect(ui.frame()).toContain('selected 1');
+    // Five presses in a row, each one a state commit. Asserting straight after the last is
+    // asserting against whichever frame happened to be current, which is why this failed on
+    // one runner and passed on three.
+    await vi.waitFor(() => expect(ui.frame()).toContain('selected 1'), {
+      timeout: RENDER_TIMEOUT,
+      interval: 10,
+    });
 
     // Three more arrivals, each one another chance to overwrite the three choices above.
     for (const size of [1, 2, 3]) {
       await source.push(
         projectEvent(makeProject(`extra${size}`, 'dormant', [artifact('out', 'build', size * GB)])),
       );
+      // The row, then the selection it gains one commit later.
       await ui.waitForText(`extra${size}`);
+      await settle();
     }
 
     expect(ui.line('dropped')).toContain(MARK_OFF);
