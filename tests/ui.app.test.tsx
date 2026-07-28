@@ -688,7 +688,7 @@ describe('selection', () => {
     expect(ui.line('big-dormant')).toContain('6.0G');
 
     await ui.press('p');
-    expect(ui.frame()).toContain('preset aggressive');
+    await ui.waitForText('preset aggressive');
     expect(ui.line('big-dormant')).toContain('9.0G');
   });
 
@@ -958,7 +958,7 @@ describe('confirmation and exit', () => {
     await ready(ui);
 
     await ui.press(ENTER);
-    expect(ui.frame()).toContain('Move to Trash?');
+    await ui.waitForText('Move to Trash?');
 
     for (const key of ['j', SPACE, 'k', 'a', 'p', ARROW_DOWN, ARROW_UP, 'x']) {
       await ui.press(key);
@@ -995,7 +995,7 @@ describe('confirmation and exit', () => {
     await ready(ui);
 
     await ui.press(ENTER);
-    expect(ui.frame()).toContain('Move to Trash?');
+    await ui.waitForText('Move to Trash?');
 
     // Deliberately not `press`: no await between them, so React cannot re-render in
     // between and both handlers see phase.kind === 'confirm'.
@@ -1035,7 +1035,7 @@ describe('confirmation and exit', () => {
     expect(ui.exits).toEqual([]);
 
     await ui.press(ENTER);
-    expect(ui.frame()).toContain('Move to Trash?');
+    await ui.waitForText('Move to Trash?');
     await ui.press(ENTER);
 
     await ui.waitForText('Moved 5.0G to the Trash.');
@@ -1141,7 +1141,7 @@ describe('confirmation and exit', () => {
     await ui.waitForText('13.0G');
     await settle();
     await ui.press(ENTER);
-    expect(ui.frame()).toContain('13.0G across 3 directories');
+    await ui.waitForText('13.0G across 3 directories');
 
     await ui.press(ENTER);
     // The in-frame round summary is held to the same rule as the exit summary.
@@ -1210,7 +1210,7 @@ describe('the confirmation is a snapshot', () => {
     });
 
     await ui.press(ENTER);
-    expect(ui.frame()).toContain('Move to Trash?');
+    await ui.waitForText('Move to Trash?');
     expect(ui.frame()).toContain('shown');
 
     // Arrives from the still-running scan, after the question was already on screen.
@@ -1298,7 +1298,7 @@ describe('the confirmation is a snapshot', () => {
     });
 
     await ui.press(ENTER);
-    expect(ui.frame()).toContain('Move to Trash?');
+    await ui.waitForText('Move to Trash?');
     expect(ui.frame()).toContain('latecomer');
     expect(ui.frame()).toContain('across 2 directories');
 
@@ -1450,7 +1450,7 @@ describe('the confirmation is screened before it is asked', () => {
     await ready(ui);
 
     await ui.press(ENTER);
-    expect(ui.frame()).toContain('Checking what can be trashed…');
+    await ui.waitForText('Checking what can be trashed…');
     expect(ui.frame()).toContain('1 blocked so far');
 
     held.open();
@@ -1480,7 +1480,7 @@ describe('the confirmation is screened before it is asked', () => {
 
     for (const key of ['j', SPACE, 'k', 'a', 'p', ARROW_DOWN, ARROW_UP, 'x', ENTER]) {
       await ui.press(key);
-      expect(ui.frame()).toContain('Checking what can be trashed…');
+      await ui.waitForText('Checking what can be trashed…');
       expect(ui.frame()).not.toContain('Move to Trash?');
       expect(ui.cleaned).toEqual([]);
       expect(ui.exits).toEqual([]);
@@ -1515,7 +1515,7 @@ describe('the confirmation is screened before it is asked', () => {
     await ready(ui);
 
     await ui.press(ENTER);
-    expect(ui.frame()).toContain('Checking what can be trashed…');
+    await ui.waitForText('Checking what can be trashed…');
 
     await ui.press(ESCAPE);
     expect(ui.frame()).not.toContain('Checking what can be trashed…');
@@ -1592,7 +1592,7 @@ describe('the confirmation is screened before it is asked', () => {
     expect(ui.exits).toEqual([]);
 
     await ui.press(ESCAPE);
-    expect(ui.frame()).toContain('space toggle');
+    await ui.waitForText('space toggle');
   });
 
   /**
@@ -2143,7 +2143,7 @@ describe('the session survives a clean', () => {
 
     // The key the screen actually offers does work.
     await ui.press(ESCAPE);
-    expect(ui.frame()).toContain('space toggle');
+    await ui.waitForText('space toggle');
   });
 });
 
@@ -2183,7 +2183,7 @@ describe('the disk gauge', () => {
     // Uncheck the 6 G row: the projection follows immediately.
     await settle();
     await ui.press(SPACE);
-    expect(ui.frame()).toContain('→ 24.0G free once emptied');
+    await ui.waitForText('→ 24.0G free once emptied');
 
     // Nothing selected: no "after" figure at all, and the legend instead — because an
     // unchanged projection printed beside the current free space invites the reader to
@@ -2292,7 +2292,7 @@ describe('emptying the Trash', () => {
 
     // The whole word, and only then.
     await ui.press('y');
-    expect(ui.frame()).toContain('enter empties the Trash');
+    await ui.waitForText('enter empties the Trash');
     await ui.press(ENTER);
 
     await ui.waitForText('Trash emptied.');
@@ -2330,7 +2330,7 @@ describe('emptying the Trash', () => {
 
     await ui.press('e');
     await ui.press(ESCAPE);
-    expect(ui.frame()).toContain('space toggle');
+    await ui.waitForText('space toggle');
     expect(ui.emptied).toEqual([]);
 
     // And the typing does not survive the trip: the word must be spelled out again.
@@ -2495,7 +2495,7 @@ describe('same-tick keys during a clean, and narrow terminals', () => {
     await ui.waitForText('selected 1');
     await settle();
     await ui.press(ENTER);
-    expect(ui.frame()).toContain('Move to Trash?');
+    await ui.waitForText('Move to Trash?');
     return ui;
   };
 
