@@ -67,10 +67,19 @@ describe('defaultConcurrency', () => {
 describe('dirSize', () => {
   /**
    * Every file is a whole number of 4 KiB blocks and holds real (non-zero) bytes, so
-   * apparent size and allocated size coincide and the expected total is exact. Sizes that
-   * were not block multiples would make `du`'s block accounting and the walker's differ by
-   * filesystem-dependent padding, and the test would be asserting the filesystem rather
-   * than the code.
+   * apparent size and allocated size coincide for the FILES.
+   *
+   * They do not coincide for the tree as a whole, and an earlier version of this test assumed
+   * they did. Directories consume blocks too, and how many is a property of the filesystem:
+   * on the author's APFS volume these four directories allocated nothing, on GitHub's runners
+   * they allocate 4 KiB each — 16 KiB of difference that failed CI on every platform while
+   * passing locally. The comment below it claimed the test must not "assert the filesystem
+   * rather than the code", which is exactly what an exact total does.
+   *
+   * So the exact figure is asserted only as a LOWER BOUND (the bytes really are in there),
+   * and the real subject of the test — that `du` and the walker agree — is asserted as an
+   * equality between the two implementations. That comparison is about this code and holds on
+   * any filesystem.
    */
   const known = {
     'proj/target/a.bin': file('a', { size: 64 * KIB }),
@@ -82,7 +91,11 @@ describe('dirSize', () => {
 
   it('measures a tree of known byte size', async () => {
     const f = await tree(known);
-    expect(await dirSize(f.path('proj/target'))).toBe(KNOWN_BYTES);
+    const measured = await dirSize(f.path('proj/target'));
+    // At least the file content; directory blocks are filesystem-dependent overhead on top.
+    expect(measured).toBeGreaterThanOrEqual(KNOWN_BYTES);
+    // ...and not wildly more: a directory costs a block, not a megabyte.
+    expect(measured).toBeLessThan(KNOWN_BYTES + 64 * KIB);
   });
 
   it('the du fast path and the walker fallback agree', async () => {
@@ -92,17 +105,24 @@ describe('dirSize', () => {
     const walked = await walkSize(target);
     const du = await duSize(target);
 
-    expect(walked).toBe(KNOWN_BYTES);
+    expect(walked).toBeGreaterThanOrEqual(KNOWN_BYTES);
     expect(HAS_DU).toBe(true); // otherwise the comparison below is vacuous
+    // The assertion that is actually about this code: two independent implementations of
+    // "how big is this tree" agree, whatever the filesystem charges for directories.
     expect(du).toBe(walked);
   });
 
   it('agrees between paths at every concurrency setting', async () => {
     const f = await tree(known);
     const target = f.path('proj/target');
+    // The property is that concurrency changes nothing — measure once, then require every
+    // other setting and both implementations to match it. Comparing against a hard-coded
+    // total would smuggle the filesystem's directory overhead back into the assertion.
+    const baseline = await walkSize(target, { concurrency: 1 });
+    expect(baseline).toBeGreaterThanOrEqual(KNOWN_BYTES);
     for (const concurrency of [1, 4, 64]) {
-      expect(await walkSize(target, { concurrency })).toBe(KNOWN_BYTES);
-      expect(await dirSize(target, { concurrency })).toBe(KNOWN_BYTES);
+      expect(await walkSize(target, { concurrency })).toBe(baseline);
+      expect(await dirSize(target, { concurrency })).toBe(baseline);
     }
   });
 
