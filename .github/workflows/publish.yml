@@ -5,27 +5,37 @@
 # no way to publish by accident, and a failed run is re-run from the Actions UI rather than
 # by adding a manual trigger.
 #
-# ── SECRET REQUIRED ───────────────────────────────────────────────────────────────────────
-#   NPM_TOKEN   an npm **Automation** token for the account that owns `dev-cleaner`.
-#               Automation, not Publish: an automation token bypasses 2FA, which a CI run
-#               cannot answer.
-#               Create:  npmjs.com → avatar → Access Tokens → Generate New Token →
-#                        Classic → Automation   (or a Granular token scoped to this package)
-#               Add:     GitHub repo → Settings → Secrets and variables → Actions →
-#                        New repository secret → name NPM_TOKEN
-#               Until that secret exists this workflow will fail at the publish step with
-#               ENEEDAUTH, after the tests have already passed.
+# ── AUTHENTICATION: TRUSTED PUBLISHING (OIDC), NOT A TOKEN ────────────────────────────────
+#   This workflow holds no npm credential. It authenticates with a short-lived OIDC token
+#   minted by GitHub for this specific repository, workflow and run, which npm verifies
+#   against a trusted publisher you configure once on the package page.
+#
+#   That is deliberate and time-sensitive. npm is retiring the long-lived alternative:
+#   from early August 2026 a 2FA-bypass token no longer bypasses 2FA for account operations,
+#   and from around January 2027 such tokens cannot publish at all — they become read-and-
+#   staging only. A publish token committed to a repository secret today is a credential that
+#   stops working, can be stolen while it does, and never expires on its own.
+#   https://github.blog/changelog/2026-07-08-npm-install-time-security-and-gat-bypass2fa-deprecation/
+#
+#   ONE-TIME SETUP, after 0.1.0 exists on the registry:
+#     npmjs.com → dev-cleaner → Settings → Trusted publishers → GitHub Actions
+#       Organization or user:  codevalley
+#       Repository:            dev-cleaner
+#       Workflow filename:     publish.yml
+#     No secret is created, and nothing needs to be rotated afterwards.
+#
+#   The first publish cannot use this: a trusted publisher is configured ON a package, so the
+#   package has to exist. Publish 0.1.0 once from a laptop with `npm login` and 2FA, then
+#   configure the above and every release after it is hands-off.
+#
+#   REQUIREMENTS, all satisfied below: npm CLI >= 11.5.1, Node >= 22.14.0, `id-token: write`,
+#   and `registry-url` set on setup-node.
 #
 # ── PROVENANCE ────────────────────────────────────────────────────────────────────────────
-#   `npm publish --provenance` attaches a signed statement linking the published tarball to
-#   this repository, this commit and this workflow run, which npm then displays on the
-#   package page. It needs three things, all of which are satisfied here:
-#     1. `id-token: write` permission (below);
-#     2. a public repository on a GitHub-hosted runner;
-#     3. a `repository` field in package.json pointing at this repo — it does.
-#   Provenance is requested with the flag rather than `publishConfig.provenance`, so that a
-#   manual emergency publish from a laptop still works instead of failing on an
-#   unsupported-environment error.
+#   Automatic. Publishing from a public repository to a public package under trusted
+#   publishing attaches the signed statement linking tarball to repo, commit and run without
+#   the `--provenance` flag — which is why the flag is gone. Passing it is not merely
+#   redundant, it fails a laptop publish that has no OIDC to attest with.
 
 name: Publish
 
@@ -49,16 +59,23 @@ jobs:
 
     permissions:
       contents: read
-      id-token: write # provenance
+      id-token: write # mints the OIDC token trusted publishing exchanges
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          # >= 22.14.0 and npm >= 11.5.1 are trusted publishing's floor. Pinned to 24 rather
+          # than tracking '22' so the floor cannot drift underneath us on a runner refresh.
+          node-version: '24'
           registry-url: 'https://registry.npmjs.org'
-          cache: npm
+
+      # The npm bundled with a Node release is often older than the floor. Cheap to be sure.
+      - name: Ensure an npm that can use trusted publishing
+        run: |
+          npm install -g npm@latest
+          npm --version
 
       # Same reasoning as ci.yml: the fixtures set their own identity, this is the belt to
       # that pair of braces.
@@ -103,7 +120,7 @@ jobs:
       # `npm publish` runs the `prepack` script, which rebuilds dist from source, so the
       # tarball is compiled from the tagged commit rather than from whatever happens to be
       # sitting in the working directory.
+      # No NODE_AUTH_TOKEN: the OIDC token is minted from `id-token: write` above and
+      # exchanged by npm itself. Provenance is attached automatically.
       - name: Publish
-        run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public

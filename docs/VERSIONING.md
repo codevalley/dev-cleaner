@@ -190,12 +190,36 @@ That is the whole manual part. Pushing a `v*` tag then triggers
 2. runs the typechecker, the build and the full test suite — a red suite means no publish;
 3. refuses to continue unless the tag name matches `version` in `package.json`, so a
    mistyped tag cannot publish a different version than it names;
-4. runs `npm publish --provenance --access public`, which rebuilds `dist` through the
-   `prepack` script and attaches a signed provenance statement linking the tarball to this
-   repository and this workflow run.
+4. runs `npm publish --access public`, which rebuilds `dist` through the `prepack` script
+   and attaches a signed provenance statement linking the tarball to this repository and
+   this workflow run.
 
 The workflow publishes on tags only. It does not run on pushes to a branch, and it does not
 run on pull requests.
+
+### Authentication: trusted publishing, not a token
+
+The workflow holds no npm credential. It authenticates with a short-lived OIDC token GitHub
+mints for that specific repository, workflow and run, which npm checks against a trusted
+publisher configured once on the package page:
+
+> npmjs.com → **dev-cleaner** → Settings → Trusted publishers → GitHub Actions
+> organization `codevalley`, repository `dev-cleaner`, workflow `publish.yml`
+
+Nothing is stored in repository secrets and nothing needs rotating. Provenance is attached
+automatically under trusted publishing, which is why `--provenance` is not passed — the flag
+is not merely redundant there, it fails a laptop publish that has no OIDC to attest with.
+
+This is not only hygiene. npm is retiring the alternative: from **early August 2026** a
+2FA-bypass token stops bypassing 2FA for account operations, and from **around January 2027**
+such tokens cannot publish at all, becoming read-and-staging only
+([changelog](https://github.blog/changelog/2026-07-08-npm-install-time-security-and-gat-bypass2fa-deprecation/)).
+A publish token added to repository secrets today is a credential that expires by policy,
+can be stolen while it works, and never rotates itself.
+
+**The first release is the exception.** A trusted publisher is configured *on* a package, so
+the package must already exist. Publish `0.1.0` once from a laptop with `npm login` and 2FA,
+configure the trusted publisher, and every release after that is hands-off.
 
 To verify afterwards:
 
