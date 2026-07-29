@@ -26,6 +26,7 @@ import {
   cursorIndex,
   cyclePreset,
   defaultSelection,
+  firstReclaimableId,
   firstSelectableId,
   isSelected,
   moveCursor,
@@ -545,6 +546,29 @@ describe('toggleSection', () => {
   it('selects every row of a partly selected section, including the protected one', () => {
     const filled = toggleSection(defaultSelection(rows), rows, 'active');
     expect(selectedCount(rows, filled)).toBe(3);
+  });
+});
+
+describe('firstReclaimableId', () => {
+  const reclaimableProjects = [
+    makeProject('small-dormant', 'dormant', [artifact('dist', 'build', 100 * MB)]),
+    makeProject('big-dormant', 'dormant', [artifact('target', 'build', 2 * GB)]),
+    makeProject('active-one', 'active', [artifact('dist', 'build', 500 * MB)]),
+  ];
+  const reclaimableRows = buildRows({
+    projects: reclaimableProjects,
+    caches: [],
+    categories: RECOMMENDED,
+  });
+
+  it('prefers the largest selected reclaimable row', () => {
+    const selection = defaultSelection(reclaimableRows);
+    expect(firstReclaimableId(reclaimableRows, selection)).toBe('project:/dev/big-dormant');
+  });
+
+  it('falls back to largest selectable when nothing is selected', () => {
+    const id = firstReclaimableId(reclaimableRows, { projects: new Set(), caches: new Set() });
+    expect(id).toBe('project:/dev/big-dormant');
   });
 });
 

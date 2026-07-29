@@ -380,6 +380,22 @@ export function firstSelectableId(rows: readonly Row[]): string | undefined {
 }
 
 /**
+ * Cursor seed for Triage/Home: the largest selected reclaimable row, else the largest
+ * selectable row. Headers and blocked rows are never candidates.
+ */
+export function firstReclaimableId(
+  rows: readonly Row[],
+  selection: Selection,
+): string | undefined {
+  const selected = rows.filter(
+    (row) => isSelectable(row) && isSelected(selection, row),
+  );
+  const pool = selected.length > 0 ? selected : rows.filter(isSelectable);
+  if (pool.length === 0) return undefined;
+  return pool.reduce((best, row) => (row.bytes > best.bytes ? row : best)).id;
+}
+
+/**
  * Move by `delta` rows, skipping headers and stopping at the ends rather than wrapping.
  * Wrapping in a list that re-sorts under the cursor is disorienting; clamping is not.
  * A cursor whose row has vanished (its project changed section, or the preset dropped it)
