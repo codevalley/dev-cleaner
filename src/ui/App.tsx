@@ -76,7 +76,7 @@ import { Headline, Logo, WORDMARK } from './Banner.js';
 import { Confirm, type BlockedEntry, type ConfirmEntry } from './Confirm.js';
 import { Detail } from './Detail.js';
 import { BAR_LEGEND, Gauge } from './Gauge.js';
-import { Footer } from './Footer.js';
+import { Footer, hintsFor } from './Footer.js';
 import { List } from './List.js';
 import { RoundSummary, type ProblemEntry, type RoundReport } from './Round.js';
 import { ScanStatus } from './ScanStatus.js';
@@ -1180,7 +1180,7 @@ export function App({
           </Box>
         ) : null}
       </Box>
-      <Footer session={sessionSummary(session)} message={message} width={columns} />
+      <Footer hints={hintsFor('triage')} session={sessionSummary(session)} message={message} width={columns} />
     </Box>
   );
 }

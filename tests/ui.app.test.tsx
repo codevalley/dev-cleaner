@@ -3015,7 +3015,7 @@ describe('the command bar', () => {
     const bar = lines[lines.length - 1] ?? '';
     expect(bar).toContain('Nothing selected');
     expect(bar).toContain('space toggle');
-    expect(bar).toContain('q quit');
+    expect(bar).toContain(KEY_HINTS.slice(0, 40));
   });
 
   it('never lets a long message take more than half the bar from the keys', async () => {

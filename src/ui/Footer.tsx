@@ -35,31 +35,58 @@ import React from 'react';
 
 import { truncateLabel } from './format.js';
 
-export const KEY_HINTS =
-  'space toggle · a section · j/k move · p preset · enter clean · t Trash · q quit';
+export type HintMode =
+  | 'home'
+  | 'triage'
+  | 'detail'
+  | 'confirm'
+  | 'done'
+  | 'trash-confirm'
+  | 'screening'
+  | 'cleaning';
+
+const HINTS: Record<HintMode, string> = {
+  home: 'enter reclaim · b browse · p preset · t Trash · q quit',
+  triage:
+    'space toggle · a section · j/k move · d detail · p preset · enter clean · esc home · t Trash · q quit',
+  detail: 'esc back · q quit',
+  confirm: 'enter confirm · esc back · q quit',
+  done: 'esc home · t Trash · q quit',
+  'trash-confirm': 'esc cancel · q quit',
+  screening: 'esc cancel · q quit',
+  cleaning: '',
+};
+
+export function hintsFor(mode: HintMode): string {
+  return HINTS[mode];
+}
+
+/** @deprecated Use `hintsFor('triage')` — kept for one release of import churn. */
+export const KEY_HINTS = hintsFor('triage');
 
 export interface FooterProps {
+  hints: string;
   /** From `sessionSummary` in model.ts. `undefined` until a round has completed. */
   session?: string | undefined;
   message?: string | undefined;
   width: number;
 }
 
-export function Footer({ session, message, width }: FooterProps): React.ReactElement {
+export function Footer({ hints, session, message, width }: FooterProps): React.ReactElement {
   const inner = Math.max(0, width - 2);
 
   // A message displaces the ledger rather than joining it: the ledger is standing information
   // the user can re-read at leisure, the message is about the keystroke they just made.
   const right = truncateLabel(message ?? session ?? '', Math.floor(inner / 2));
   const gap = right.length === 0 ? 0 : 2;
-  const hints = truncateLabel(KEY_HINTS, Math.max(0, inner - right.length - gap));
+  const shown = truncateLabel(hints, Math.max(0, inner - right.length - gap));
   // Assembled by arithmetic rather than by `justifyContent`, so the three pieces provably sum
   // to `inner` and the bar cannot be one column wider than the terminal on any input.
-  const filler = ' '.repeat(Math.max(0, inner - hints.length - right.length));
+  const filler = ' '.repeat(Math.max(0, inner - shown.length - right.length));
 
   return (
     <Box paddingX={1}>
-      <Text dimColor>{hints}</Text>
+      <Text dimColor>{shown}</Text>
       <Text>{filler}</Text>
       <Text bold={message !== undefined} color={message === undefined ? 'cyan' : 'yellow'}>
         {right}
