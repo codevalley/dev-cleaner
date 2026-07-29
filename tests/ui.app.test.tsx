@@ -115,6 +115,9 @@ const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout
  */
 const RENDER_TIMEOUT = process.env['CI'] === undefined ? 1_000 : 15_000;
 
+/** Splash dwell + Home handoff; reuse for Home → Triage so full-suite runs stay green. */
+const LANDING_TIMEOUT = Math.max(RENDER_TIMEOUT, SPLASH_MIN_DWELL_MS + 800);
+
 /**
  * A note on `selected N` assertions, because there were 22 of them and they were the single
  * biggest source of CI-only failure in this file.
@@ -480,7 +483,7 @@ function mount(
    * Re-opens Triage from Home only.
    */
   async function ensureLanded(timeout = RENDER_TIMEOUT): Promise<void> {
-    const budget = Math.max(timeout, SPLASH_MIN_DWELL_MS + 800);
+    const budget = Math.max(timeout, LANDING_TIMEOUT);
     const isModal = (shown: string): boolean =>
       shown.includes('Move to Trash?') ||
       shown.includes('Empty the Trash?') ||
@@ -525,7 +528,7 @@ function mount(
   }
 
   async function reopenTriageFromHomeOrDone(timeout = RENDER_TIMEOUT): Promise<void> {
-    const budget = Math.max(timeout, SPLASH_MIN_DWELL_MS + 800);
+    const budget = Math.max(timeout, LANDING_TIMEOUT);
     if (frame().includes('space toggle')) return;
     if (/\bMoved\b/.test(frame()) || frame().includes('esc home')) {
       instance.stdin.write(ESCAPE);
@@ -616,7 +619,7 @@ function mount(
       }
       if (text.startsWith('b browse')) {
         await vi.waitFor(() => expect(frame()).toContain(text), {
-          timeout: Math.max(timeout, SPLASH_MIN_DWELL_MS + 800),
+          timeout: Math.max(timeout, LANDING_TIMEOUT),
           interval: 20,
         });
         return;
@@ -631,7 +634,10 @@ function mount(
         !text.includes('clean failed') &&
         !text.includes('Checking');
       if (wantsList) await reopenTriageFromHomeOrDone(timeout);
-      await vi.waitFor(() => expect(frame()).toContain(text), { timeout, interval: 10 });
+      await vi.waitFor(() => expect(frame()).toContain(text), {
+        timeout: wantsList ? Math.max(timeout, LANDING_TIMEOUT) : timeout,
+        interval: 10,
+      });
     },
   };
 }
@@ -652,7 +658,7 @@ async function waitForHome(ui: Harness, timeout = RENDER_TIMEOUT): Promise<void>
 async function enterTriage(ui: Harness): Promise<void> {
   await waitForHome(ui);
   await ui.press('b');
-  await ui.waitForText('space toggle');
+  await ui.waitForText('space toggle', LANDING_TIMEOUT);
 }
 
 describe('session modes', () => {
@@ -3095,16 +3101,18 @@ describe('the frame leaves the terminal a spare row', () => {
     inkRendered.push(instance);
 
     await vi.waitFor(() => expect(stdout.lastFrame()).toContain('b browse'), {
-      timeout: Math.max(RENDER_TIMEOUT, SPLASH_MIN_DWELL_MS + 800),
+      timeout: LANDING_TIMEOUT,
       interval: 20,
     });
+    await settle();
     stdin.write('b');
+    await delay(100);
     await vi.waitFor(() => expect(stdout.lastFrame()).toContain('space toggle'), {
-      timeout: RENDER_TIMEOUT,
+      timeout: LANDING_TIMEOUT,
       interval: 20,
     });
     await vi.waitFor(() => expect(stdout.lastFrame()).toContain('scan complete'), {
-      timeout: RENDER_TIMEOUT,
+      timeout: LANDING_TIMEOUT,
       interval: 10,
     });
 
@@ -3337,12 +3345,14 @@ describe('the wordmark', () => {
     inkRendered.push(instance);
 
     await vi.waitFor(() => expect(stdout.lastFrame()).toContain('b browse'), {
-      timeout: Math.max(RENDER_TIMEOUT, SPLASH_MIN_DWELL_MS + 800),
+      timeout: LANDING_TIMEOUT,
       interval: 20,
     });
+    await settle();
     stdin.write('b');
+    await delay(100);
     await vi.waitFor(() => expect(stdout.lastFrame()).toContain('space toggle'), {
-      timeout: RENDER_TIMEOUT,
+      timeout: LANDING_TIMEOUT,
       interval: 20,
     });
     await settle();
