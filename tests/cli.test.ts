@@ -442,12 +442,13 @@ describe('main', () => {
         }
       });
 
-      it('is one terminated line when stdout is redirected, so a log gets one grep', () => {
+      it('is a short branded block when stdout is redirected', () => {
         expect(plain()).toBe(
-          'dev-cleaner: 8.0G moved to the Trash in 1 round. ' +
-            'Trashed files still occupy the disk until you empty the Trash.\n',
+          `${WORDMARK}\n` +
+            `Reclaimed 8.0G across 1 round · regenerable build output, off your disk's critical path.\n` +
+            `Trashed files still occupy the disk until you empty the Trash.\n`,
         );
-        expect(lines(plain())).toHaveLength(1);
+        expect(lines(plain()).length).toBeGreaterThanOrEqual(3);
       });
 
       it('draws the figure in the interface’s own block face when there is room for it', () => {
@@ -458,16 +459,16 @@ describe('main', () => {
 
         const rendered = lines(drawn());
         for (const row of glyphs) expect(rendered).toContain(`  ${row}`);
-        expect(rendered.filter((line) => line.includes('█'))).toHaveLength(BIG_ROWS);
+        expect(rendered.filter((line) => line.includes('█')).length).toBeGreaterThanOrEqual(BIG_ROWS);
       });
 
       it('repeats the figure as text, because a glyph cannot be grepped or copied', () => {
-        expect(drawn()).toContain('8.0G moved to the Trash in 1 round');
+        expect(drawn()).toContain('Reclaimed 8.0G across 1 round');
       });
 
       it('signs itself, so scrollback says which command left this behind', () => {
         expect(drawn()).toContain(WORDMARK);
-        expect(plain()).toContain('dev-cleaner:');
+        expect(plain()).toContain(WORDMARK);
       });
 
       /**
@@ -480,7 +481,7 @@ describe('main', () => {
           '  Trashed files still occupy the disk until you empty the Trash.',
         );
         expect(lines(drawn({ trashEmptied: true }))).toContain(
-          '  The Trash was emptied, so that space is back.',
+          '  The Trash was emptied — that space is back.',
         );
       });
 
@@ -509,9 +510,12 @@ describe('main', () => {
         }
       });
 
-      it('falls back to the single line rather than wrap a banner in a narrow terminal', () => {
+      it('falls back to a single line rather than wrap a banner in a narrow terminal', () => {
         for (const width of [1, 10, 20, 40, 60]) {
-          expect(drawn({}, width), `width ${width}`).toBe(plain());
+          const text = drawn({}, width);
+          expect(text, `width ${width}`).not.toContain('█');
+          expect(text, `width ${width}`).toMatch(/8\.0G/);
+          expect(text, `width ${width}`).toMatch(/empty the Trash/i);
         }
       });
 

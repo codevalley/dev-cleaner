@@ -27,6 +27,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { App, frameBudget, runApp, type ExitSummary } from '../src/ui/App.js';
 import { LOGO_TEXT, WORDMARK, bigText } from '../src/ui/Banner.js';
+import { bigTextLines } from '../src/ui/glyphs.js';
 import { KEY_HINTS, hintsFor } from '../src/ui/Footer.js';
 import { ScanStatus, SPINNER_FRAMES } from '../src/ui/ScanStatus.js';
 import { CURSOR, MARK_OFF, MARK_ON, formatBytes } from '../src/ui/format.js';
@@ -497,7 +498,7 @@ function mount(
 
     const isDone = (shown: string): boolean =>
       /\bMoved\b/.test(shown) ||
-      (shown.includes('esc home') && !shown.includes('space toggle') && !shown.includes('b browse'));
+      (shown.includes('press any key') && !shown.includes('space toggle') && !shown.includes('b browse'));
 
     await vi.waitFor(
       () => {
@@ -530,8 +531,8 @@ function mount(
   async function reopenTriageFromHomeOrDone(timeout = RENDER_TIMEOUT): Promise<void> {
     const budget = Math.max(timeout, LANDING_TIMEOUT);
     if (frame().includes('space toggle')) return;
-    if (/\bMoved\b/.test(frame()) || frame().includes('esc home')) {
-      instance.stdin.write(ESCAPE);
+    if (/\bMoved\b/.test(frame()) || frame().includes('press any key')) {
+      instance.stdin.write(ENTER);
       await delay(100);
       await vi.waitFor(() => expect(frame()).toContain('b browse'), {
         timeout: budget,
@@ -585,7 +586,9 @@ function mount(
       const shown = frame();
       const onDone =
         /\bMoved\b/.test(shown) ||
-        (shown.includes('esc home') && !shown.includes('space toggle') && !shown.includes('b browse'));
+        (shown.includes('press any key') &&
+          !shown.includes('space toggle') &&
+          !shown.includes('b browse'));
       const onModal =
         shown.includes('Move to Trash?') ||
         shown.includes('Empty the Trash?') ||
@@ -596,7 +599,7 @@ function mount(
         shown.includes('clean failed:') ||
         shown.includes('moving to the Trash') ||
         shown.includes('esc back');
-      // Never auto-dismiss Done/Confirm — ENTER on Done must stay inert.
+      // Never auto-dismiss Celebrate/Confirm — tests that wait on "Moved" must not skip past it.
       if (land === 'triage' && !onDone && !onModal && !shown.includes('space toggle')) {
         await reopenTriageFromHomeOrDone();
       }
@@ -680,8 +683,9 @@ describe('session modes', () => {
 
     await waitForHome(ui);
     expect(ui.frame()).toContain('enter');
-    expect(ui.frame()).toContain('recommended');
+    expect(ui.frame()).toContain('reclaim');
     expect(ui.frame()).toContain('b browse');
+    expect(ui.frame()).toContain('▸');
 
     await ui.press(ENTER);
     await ui.waitForText('Move to Trash?');
@@ -729,7 +733,7 @@ describe('session modes', () => {
     expect(ui.frame()).toContain('alpha');
   });
 
-  it('ignores home enter when nothing is recommended', async () => {
+  it('enter on home opens browse when nothing is recommended', async () => {
     const ui = mount(
       fastStream([
         projectEvent(makeProject('busy', 'active', [artifact('dist', 'build', GB)])),
@@ -738,12 +742,32 @@ describe('session modes', () => {
     );
 
     await waitForHome(ui);
-    expect(ui.frame()).toContain('nothing recommended');
+    expect(ui.frame()).toContain('b browse');
+    expect(ui.frame()).not.toMatch(/reclaim \d/);
     await ui.press(ENTER);
-    await settle();
-    expect(ui.frame()).not.toContain('Move to Trash?');
-    expect(ui.frame()).not.toContain('Checking what can be trashed');
+    await ui.waitForText('space toggle', LANDING_TIMEOUT);
+    expect(ui.frame()).toContain('busy');
     expect(ui.screened).toHaveLength(0);
+  });
+
+  it('arrow keys move home focus; enter activates the focused row', async () => {
+    const ui = mount(
+      fastStream([
+        projectEvent(makeProject('alpha', 'dormant', [artifact('dist', 'build', 5 * GB)])),
+      ]),
+      { screen: {}, ...homeLand },
+    );
+
+    await waitForHome(ui);
+    expect(ui.frame()).toMatch(/▸ enter/);
+
+    await ui.press(ARROW_DOWN);
+    await settle();
+    expect(ui.frame()).toMatch(/▸ b browse/);
+
+    await ui.press(ENTER);
+    await ui.waitForText('space toggle', LANDING_TIMEOUT);
+    expect(ui.frame()).toContain('alpha');
   });
 
   /**
@@ -802,7 +826,7 @@ describe('session modes', () => {
     expect(ui.frame()).not.toContain('esc to review');
   });
 
-  it('triage esc returns home; done esc returns home and q quits', async () => {
+  it('triage esc returns home; celebrate any-key returns home and q quits', async () => {
     const ui = mount(
       fastStream([
         projectEvent(makeProject('alpha', 'dormant', [artifact('dist', 'build', 5 * GB)])),
@@ -819,9 +843,9 @@ describe('session modes', () => {
     await ui.waitForText('Move to Trash?');
     await ui.press(ENTER);
     await ui.waitForText('Moved');
-    expect(ui.frame()).toMatch(/esc home|esc back/);
+    expect(ui.frame()).toContain('press any key to continue');
 
-    await ui.press(ESCAPE);
+    await ui.press(ENTER);
     await waitForHome(ui);
 
     await ui.press('q');
@@ -2486,14 +2510,10 @@ describe('the session survives a clean', () => {
   });
 
   /**
-   * The new pinned guard, and it belongs to the same family as "only enter starts a clean".
-   *
-   * `enter` is this application's commit key. A user holding it — and the confirmation dialog
-   * is exactly where people hold keys — would otherwise chain *dismiss the summary → list →
-   * enter → screening → confirm → enter* and run a second round they never chose. So the one
-   * screen that sits between two rounds refuses the key that starts them.
+   * Celebrate continues on any key (including enter). A held confirm-enter must not chain a
+   * second clean: Home therefore lands with browse focused, not reclaim.
    */
-  it('ignores enter on the round summary, so a held key cannot chain a second round', async () => {
+  it('continues from celebrate on enter without chaining a second clean', async () => {
     const ui = mount(three(), { screen: {} });
     await ready(ui);
 
@@ -2501,21 +2521,18 @@ describe('the session survives a clean', () => {
     await ui.waitForText('Move to Trash?');
     await ui.press(ENTER);
     await ui.waitForText('Moved 16.0G to the Trash.');
+    expect(ui.frame()).toContain('press any key to continue');
 
-    for (const key of [ENTER, ENTER, ENTER, 'j', 'a', 'p']) {
-      await ui.press(key);
-      // Still the summary: no key here has advanced anywhere, least of all into a new round.
-      expect(ui.frame()).toContain('Moved 16.0G to the Trash.');
-      expect(ui.frame()).not.toContain('Move to Trash?');
-      expect(ui.cleaned).toHaveLength(1);
-    }
-    await delay(50);
+    await ui.press(ENTER);
+    await waitForHome(ui);
+    expect(ui.frame()).toMatch(/▸ b browse/);
     expect(ui.cleaned).toHaveLength(1);
-    expect(ui.exits).toEqual([]);
+    expect(ui.frame()).not.toContain('Move to Trash?');
 
-    // The key the screen actually offers does work.
-    await ui.press(ESCAPE);
-    await ui.waitForText('space toggle');
+    // Another enter opens triage (browse), not a new clean.
+    await ui.press(ENTER);
+    await ui.waitForText('space toggle', LANDING_TIMEOUT);
+    expect(ui.cleaned).toHaveLength(1);
   });
 });
 
@@ -3183,7 +3200,7 @@ describe('the chrome is four lines above the panes and one below', () => {
     expect(lines[1]).toContain('80.0G used of 100G');
     expect(lines[1]).toContain('20.0G free');
     // The line after the bar is the headline figure, not a second line of gauge.
-    expect(lines[2]).toContain(bigText(formatBytes(11 * GB))[0]);
+    expect(lines[2]).toContain(formatBytes(11 * GB));
 
     expect(ui.frame()).toContain('Trashed files still occupy the disk');
     expect(ui.frame()).toContain('→ 31.0G free once emptied');
@@ -3195,11 +3212,8 @@ describe('the chrome is four lines above the panes and one below', () => {
  *
  * "The amount that will be 'freed' is not very prominent" — it was `selected 8 · 104G` in dim
  * cyan at the end of a status line, six characters at the bottom of a screen the user had
- * opened *specifically* to find out that number. It is now the headline: two rows of block
- * glyphs, the largest thing on the frame, redrawn on every keystroke that changes it.
- *
- * The assertions are against `bigText`, so they are about the figure actually being drawn at
- * size — a footer that merely printed `11.0G` somewhere would satisfy a substring check.
+ * opened *specifically* to find out that number. It is now the headline: plain bold digits
+ * (readable at a glance), the largest weight on the frame, redrawn on every keystroke.
  */
 describe('the selection total is the headline', () => {
   const stream = (): AsyncIterable<ScanEvent> =>
@@ -3208,38 +3222,32 @@ describe('the selection total is the headline', () => {
       projectEvent(makeProject('small', 'dormant', [artifact('dist', 'build', 5 * GB)])),
     ]);
 
-  const drawnAt = (frame: string, bytes: number): number => {
-    const [top, bottom] = bigText(formatBytes(bytes));
-    const lines = frame.split('\n');
-    const at = lines.findIndex((line) => line.includes(top));
-    // Both rows, adjacent and in order, or it is not a figure — it is a coincidence.
-    return at >= 0 && (lines[at + 1] ?? '').includes(bottom) ? at : -1;
-  };
-
-  it('draws the total at four times the size of anything else on the frame', async () => {
+  it('draws the total as bold plain digits near the top of the frame', async () => {
     const ui = mount(stream(), { width: 100, height: 24 });
     await ui.waitForText('selected 2');
     await settle();
 
-    expect(drawnAt(ui.frame(), 11 * GB)).toBe(2);
+    const lines = ui.lines();
+    expect(lines[2]).toContain(formatBytes(11 * GB));
+    expect(lines[2]).toContain('selected 2');
   });
 
   it('redraws as the user checks and unchecks boxes', async () => {
     const ui = mount(stream(), { width: 100, height: 24 });
     await ui.waitForText('selected 2');
     await settle();
-    expect(drawnAt(ui.frame(), 11 * GB)).toBeGreaterThanOrEqual(0);
+    expect(ui.lines()[2]).toContain(formatBytes(11 * GB));
 
     await ui.press(SPACE); // clear `big`, 6 G
     await vi.waitFor(() => expect(ui.frame()).toContain('selected 1'), {
       timeout: RENDER_TIMEOUT,
       interval: 10,
     });
-    expect(drawnAt(ui.frame(), 5 * GB)).toBeGreaterThanOrEqual(0);
-    expect(drawnAt(ui.frame(), 11 * GB)).toBe(-1);
+    expect(ui.lines()[2]).toContain(formatBytes(5 * GB));
+    expect(ui.lines()[2]).not.toContain(formatBytes(11 * GB));
 
     await ui.press(SPACE);
-    expect(drawnAt(ui.frame(), 11 * GB)).toBeGreaterThanOrEqual(0);
+    expect(ui.lines()[2]).toContain(formatBytes(11 * GB));
   });
 
   /**
@@ -3257,7 +3265,7 @@ describe('the selection total is the headline', () => {
       timeout: RENDER_TIMEOUT,
       interval: 10,
     });
-    expect(drawnAt(ui.frame(), 0)).toBeGreaterThanOrEqual(0);
+    expect(ui.frame()).toContain(formatBytes(0));
   });
 
   it('says how much of the list the figure covers', async () => {
@@ -3306,9 +3314,11 @@ describe('the wordmark', () => {
     const [top, bottom] = bigText(LOGO_TEXT);
     expect(ui.frame()).toContain(top);
     expect(ui.frame()).toContain(bottom);
-    // And the figure is still the headline: what is moving, at size.
+    // Solid reclaim figure + spinner caption while bytes move.
     expect(ui.frame()).toContain('to the Trash…');
-    expect(ui.frame()).toContain(bigText(formatBytes(5 * GB))[0]);
+    const solid = bigTextLines(formatBytes(5 * GB));
+    expect(solid).toBeDefined();
+    expect(ui.frame()).toContain(solid![0]!);
 
     held.open();
     await ui.waitForText('to the Trash.');

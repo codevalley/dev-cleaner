@@ -198,33 +198,35 @@ describe('the celebration is proportionate', () => {
     expect(frame).toContain('41 directories trashed');
   });
 
-  it('gives a hundred gigabytes more than it gives two', () => {
+  it('scales fanfare from a small reclaim up to a hundred gigabytes', () => {
     const huge = show({ reclaimedBytes: 107 * GB, trashed: 41 });
     const big = show({ reclaimedBytes: 40 * GB, trashed: 9 });
     const good = show({ reclaimedBytes: 2 * GB, trashed: 2 });
+    const modest = show({ reclaimedBytes: 200 * MB, trashed: 3 });
 
     expect(huge).toContain('✦ ✦ ✦');
     expect(huge).toContain('An enormous round.');
     expect(huge).toContain('━');
 
     expect(big).toContain('✦ ✦');
-    expect(big).not.toContain('✦ ✦ ✦');
-    expect(big).toContain('A big round.');
-    expect(big).not.toContain('━');
+    expect(big).toContain('An enormous round.');
+    expect(big).toContain('━');
 
-    expect(good).toContain('✦');
-    expect(good).not.toContain('✦ ✦');
-    expect(good).toContain('A good round.');
+    expect(good).toContain('✦ ✦');
+    expect(good).toContain('A big round.');
+    expect(good).not.toContain('━');
+
+    expect(modest).toContain('Moved 200M to the Trash.');
+    expect(modest).toContain('A good round.');
+    expect(modest).toContain('█');
+    expect(celebrationFor(200 * MB).big).toBe(true);
   });
 
-  it('gives a sub-gigabyte round a plain sentence and no fanfare', () => {
-    const frame = show({ reclaimedBytes: 200 * MB, trashed: 3 });
-
-    expect(frame).toContain('Moved 200M to the Trash.');
-    expect(frame).toContain('3 directories trashed');
-    expect(frame).not.toContain('✦');
-    expect(frame).not.toContain('█');
-    expect(celebrationFor(200 * MB).big).toBe(false);
+  it('still celebrates a tiny reclaim with a figure', () => {
+    const frame = show({ reclaimedBytes: 50 * MB, trashed: 1 });
+    expect(frame).toContain('Moved 50.0M to the Trash.');
+    expect(frame).toContain('Nice catch.');
+    expect(celebrationFor(50 * MB).big).toBe(true);
   });
 
   it('ranks the number above the words: the banner comes first', () => {
@@ -321,11 +323,11 @@ describe('emptying the Trash is the obvious next thing', () => {
     expect(frame).toContain('Trash still holds the space until you empty it.');
   });
 
-  it('names esc, and not enter, as the way out', () => {
+  it('asks for any key to continue (not a commit key)', () => {
     const frame = show({ reclaimedBytes: 3 * GB });
 
-    expect(frame).toContain('esc home · q quit');
-    expect(frame).not.toContain('enter');
+    expect(frame).toContain('press any key to continue');
+    expect(frame).not.toMatch(/\benter\b/);
   });
 
   it('states the running session total from the second round on', () => {
@@ -357,7 +359,7 @@ describe('it costs nothing to see twice', () => {
     expect(bannerRowsOn(first, '107G')).toBe(BIG_ROWS);
     expect(first).toContain('Moved 107G to the Trash.');
     expect(first).toContain('An enormous round.');
-    expect(first).toContain('esc home');
+    expect(first).toContain('press any key to continue');
   });
 });
 
@@ -402,7 +404,7 @@ describe('it degrades', () => {
     const frame = strip(instance.lastFrame() ?? '');
     expect(lines(frame).length, `${height} rows`).toBeLessThanOrEqual(height);
     expect(frame).toContain('Moved');
-    expect(frame).toContain('esc home');
+    expect(frame).toContain('press any key to continue');
   });
 
   it('drops the banner rather than wrap it, and keeps the sentence', () => {

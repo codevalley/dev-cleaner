@@ -160,31 +160,42 @@ export interface RoundSummaryProps {
 }
 
 /**
- * How loudly a round is worth celebrating. Four steps, because the difference between 200 M
- * and 107 G is the difference between "tidied up" and "got a tenth of the disk back", and one
- * fixed fanfare for both makes the big one feel routine and the small one feel oversold.
+ * How loudly a round is worth celebrating. Steps from any positive reclaim up — a ~1G round
+ * used to get no banner because the floor was 1 GiB, which made the Done pane feel empty.
  *
- * No phrase claims the space is free — it is in the Trash. `big` gates the banner rather than
- * the whole pane: a sub-gigabyte round still says exactly what it did, in words.
+ * No phrase claims the space is free — it is in the Trash. `big` gates the banner.
  */
 export interface Celebration {
   /** Draw the block-font banner. */
   big: boolean;
-  /** Rules above and below it — reserved for the largest step. */
+  /** Rules above and below it — reserved for the largest steps. */
   rule: boolean;
   /** Zero to three marks, scaling with the figure. */
   sparks: string;
-  /** The one-line verdict, absent below a gigabyte. */
+  /** The one-line verdict. */
   phrase: string | undefined;
 }
+
+const MIB = 1024 ** 2;
 
 const TIERS: readonly { readonly min: number; readonly celebration: Celebration }[] = [
   {
     min: 100 * GIB,
     celebration: { big: true, rule: true, sparks: '✦ ✦ ✦', phrase: 'An enormous round.' },
   },
-  { min: 10 * GIB, celebration: { big: true, rule: false, sparks: '✦ ✦', phrase: 'A big round.' } },
-  { min: GIB, celebration: { big: true, rule: false, sparks: '✦', phrase: 'A good round.' } },
+  {
+    min: 10 * GIB,
+    celebration: { big: true, rule: true, sparks: '✦ ✦', phrase: 'An enormous round.' },
+  },
+  { min: GIB, celebration: { big: true, rule: false, sparks: '✦ ✦', phrase: 'A big round.' } },
+  {
+    min: 100 * MIB,
+    celebration: { big: true, rule: false, sparks: '✦', phrase: 'A good round.' },
+  },
+  {
+    min: 1,
+    celebration: { big: true, rule: false, sparks: '', phrase: 'Nice catch.' },
+  },
 ];
 
 const NO_CELEBRATION: Celebration = { big: false, rule: false, sparks: '', phrase: undefined };
@@ -375,10 +386,11 @@ export function RoundSummary({
       )}
       <Text> </Text>
       {/*
-        `esc`, never `enter` — see the module note. The hint has to name the key that works,
-        because a user who presses enter here and sees nothing happen will press it again.
+        Continue is any key (except t / q). Enter used to be refused here so a held confirm
+        key could not chain rounds — Home's focused reclaim is the next commit, and Celebrate
+        no longer maps enter to clean.
       */}
-      <Text dimColor>{fit('esc home · q quit')}</Text>
+      <Text dimColor>{fit('press any key to continue')}</Text>
     </Box>
   );
 }

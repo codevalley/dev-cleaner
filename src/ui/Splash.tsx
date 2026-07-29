@@ -19,7 +19,7 @@ import {
   useSpinner,
 } from './ScanStatus.js';
 
-export const SPLASH_MIN_DWELL_MS = 400;
+export const SPLASH_MIN_DWELL_MS = 1200;
 export const SPLASH_PURPOSE = 'reclaim regenerable build output';
 
 export interface SplashProps {
@@ -67,7 +67,7 @@ function splashStatusLine(
   return truncateLabel(`${mark} ${label} · ${root} · ${counts}`, Math.max(0, width));
 }
 
-/** Lays out title, purpose, and status within `height` lines — pad to center, truncate title if needed. */
+/** Lays out title, purpose, and status within `height` lines — pad to center, keep title visible. */
 export function splashLayout(
   width: number,
   height: number,
@@ -78,17 +78,22 @@ export function splashLayout(
   caches: number,
   bytes: number,
 ): SplashLine[] {
-  const { lines: titleLines } = splashTitle(width);
   const body: SplashLine[] = [
     { kind: 'purpose' },
     { kind: 'status', text: splashStatusLine(scanning, mark, rootsLabel, projects, caches, bytes, width) },
   ];
+  // Prefer solid five-row brand when the frame can hold it — that is the canvas titling.
+  const { lines: titleLines } = splashTitle(width, Math.max(0, height - body.length));
   const title: SplashLine[] = titleLines.map((text) => ({ kind: 'title', text }));
   let content: SplashLine[] = [...title, ...body];
 
   if (content.length > height) {
-    const titleBudget = Math.max(0, height - body.length);
-    content = [...title.slice(-titleBudget), ...body];
+    // Keep at least one title row when possible; never drop brand to zero while height allows.
+    const titleBudget = Math.max(title.length > 0 ? 1 : 0, height - body.length);
+    content = [...title.slice(0, titleBudget), ...body];
+    if (content.length > height) {
+      content = content.slice(0, height);
+    }
   }
 
   const topPad = Math.floor((height - content.length) / 2);

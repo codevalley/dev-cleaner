@@ -22,6 +22,7 @@
 
 import { createRequire } from 'node:module';
 import { realpathSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -263,6 +264,17 @@ async function resolveRoots(roots: readonly string[], deps: MainDeps): Promise<s
   const resolved: string[] = [];
   for (const root of roots) resolved.push(await resolve(root));
   return resolved;
+}
+
+/** Short label for the chrome: `~/develop`, or `3 roots` when scanning several. */
+export function formatRootsLabel(roots: readonly string[], home = os.homedir()): string {
+  if (roots.length === 0) return '.';
+  if (roots.length > 1) return `${roots.length} roots`;
+  const root = roots[0] ?? '.';
+  if (root === home) return '~';
+  const prefix = home.endsWith(path.sep) ? home : home + path.sep;
+  if (root.startsWith(prefix)) return `~${path.sep}${root.slice(prefix.length)}`;
+  return root;
 }
 
 /**
@@ -531,33 +543,39 @@ export function renderClosingLine(
 
   const figure = formatBytes(summary.trashedBytes);
   const rounds = summary.rounds === 1 ? '1 round' : `${summary.rounds} rounds`;
+  const recall =
+    `Reclaimed ${figure} across ${rounds} · regenerable build output, off your disk's critical path.`;
   const tail = summary.trashEmptied
-    ? 'The Trash was emptied, so that space is back.'
+    ? 'The Trash was emptied — that space is back.'
     : 'Trashed files still occupy the disk until you empty the Trash.';
-  const plain = `dev-cleaner: ${figure} moved to the Trash in ${rounds}. ${tail}\n`;
+
+  if (summary.trashedBytes <= 0) {
+    return `dev-cleaner: nothing moved to the Trash in ${rounds}.\n`;
+  }
 
   const width = closingWidth(options.width);
-  if (width === undefined || summary.trashedBytes <= 0) return plain;
+  const plain = `${WORDMARK}\n${recall}\n${tail}\n`;
+  if (width === undefined) return plain;
+
+  const fits = (line: string): boolean => CLOSING_INDENT.length + line.length <= width;
+  if (!fits(recall) || !fits(tail) || !fits(WORDMARK)) {
+    return `dev-cleaner: ${figure} moved to the Trash in ${rounds}. ${tail}\n`;
+  }
 
   const banner = bigBytes(summary.trashedBytes, width);
-  if (banner === undefined) return plain;
-
-  // The wordmark stands in for the `dev-cleaner:` prefix the plain line uses: after a
-  // full-screen interface has vanished, the scrollback still has to say which command left this
-  // behind.
-  const caption = `${WORDMARK} · ${figure} moved to the Trash in ${rounds}`;
-  const fits = (line: string): boolean => CLOSING_INDENT.length + line.length <= width;
-  if (!fits(caption) || !fits(tail)) return plain;
-
   const color = options.color ?? process.stdout.isTTY === true;
-  return [
-    '',
-    ...banner.map((row) => paint(`${CLOSING_INDENT}${row}`, ANSI.figure, color)),
-    '',
-    `${paint(`${CLOSING_INDENT}${WORDMARK}`, ANSI.mark, color)}${caption.slice(WORDMARK.length)}`,
-    paint(`${CLOSING_INDENT}${tail}`, ANSI.dim, color),
-    '',
-  ].join('\n');
+  const lines: string[] = [''];
+  if (banner !== undefined) {
+    for (const row of banner) {
+      lines.push(paint(`${CLOSING_INDENT}${row}`, ANSI.figure, color));
+    }
+    lines.push('');
+  }
+  lines.push(paint(`${CLOSING_INDENT}${WORDMARK}`, ANSI.mark, color));
+  lines.push(paint(`${CLOSING_INDENT}${recall}`, ANSI.dim, color));
+  lines.push(paint(`${CLOSING_INDENT}${tail}`, ANSI.dim, color));
+  lines.push('');
+  return lines.join('\n');
 }
 
 async function runInteractive(options: CliOptions, deps: MainDeps, io: CliIO): Promise<number> {
@@ -624,6 +642,7 @@ async function runInteractive(options: CliOptions, deps: MainDeps, io: CliIO): P
     categoriesFor,
     preset: options.preset,
     nowMs: deps.nowMs ?? Date.now(),
+    rootsLabel: formatRootsLabel(options.roots),
     readDisk,
     readTrash,
     onEmptyTrash: emptyTheTrash,

@@ -22,6 +22,7 @@ import { describe, expect, it } from 'vitest';
 
 import { LOGO_TEXT, WORDMARK, bigText, bigTextWidth, splashTitle } from '../src/ui/Banner.js';
 import { formatBytes, truncateLabel } from '../src/ui/format.js';
+import { bigTextLines } from '../src/ui/glyphs.js';
 
 const GB = 1024 ** 3;
 
@@ -91,11 +92,12 @@ describe('the block face', () => {
 });
 
 describe('splashTitle', () => {
-  it('returns the block face when width allows', () => {
-    const [top] = bigText(LOGO_TEXT);
-    const result = splashTitle(top.length + 4);
+  it('returns the solid block face when width allows', () => {
+    const solid = bigTextLines(LOGO_TEXT);
+    expect(solid).toBeDefined();
+    const result = splashTitle(80);
     expect(result.degraded).toBe(false);
-    expect(result.lines.join('\n')).toContain(top);
+    expect(result.lines.join('\n')).toContain(solid![0]!);
   });
 
   it('degrades to WORDMARK when too narrow', () => {

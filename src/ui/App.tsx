@@ -72,18 +72,19 @@
 import { Box, Text, render, useApp, useInput, useStdin, useStdout } from 'ink';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
+import { ScanStatus, useSpinner } from './ScanStatus.js';
+import { Splash, splashReady } from './Splash.js';
+import { EMPTY_TRASH_WORD, TrashConfirm, TrashResult, trashConfirmArmed } from './Trash.js';
+import { formatBytes } from './format.js';
+import { bigBytes } from './glyphs.js';
 import { Headline, Logo, WORDMARK } from './Banner.js';
 import { Confirm, type BlockedEntry, type ConfirmEntry } from './Confirm.js';
 import { Detail } from './Detail.js';
 import { BAR_LEGEND, Gauge } from './Gauge.js';
 import { Footer, hintsFor } from './Footer.js';
-import { Home } from './Home.js';
+import { Home, clampHomeFocus, defaultHomeFocus, homeActions } from './Home.js';
 import { List, statusLine } from './List.js';
 import { RoundSummary, type ProblemEntry, type RoundReport } from './Round.js';
-import { ScanStatus } from './ScanStatus.js';
-import { Splash, splashReady } from './Splash.js';
-import { EMPTY_TRASH_WORD, TrashConfirm, TrashResult, trashConfirmArmed } from './Trash.js';
-import { formatBytes } from './format.js';
 import {
   EMPTY_SELECTION,
   EMPTY_SESSION,
@@ -465,6 +466,56 @@ function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/** Mid-clean wait: brand + solid figure + spinner — the delight beat before Celebrate. */
+function CleaningPane({
+  bytes,
+  count,
+  width,
+  rowsAvailable,
+}: {
+  bytes: number;
+  count: number;
+  width: number;
+  rowsAvailable: number;
+}): React.ReactElement {
+  const spinner = useSpinner(true);
+  const banner = bigBytes(bytes, width);
+  const roomForLogo = rowsAvailable - RESERVED_ROW >= 8;
+  const ruleWidth =
+    banner === undefined ? 0 : banner.reduce((widest, line) => Math.max(widest, line.length), 0);
+  const noun = count === 1 ? 'directory' : 'directories';
+
+  return (
+    <Box flexDirection="column" paddingX={1}>
+      {roomForLogo ? (
+        <Box flexDirection="column">
+          <Logo width={width} />
+          <Text> </Text>
+        </Box>
+      ) : null}
+      {banner !== undefined ? (
+        <Box flexDirection="column">
+          {banner.map((line, index) => (
+            <Text key={`clean-fig-${index}`} bold color="green">
+              {line}
+            </Text>
+          ))}
+          {ruleWidth > 0 ? <Text color="green">{'━'.repeat(ruleWidth)}</Text> : null}
+          <Text> </Text>
+        </Box>
+      ) : (
+        <Text bold color="green">
+          {formatBytes(bytes)}
+        </Text>
+      )}
+      <Text bold color="cyan">
+        {`${spinner} moving to the Trash… · ${count} ${noun}`}
+      </Text>
+      <Text dimColor>{TRASH_CAVEAT}</Text>
+    </Box>
+  );
+}
+
 export function App({
   stream,
   categoriesFor,
@@ -512,6 +563,7 @@ export function App({
   const [scanning, setScanning] = useState(true);
   const [preset, setPreset] = useState<Preset>(initialPreset ?? 'recommended');
   const [cursorId, setCursorId] = useState<string | undefined>(undefined);
+  const [homeFocus, setHomeFocus] = useState(0);
   const [mode, setMode] = useState<Mode>({ kind: 'splash' });
   const [message, setMessage] = useState<string | undefined>(undefined);
   const [disk, setDisk] = useState<DiskUsage | undefined>(undefined);
@@ -650,6 +702,20 @@ export function App({
     () => toTargets({ rows, selection: recommended, categories }),
     [rows, recommended, categories],
   );
+  const homeMenu = useMemo(
+    () => homeActions(recommendedCount, recommendedBytes),
+    [recommendedCount, recommendedBytes],
+  );
+
+  // When reclaim appears or disappears, snap focus to the safe default (never Trash).
+  // Do not reset merely because the recommended *count* grew mid-scan — that steals the cursor.
+  const prevHadReclaimRef = useRef(recommendedCount > 0);
+  useEffect(() => {
+    const had = recommendedCount > 0;
+    if (prevHadReclaimRef.current === had) return;
+    prevHadReclaimRef.current = had;
+    setHomeFocus(defaultHomeFocus(recommendedCount));
+  }, [recommendedCount]);
 
   const dormantCount = useMemo(
     () => rows.filter((row) => row.kind === 'project' && row.section === 'projects').length,
@@ -992,21 +1058,32 @@ export function App({
       }
 
       /**
-       * Done / trash-result: the one place `enter` does nothing.
+       * Celebrate (done) / trash-result.
        *
-       * `enter` is the commit key: it opens the confirmation and it spends consent. A held
-       * `enter` — and the confirmation dialog is exactly where people hold keys — would
-       * otherwise chain *dismiss → home → enter → screening → confirm → enter* and run a
-       * second round nobody asked for. Dismissal is `esc` → Home (or the prior workspace for
-       * trash-result).
+       * Celebrate: any key continues to Home — except `t` (empty Trash) and `q` (already
+       * handled globally). Enter is safe here: Home's focused action is the next commit, so a
+       * held confirm key cannot chain a second clean.
+       *
+       * trash-result: esc/space dismisses; enter still refused so a held key cannot chain.
        */
       if (mode.kind === 'done' || mode.kind === 'trash-result') {
-        if (key.escape || input === ' ') {
-          setMode({ kind: mode.kind === 'done' ? 'home' : returnToRef.current });
+        if (mode.kind === 'done') {
+          if (input === 't' && canEmptyTrash) {
+            returnToRef.current = 'home';
+            void beginTrash();
+            return;
+          }
+          // Land on browse, never reclaim: a held enter from Confirm must not chain
+          // celebrate → home → reclaim → screening.
+          const browseAt = homeMenu.findIndex((action) => action.id === 'browse');
+          setHomeFocus(browseAt >= 0 ? browseAt : defaultHomeFocus(recommendedCount));
+          setMode({ kind: 'home' });
           setMessage(undefined);
-        } else if (input === 't' && mode.kind === 'done' && canEmptyTrash) {
-          returnToRef.current = 'home';
-          void beginTrash();
+          return;
+        }
+        if (key.escape || input === ' ') {
+          setMode({ kind: returnToRef.current });
+          setMessage(undefined);
         }
         return;
       }
@@ -1018,27 +1095,41 @@ export function App({
 
       if (mode.kind === 'home') {
         setMessage(undefined);
-        if (input === 'b') {
-          openTriage();
+        const activate = (id: (typeof homeMenu)[number]['id']): void => {
+          if (id === 'browse') {
+            openTriage();
+          } else if (id === 'trash') {
+            if (canEmptyTrash) {
+              returnToRef.current = 'home';
+              void beginTrash();
+            } else setMessage('Emptying the Trash is not available here');
+          } else if (id === 'quit') {
+            quit();
+          } else if (id === 'reclaim') {
+            if (recommendedCount === 0 || recommendedTargets.length === 0) return;
+            returnToRef.current = 'home';
+            void beginScreening({
+              rows: recommendedChosen,
+              targets: recommendedTargets,
+              bytes: recommendedBytes,
+              source: 'recommended',
+            });
+          }
+        };
+
+        if (key.upArrow || input === 'k') {
+          setHomeFocus((current) => clampHomeFocus(current - 1, homeMenu.length));
+        } else if (key.downArrow || input === 'j') {
+          setHomeFocus((current) => clampHomeFocus(current + 1, homeMenu.length));
+        } else if (input === 'b') {
+          activate('browse');
         } else if (input === 'p') {
           setPreset(cyclePreset);
         } else if (input === 't') {
-          if (canEmptyTrash) {
-            returnToRef.current = 'home';
-            void beginTrash();
-          } else setMessage('Emptying the Trash is not available here');
+          activate('trash');
         } else if (key.return) {
-          if (recommendedCount === 0 || recommendedTargets.length === 0) {
-            // Never open Confirm of zero under a celebratory number.
-            return;
-          }
-          returnToRef.current = 'home';
-          void beginScreening({
-            rows: recommendedChosen,
-            targets: recommendedTargets,
-            bytes: recommendedBytes,
-            source: 'recommended',
-          });
+          const focused = homeMenu[clampHomeFocus(homeFocus, homeMenu.length)];
+          if (focused !== undefined) activate(focused.id);
         }
         return;
       }
@@ -1105,21 +1196,35 @@ export function App({
   }
 
   if (mode.kind === 'home') {
+    const foundLabel = scanning
+      ? `found ${session.projects.length} projects · ${session.caches.length} caches · ${formatBytes(foundBytes)} so far · b to watch`
+      : undefined;
+    // Footer is pinned; Home fills the remaining frame so q / ↑↓ never clip off the bottom.
+    const homeBodyRows = Math.max(1, frameRows - FOOTER_HEIGHT);
     return (
-      <Home
-        // Home owns paddingX={1}; width is the *inner* budget so promptBox corners do not wrap.
-        width={Math.max(0, columns - 2)}
-        height={frameRows}
-        rootsLabel={rootsLabel}
-        scanning={scanning}
-        recommendedCount={recommendedCount}
-        recommendedBytes={recommendedBytes}
-        dormantCount={dormantCount}
-        activeCount={activeCount}
-        cacheCount={cacheCount}
-        disk={disk}
-        session={sessionSummary(session)}
-      />
+      <Box flexDirection="column">
+        <Home
+          // Home owns paddingX={1}; width is the *inner* budget so promptBox corners do not wrap.
+          width={Math.max(0, columns - 2)}
+          height={homeBodyRows}
+          rootsLabel={rootsLabel}
+          scanning={scanning}
+          recommendedCount={recommendedCount}
+          recommendedBytes={recommendedBytes}
+          dormantCount={dormantCount}
+          activeCount={activeCount}
+          cacheCount={cacheCount}
+          focusIndex={homeFocus}
+          foundLabel={foundLabel}
+          disk={disk}
+        />
+        <Footer
+          hints={hintsFor('home')}
+          session={sessionSummary(session)}
+          message={message}
+          width={columns}
+        />
+      </Box>
     );
   }
 
@@ -1183,29 +1288,13 @@ export function App({
   }
 
   if (mode.kind === 'cleaning') {
-    const { snapshot } = mode;
-    const cleaningCount = snapshot.targets.length;
-    // The one screen with the terminal to itself and a user who has nothing to do but wait, so
-    // it is the one screen that can afford the tall wordmark — and the one that should have it,
-    // because the wait is where a tool either feels considered or feels stalled. It is drawn
-    // only when the terminal can hold it *and* the frame still fits inside `rows - 1`, which is
-    // the same rule the workspace obeys and for the same reason.
-    const roomForLogo = rowsAvailable - RESERVED_ROW >= 8;
     return (
-      <Box flexDirection="column" paddingX={1}>
-        {roomForLogo ? (
-          <Box flexDirection="column">
-            <Logo width={Math.max(0, columns - 2)} />
-            <Text> </Text>
-          </Box>
-        ) : null}
-        <Headline
-          bytes={snapshot.bytes}
-          caption={`moving to the Trash… · ${cleaningCount} ${cleaningCount === 1 ? 'directory' : 'directories'}`}
-          note={TRASH_CAVEAT}
-          width={Math.max(0, columns - 2)}
-        />
-      </Box>
+      <CleaningPane
+        bytes={mode.snapshot.bytes}
+        count={mode.snapshot.targets.length}
+        width={Math.max(0, columns - 2)}
+        rowsAvailable={rowsAvailable}
+      />
     );
   }
 

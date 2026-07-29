@@ -38,7 +38,7 @@ import { Box, Text } from 'ink';
 import React from 'react';
 
 import { formatBytes, truncateLabel } from './format.js';
-import { WORDMARK } from './glyphs.js';
+import { BIG_ROWS, WORDMARK, bigTextLines } from './glyphs.js';
 
 /**
  * The compact wordmark, for the workspace.
@@ -136,17 +136,37 @@ export function bigTextWidth(text: string): number {
 }
 
 /**
- * Splash entry title: block face when the terminal is wide enough, stacked words when only
- * that fits, compact wordmark when nothing else will.
+ * Splash entry title: solid five-row face when height and width allow (canvas brand), then
+ * half-block, then stacked words, then compact wordmark.
  */
-export function splashTitle(width: number): { lines: string[]; degraded: boolean } {
+export function splashTitle(
+  width: number,
+  titleBudget: number = Number.POSITIVE_INFINITY,
+): { lines: string[]; degraded: boolean } {
+  const fits = (lines: readonly string[]): boolean =>
+    lines.every((line) => line.length === 0 || line.length <= width);
+
+  if (titleBudget >= BIG_ROWS) {
+    const solid = bigTextLines(LOGO_TEXT);
+    if (solid !== undefined && fits(solid)) {
+      return { lines: [...solid], degraded: false };
+    }
+  }
+  if (titleBudget >= BIG_ROWS * 2 + 1) {
+    const dev = bigTextLines('DEV');
+    const cleaner = bigTextLines('CLEANER');
+    if (dev !== undefined && cleaner !== undefined && fits(dev) && fits(cleaner)) {
+      return { lines: [...dev, '', ...cleaner], degraded: false };
+    }
+  }
+
   const [top, bottom] = bigText(LOGO_TEXT);
-  if (top.length <= width) {
+  if (top.length <= width && titleBudget >= 2) {
     return { lines: [top, bottom], degraded: false };
   }
   const [d0, d1] = bigText('DEV');
   const [c0, c1] = bigText('CLEANER');
-  if (Math.max(d0.length, c0.length) <= width) {
+  if (Math.max(d0.length, c0.length) <= width && titleBudget >= 5) {
     return { lines: [d0, d1, '', c0, c1], degraded: false };
   }
   return { lines: [truncateLabel(WORDMARK, Math.max(0, width))], degraded: true };
@@ -164,43 +184,39 @@ export interface HeadlineProps {
 }
 
 /**
- * The headline figure: what checking these boxes would free, at four times the size of
- * anything else on the screen.
+ * The headline figure: what checking these boxes would free.
  *
  * **Exactly two lines, always.** The block sits above a pane whose height is the terminal's
- * minus a fixed chrome budget, so a headline that grew a line when a unit changed from `M` to
- * `G` would push the frame past the terminal and un-pin the footer. `bigText` guarantees two
- * rows of equal width; the captions are truncated into what is left.
+ * minus a fixed chrome budget, so a headline that grew when a unit changed from `M` to `G`
+ * would push the frame past the terminal and un-pin the footer.
+ *
+ * Uses plain bold digits rather than the half-block face — those packed glyphs are hard to
+ * read as a number from a glance. Home uses the solid five-row face where height allows.
  *
  * **Zero is drawn, not hidden.** A selection of nothing shows a dim `0B` rather than an empty
- * space, because the figure's whole job is to move as the user checks boxes, and a number that
- * appears from nowhere on the first check reads as a different element arriving rather than as
- * the same one responding.
+ * space, because the figure's whole job is to move as the user checks boxes.
  */
 export function Headline({ bytes, caption, note, width }: HeadlineProps): React.ReactElement {
-  const [top, bottom] = bigText(formatBytes(bytes));
+  const label = formatBytes(bytes);
   const muted = bytes <= 0;
-  // Two columns of gutter between the figure and the text it explains. Enough to read as two
-  // columns rather than as one crowded one, cheap enough at 40 columns to still leave a caption.
-  const captionAt = top.length + 3;
-  const captionWidth = Math.max(0, width - captionAt);
-
-  const line = (figure: string, text: string, dim: boolean): React.ReactElement => (
-    <Text>
-      <Text bold color={muted ? undefined : 'green'} dimColor={muted}>
-        {figure}
-      </Text>
-      <Text>{'   '}</Text>
-      <Text dimColor={dim} bold={!dim}>
-        {truncateLabel(text, captionWidth)}
-      </Text>
-    </Text>
-  );
+  // Leave room for the figure to grow (e.g. `999G` → `1.0T`) without shifting the caption.
+  const figureCol = Math.max(label.length, 6);
+  const captionWidth = Math.max(0, width - figureCol - 3);
 
   return (
     <Box flexDirection="column">
-      {line(top, caption, false)}
-      {line(bottom, note, true)}
+      <Text>
+        <Text bold color={muted ? undefined : 'green'} dimColor={muted}>
+          {label.padEnd(figureCol, ' ')}
+        </Text>
+        <Text>{'   '}</Text>
+        <Text bold>{truncateLabel(caption, captionWidth)}</Text>
+      </Text>
+      <Text>
+        <Text>{' '.repeat(figureCol)}</Text>
+        <Text>{'   '}</Text>
+        <Text dimColor>{truncateLabel(note, captionWidth)}</Text>
+      </Text>
     </Box>
   );
 }

@@ -8,9 +8,13 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import { WORDMARK } from '../src/ui/Banner.js';
 import { formatBytes } from '../src/ui/format.js';
+import { bigTextLines } from '../src/ui/glyphs.js';
 import {
   Home,
+  clampHomeFocus,
+  defaultHomeFocus,
   homeActionLines,
+  homeActions,
   homeCaptionText,
   homeDiskNote,
 } from '../src/ui/Home.js';
@@ -39,6 +43,8 @@ function show(props: Partial<React.ComponentProps<typeof Home>> = {}): string {
       dormantCount={props.dormantCount ?? 12}
       activeCount={props.activeCount ?? 3}
       cacheCount={props.cacheCount ?? 1}
+      focusIndex={props.focusIndex}
+      foundLabel={props.foundLabel}
       disk={props.disk}
       session={props.session}
     />,
@@ -47,34 +53,56 @@ function show(props: Partial<React.ComponentProps<typeof Home>> = {}): string {
   return instance.lastFrame() ?? '';
 }
 
-describe('homeActionLines', () => {
-  it('offers enter reclaim when recommendedCount > 0', () => {
+describe('homeActions', () => {
+  it('offers reclaim when recommendedCount > 0', () => {
     const lines = homeActionLines(4, 1.9e9);
     expect(lines.join('\n')).toMatch(/enter/);
-    expect(lines.join('\n')).toMatch(/recommended/);
+    expect(lines.join('\n')).toMatch(/reclaim/);
     expect(lines.join('\n')).toMatch(/4 items/);
     expect(lines.join('\n')).toMatch(formatBytes(1.9e9));
+    expect(lines.join('\n')).toMatch(/empty Trash/);
   });
 
-  it('hides enter reclaim when nothing is recommended', () => {
+  it('hides reclaim when nothing is recommended', () => {
     const lines = homeActionLines(0, 0);
-    expect(lines.join('\n')).not.toMatch(/trash the recommended/);
-    expect(lines.join('\n')).toMatch(/nothing recommended/);
+    expect(lines.join('\n')).not.toMatch(/reclaim/);
     expect(lines.join('\n')).toMatch(/browse/);
+    expect(homeActions(0, 0)[0]?.id).toBe('browse');
+  });
+
+  it('defaults focus to the first row (reclaim or browse), never Trash', () => {
+    expect(defaultHomeFocus(4)).toBe(0);
+    expect(defaultHomeFocus(0)).toBe(0);
+    expect(homeActions(4, 1)[clampHomeFocus(0, 4)]?.id).toBe('reclaim');
+    expect(homeActions(0, 0)[clampHomeFocus(0, 3)]?.id).toBe('browse');
   });
 });
 
 describe('Home', () => {
-  it('offers enter reclaim when recommendedCount > 0', () => {
+  it('offers reclaim when recommendedCount > 0', () => {
     const frame = show({ recommendedCount: 4, recommendedBytes: 1.9e9 });
     expect(frame).toMatch(/enter/);
-    expect(frame).toMatch(/recommended/);
+    expect(frame).toMatch(/reclaim/);
+    expect(frame).toMatch(/▸/);
   });
 
-  it('hides enter reclaim when nothing is recommended', () => {
+  it('hides reclaim when nothing is recommended', () => {
     const frame = show({ recommendedCount: 0, recommendedBytes: 0 });
-    expect(frame).not.toMatch(/trash the recommended/);
+    expect(frame).not.toMatch(/reclaim \d/);
     expect(frame).toMatch(/browse/);
+  });
+
+  it('draws the solid five-row face when height allows', () => {
+    const bytes = 102 * 1024 * 1024;
+    const frame = show({
+      height: 24,
+      width: 80,
+      recommendedCount: 1,
+      recommendedBytes: bytes,
+    });
+    const solid = bigTextLines(formatBytes(bytes));
+    expect(solid).toBeDefined();
+    expect(frame).toContain(solid![0]!);
   });
 
   it('shows compact mark, counts caption, and disk note when available', () => {
@@ -82,6 +110,14 @@ describe('Home', () => {
     expect(frame).toContain(WORDMARK);
     expect(frame).toContain(homeCaptionText(12, 3, 1, disk));
     expect(frame).toContain(homeDiskNote(disk, 2 * GB));
+  });
+
+  it('shows live scan progress when provided', () => {
+    const frame = show({
+      scanning: true,
+      foundLabel: 'found 3 projects · 1 caches · 102M so far · b to watch',
+    });
+    expect(frame).toContain('found 3 projects');
   });
 
   it('shows session ledger when provided', () => {
@@ -96,5 +132,19 @@ describe('Home', () => {
         expect(frame.split('\n').length, `${width}x${height}`).toBeLessThanOrEqual(height);
       }
     }
+  });
+
+  it('keeps the action box bottom border when height is tight', () => {
+    const frame = show({
+      height: 14,
+      width: 60,
+      recommendedCount: 1,
+      recommendedBytes: GB,
+      disk,
+      foundLabel: 'found 9 projects · 2 caches · 1.0G so far · b to watch',
+      session: '9.0G trashed this session',
+    });
+    expect(frame).toMatch(/╰─+╯/);
+    expect(frame).toMatch(/quit/);
   });
 });

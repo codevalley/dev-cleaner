@@ -46,12 +46,14 @@ export type HintMode =
   | 'cleaning';
 
 const HINTS: Record<HintMode, string> = {
-  home: 'enter reclaim · b browse · p preset · t Trash · q quit',
-  triage:
-    'space toggle · a section · j/k move · d detail · p preset · enter clean · esc home · t Trash · q quit',
+  // ↑↓ and q early so a narrow footer still teaches navigation / quit before browse/Trash.
+  home: '↑↓ move · enter · q quit · b browse · t empty Trash',
+  // Keep "space toggle" (landing marker) and put q before the trailing shortcuts so
+  // truncateLabel cannot eat quit when the session ledger shares the bar.
+  triage: '↑↓/jk · space toggle · enter · d · esc · q · a · p · t',
   detail: 'esc back · q quit',
   confirm: 'enter confirm · esc back · q quit',
-  done: 'esc home · t Trash · q quit',
+  done: 'press any key · t empty Trash · q quit',
   'trash-confirm': 'esc cancel · q quit',
   screening: 'esc cancel · q quit',
   cleaning: '',

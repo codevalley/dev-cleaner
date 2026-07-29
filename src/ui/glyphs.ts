@@ -40,6 +40,9 @@ export const BIG_ROWS = 5;
  * Only `█` and the space are used. Half-blocks and box-drawing corners render at different
  * widths in enough terminals that a banner built from them can come out ragged, and a ragged
  * 107 G is worse than a blocky one.
+ *
+ * Digits and unit letters cover `formatBytes`. Extra letters spell the splash wordmark
+ * (`DEV-CLEANER`) in the same face so brand and reclaim figure share one typeface.
  */
 const GLYPHS: Record<string, readonly string[]> = {
   '0': ['███', '█ █', '█ █', '█ █', '███'],
@@ -60,6 +63,16 @@ const GLYPHS: Record<string, readonly string[]> = {
   G: ['███', '█  ', '█ █', '█ █', '███'],
   T: ['███', ' █ ', ' █ ', ' █ ', ' █ '],
   P: ['███', '█ █', '███', '█  ', '█  '],
+  // Splash / Logo wordmark letters (DEV-CLEANER). Same solid face as reclaim figures.
+  A: [' █ ', '█ █', '███', '█ █', '█ █'],
+  C: ['███', '█  ', '█  ', '█  ', '███'],
+  D: ['██ ', '█ █', '█ █', '█ █', '██ '],
+  E: ['███', '█  ', '██ ', '█  ', '███'],
+  L: ['█  ', '█  ', '█  ', '█  ', '███'],
+  N: ['█ █', '███', '███', '█ █', '█ █'],
+  R: ['██ ', '█ █', '██ ', '█ █', '█ █'],
+  V: ['█ █', '█ █', '█ █', '█ █', ' █ '],
+  '-': ['   ', '   ', '███', '   ', '   '],
 };
 
 /**

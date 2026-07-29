@@ -2,17 +2,24 @@ import { describe, expect, it } from 'vitest';
 
 import { hintsFor, KEY_HINTS } from '../src/ui/Footer.js';
 
-it('home promotes enter reclaim and browse', () => {
+it('home promotes arrow move, enter, browse, and empty Trash', () => {
+  expect(hintsFor('home')).toMatch(/↑↓/);
   expect(hintsFor('home')).toMatch(/enter/);
-  expect(hintsFor('home')).toMatch(/b /);
-  expect(hintsFor('home')).not.toMatch(/j\/k/);
+  expect(hintsFor('home')).toMatch(/b browse/);
+  expect(hintsFor('home')).toMatch(/empty Trash/);
+  expect(hintsFor('home')).toMatch(/q quit/);
+  expect(hintsFor('home').indexOf('q quit')).toBeLessThan(hintsFor('home').indexOf('empty Trash'));
 });
 
-it('triage keeps list keys and esc home', () => {
+it('triage keeps list keys with q before the long tail', () => {
   const h = hintsFor('triage');
-  expect(h).toMatch(/space/);
-  expect(h).toMatch(/esc home/);
-  expect(h).toMatch(/d detail/);
+  expect(h).toMatch(/space toggle/);
+  expect(h).toMatch(/↑↓\/jk/);
+  expect(h).toMatch(/\bq\b/);
+  expect(h).toMatch(/enter/);
+  expect(h).toMatch(/esc/);
+  // q must appear before trailing a/p/t so truncation keeps quit.
+  expect(h.indexOf(' q ')).toBeLessThan(h.lastIndexOf(' t'));
 });
 
 it('confirm is only enter/esc', () => {
@@ -23,13 +30,13 @@ it('confirm is only enter/esc', () => {
 describe('hintsFor exact strings', () => {
   it('locks home hints', () => {
     expect(hintsFor('home')).toBe(
-      'enter reclaim · b browse · p preset · t Trash · q quit',
+      '↑↓ move · enter · q quit · b browse · t empty Trash',
     );
   });
 
   it('locks triage hints', () => {
     expect(hintsFor('triage')).toBe(
-      'space toggle · a section · j/k move · d detail · p preset · enter clean · esc home · t Trash · q quit',
+      '↑↓/jk · space toggle · enter · d · esc · q · a · p · t',
     );
   });
 
@@ -42,7 +49,7 @@ describe('hintsFor exact strings', () => {
   });
 
   it('locks done hints', () => {
-    expect(hintsFor('done')).toBe('esc home · t Trash · q quit');
+    expect(hintsFor('done')).toBe('press any key · t empty Trash · q quit');
   });
 
   it('locks trash-confirm hints', () => {

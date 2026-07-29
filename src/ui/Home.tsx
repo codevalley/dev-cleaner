@@ -1,13 +1,19 @@
 /**
  * Default post-splash surface: one reclaim CTA, or browse when nothing is recommended.
+ *
+ * Home is a short menu, not a form. Arrow keys move a focus cursor; enter activates the
+ * focused row. Letter shortcuts still work. The reclaim figure uses the solid five-row face
+ * when the terminal is tall enough — the two-row half-block face is too dense to read as a
+ * number from a glance.
  */
 
 import { Box, Text } from 'ink';
 import React from 'react';
 
-import { Headline, WORDMARK } from './Banner.js';
+import { WORDMARK } from './Banner.js';
 import { type DiskUsage, diskLabels } from './diskbar.js';
 import { formatBytes, truncateLabel } from './format.js';
+import { BIG_ROWS, bigTextLines } from './glyphs.js';
 import { promptBox } from './Round.js';
 import {
   SCANNING_LABEL,
@@ -16,6 +22,15 @@ import {
 } from './ScanStatus.js';
 
 export const HOME_READY_LABEL = 'ready';
+
+export type HomeActionId = 'reclaim' | 'browse' | 'trash' | 'quit';
+
+export interface HomeAction {
+  id: HomeActionId;
+  /** Left column: the key that activates this row without moving focus. */
+  key: string;
+  label: string;
+}
 
 export interface HomeProps {
   width: number;
@@ -27,6 +42,9 @@ export interface HomeProps {
   dormantCount: number;
   activeCount: number;
   cacheCount: number;
+  /** Index into `homeActions(...)`; clamped by the renderer. */
+  focusIndex?: number;
+  foundLabel?: string | undefined;
   disk?: DiskUsage | undefined;
   session?: string | undefined;
 }
@@ -58,17 +76,37 @@ export function homeDiskNote(disk: DiskUsage | undefined, reclaiming: number): s
   return labels.projected ?? `${labels.free} on volume`;
 }
 
-export function homeActionLines(recommendedCount: number, recommendedBytes: number): string[] {
-  const lines: string[] = [];
+/**
+ * Menu rows. Reclaim is omitted when nothing is recommended so enter cannot pretend to
+ * clean an empty set. Labels say "reclaim" / "empty Trash" — both used to say "trash" and
+ * that made enter feel like it had chosen `t`.
+ */
+export function homeActions(
+  recommendedCount: number,
+  recommendedBytes: number,
+): HomeAction[] {
+  const actions: HomeAction[] = [];
   if (recommendedCount > 0) {
-    lines.push(
-      `enter  trash the recommended ${plural(recommendedCount, 'item')} · ${formatBytes(recommendedBytes)}`,
-    );
-  } else {
-    lines.push('nothing recommended');
+    actions.push({
+      id: 'reclaim',
+      key: 'enter',
+      label: `reclaim ${plural(recommendedCount, 'item')} · ${formatBytes(recommendedBytes)}`,
+    });
   }
-  lines.push('b browse & adjust', 't Trash', 'q quit');
-  return lines;
+  actions.push(
+    { id: 'browse', key: 'b', label: 'browse & adjust' },
+    { id: 'trash', key: 't', label: 'empty Trash' },
+    { id: 'quit', key: 'q', label: 'quit' },
+  );
+  return actions;
+}
+
+/** @deprecated Prefer `homeActions` — kept for tests that assert the old line list. */
+export function homeActionLines(recommendedCount: number, recommendedBytes: number): string[] {
+  return homeActions(recommendedCount, recommendedBytes).map((action) => {
+    if (action.id === 'reclaim') return `enter  ${action.label}`;
+    return `${action.key} ${action.label}`;
+  });
 }
 
 export function homeChromeLine(
@@ -82,89 +120,37 @@ export function homeChromeLine(
   return truncateLabel(`${WORDMARK} · ${mark} ${label} · ${root}`, Math.max(0, width));
 }
 
-type HomeLine =
-  | { kind: 'pad' }
-  | { kind: 'chrome'; text: string }
-  | { kind: 'headline' }
-  | { kind: 'session'; text: string }
-  | { kind: 'action'; text: string };
-
-function homeLineHeight(line: HomeLine): number {
-  return line.kind === 'headline' ? 2 : 1;
+/** Default focus: reclaim when offered, otherwise browse — never Trash. */
+export function defaultHomeFocus(recommendedCount: number): number {
+  return 0;
 }
 
-function homeLinesHeight(lines: readonly HomeLine[]): number {
-  return lines.reduce((sum, line) => sum + homeLineHeight(line), 0);
+export function clampHomeFocus(focusIndex: number, actionCount: number): number {
+  if (actionCount <= 0) return 0;
+  if (focusIndex < 0) return 0;
+  if (focusIndex >= actionCount) return actionCount - 1;
+  return focusIndex;
 }
 
-function homeActionRows(
-  recommendedCount: number,
-  recommendedBytes: number,
-  width: number,
-  maxLines: number,
-): HomeLine[] {
-  const choices = homeActionLines(recommendedCount, recommendedBytes);
-  const boxed = promptBox(choices, width).map((text) => ({ kind: 'action' as const, text }));
-  if (boxed.length <= maxLines) return boxed;
-  return choices.map((text) => ({ kind: 'action' as const, text }));
-}
+/** Height the solid figure needs, including a blank gap under it. */
+const TALL_FIGURE_BUDGET = BIG_ROWS + 1;
 
-function trimToHeight(lines: readonly HomeLine[], maxHeight: number): HomeLine[] {
-  const result: HomeLine[] = [];
-  let used = 0;
-  for (const line of lines) {
-    const next = homeLineHeight(line);
-    if (used + next > maxHeight) break;
-    result.push(line);
-    used += next;
+function figureLines(bytes: number, width: number, allowTall: boolean): string[] {
+  if (allowTall) {
+    const tall = bigTextLines(formatBytes(bytes));
+    if (tall !== undefined) {
+      const drawn = tall.reduce((w, line) => Math.max(w, line.length), 0);
+      if (drawn > 0 && drawn <= width) return [...tall];
+    }
   }
-  return result;
+  // Compact fallback: one bold plain line — readable when the tall face will not fit.
+  return [formatBytes(bytes)];
 }
 
-export function homeLayout(
-  width: number,
-  height: number,
-  scanning: boolean,
-  mark: string,
-  rootsLabel: string,
-  recommendedCount: number,
-  recommendedBytes: number,
-  session?: string,
-): HomeLine[] {
-  const chrome: HomeLine = {
-    kind: 'chrome',
-    text: homeChromeLine(scanning, mark, rootsLabel, width),
-  };
-  const headline: HomeLine = { kind: 'headline' };
-  const sessionLine: HomeLine | undefined =
-    session === undefined ? undefined : { kind: 'session', text: session };
-
-  const fixed = [chrome, ...(sessionLine === undefined ? [] : [sessionLine]), headline];
-  const fixedHeight = homeLinesHeight(fixed);
-  const actions = homeActionRows(
-    recommendedCount,
-    recommendedBytes,
-    width,
-    Math.max(1, height - fixedHeight),
-  );
-  let body: HomeLine[] = [...fixed, ...actions];
-
-  if (homeLinesHeight(body) > height && sessionLine !== undefined) {
-    body = [chrome, headline, ...homeActionRows(recommendedCount, recommendedBytes, width, height - 3)];
-  }
-
-  const bodyHeight = homeLinesHeight(body);
-  if (bodyHeight > height) {
-    return trimToHeight(body, height);
-  }
-
-  const topPad = Math.floor((height - bodyHeight) / 2);
-  const bottomPad = height - bodyHeight - topPad;
-  return [
-    ...Array<HomeLine>(topPad).fill({ kind: 'pad' }),
-    ...body,
-    ...Array<HomeLine>(bottomPad).fill({ kind: 'pad' }),
-  ];
+function renderActionRow(action: HomeAction, focused: boolean, width: number): string {
+  const mark = focused ? '▸' : ' ';
+  // Single spaces so substring checks like "b browse" still match the painted line.
+  return truncateLabel(`${mark} ${action.key} ${action.label}`, Math.max(0, width));
 }
 
 export function Home({
@@ -177,60 +163,142 @@ export function Home({
   dormantCount,
   activeCount,
   cacheCount,
+  focusIndex = 0,
+  foundLabel,
   disk,
   session,
 }: HomeProps): React.ReactElement {
   const spinner = useSpinner(scanning);
   const mark = scanning ? spinner : SETTLED_MARK;
-  const lines = homeLayout(
-    width,
-    height,
-    scanning,
-    mark,
-    rootsLabel,
-    recommendedCount,
-    recommendedBytes,
-    session,
-  );
+  const actions = homeActions(recommendedCount, recommendedBytes);
+  const focus = clampHomeFocus(focusIndex, actions.length);
+
+  const chrome = homeChromeLine(scanning, mark, rootsLabel, width);
   const caption = homeCaptionText(dormantCount, activeCount, cacheCount, disk);
   const note = homeDiskNote(disk, recommendedBytes);
+  const progress =
+    foundLabel !== undefined && foundLabel.length > 0
+      ? foundLabel
+      : scanning
+        ? 'b browse to watch the list fill in'
+        : '';
+
+  const actionBlock = promptBox(
+    actions.map((action, index) => renderActionRow(action, index === focus, Math.max(0, width - 4))),
+    width,
+  );
+
+  // Fixed lines excluding the reclaim figure: chrome · gap · [figure] · gap · caption · …
+  const fixedWithoutFigure =
+    1 + // chrome
+    1 + // gap under chrome
+    1 + // gap under figure
+    1 + // caption
+    (note.length > 0 ? 1 : 0) +
+    (progress.length > 0 ? 1 : 0) +
+    (session !== undefined ? 1 : 0) +
+    1 + // gap above actions
+    actionBlock.length;
+
+  const allowTall = height >= fixedWithoutFigure + TALL_FIGURE_BUDGET;
+  const figure = figureLines(recommendedBytes, width, allowTall);
+  const muted = recommendedBytes <= 0;
+
+  type Line = { key: string; node: React.ReactElement; keep: boolean };
+  const lines: Line[] = [];
+  const pushGap = (key: string, keep = true): void => {
+    lines.push({ key, node: <Text key={key}> </Text>, keep });
+  };
+  const pushText = (
+    key: string,
+    node: React.ReactElement,
+    keep = true,
+  ): void => {
+    lines.push({ key, node, keep });
+  };
+
+  pushText(
+    'chrome',
+    <Text key="chrome" color={scanning ? 'cyan' : 'green'} wrap="truncate-end">
+      {chrome}
+    </Text>,
+  );
+  pushGap('gap-chrome');
+
+  for (const [index, line] of figure.entries()) {
+    pushText(
+      `fig-${index}`,
+      <Text key={`fig-${index}`} bold color={muted ? undefined : 'green'} dimColor={muted}>
+        {truncateLabel(line, width)}
+      </Text>,
+    );
+  }
+  pushGap('gap-figure');
+
+  pushText(
+    'caption',
+    <Text key="caption" wrap="truncate-end">
+      {truncateLabel(caption, width)}
+    </Text>,
+  );
+  if (note.length > 0) {
+    pushText(
+      'note',
+      <Text key="note" dimColor wrap="truncate-end">
+        {truncateLabel(note, width)}
+      </Text>,
+      false,
+    );
+  }
+  if (progress.length > 0) {
+    pushText(
+      'progress',
+      <Text key="progress" dimColor wrap="truncate-end">
+        {truncateLabel(progress, width)}
+      </Text>,
+      false,
+    );
+  }
+  if (session !== undefined) {
+    pushText(
+      'session',
+      <Text key="session" dimColor wrap="truncate-end">
+        {truncateLabel(session, width)}
+      </Text>,
+      false,
+    );
+  }
+
+  pushGap('gap-actions');
+  for (const [index, line] of actionBlock.entries()) {
+    const focusedLine = line.includes('▸');
+    pushText(
+      `act-${index}`,
+      <Text
+        key={`act-${index}`}
+        bold={focusedLine}
+        color={focusedLine ? 'yellow' : undefined}
+        dimColor={!focusedLine}
+      >
+        {line}
+      </Text>,
+    );
+  }
+
+  // Drop optional middle lines first so the action box (and its bottom border) never clips.
+  while (lines.length > height) {
+    const dropAt = lines.findIndex((line) => !line.keep);
+    if (dropAt < 0) break;
+    lines.splice(dropAt, 1);
+  }
+  const fitted = lines.slice(0, height).map((line) => line.node);
+  while (fitted.length < height) {
+    fitted.push(<Text key={`pad-${fitted.length}`}> </Text>);
+  }
 
   return (
     <Box flexDirection="column" paddingX={1}>
-      {lines.map((line, index) => {
-        switch (line.kind) {
-          case 'pad':
-            return <Text key={index}> </Text>;
-          case 'chrome':
-            return (
-              <Text key={index} color={scanning ? 'cyan' : 'green'} wrap="truncate-end">
-                {line.text}
-              </Text>
-            );
-          case 'session':
-            return (
-              <Text key={index} dimColor wrap="truncate-end">
-                {truncateLabel(line.text, Math.max(0, width))}
-              </Text>
-            );
-          case 'headline':
-            return (
-              <Headline
-                key={index}
-                bytes={recommendedBytes}
-                caption={caption}
-                note={note}
-                width={Math.max(0, width)}
-              />
-            );
-          case 'action':
-            return (
-              <Text key={index} dimColor={!line.text.includes('enter')}>
-                {line.text}
-              </Text>
-            );
-        }
-      })}
+      {fitted}
     </Box>
   );
 }
