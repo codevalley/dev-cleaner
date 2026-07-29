@@ -204,11 +204,16 @@ export interface AppProps {
  * therefore describe one set of directories and `clean` would receive a longer one: the
  * user consents to a screen, and the work list grows behind it. Freezing rows, targets and
  * the total at the moment the question is asked makes the answer apply to the question.
+ *
+ * `source` records which policy froze the set — Home freezes **recommended**
+ * (`defaultSelection`), Triage freezes the user's **selection** — so arrivals compare
+ * against the same policy, not always against triage `chosen`.
  */
 interface Candidate {
   rows: readonly Row[];
   targets: readonly CleanTarget[];
   bytes: number;
+  source: 'recommended' | 'selection';
 }
 
 /**
@@ -348,6 +353,7 @@ function screenedSnapshot(candidate: Candidate, screenings: readonly Screening[]
     entries,
     blocked,
     blockedBytes: blocked.reduce((sum, entry) => sum + entry.bytes, 0),
+    source: candidate.source,
   };
 }
 
@@ -1031,6 +1037,7 @@ export function App({
             rows: recommendedChosen,
             targets: recommendedTargets,
             bytes: recommendedBytes,
+            source: 'recommended',
           });
         }
         return;
@@ -1072,7 +1079,7 @@ export function App({
         // rows, the targets and the total are read fresh and screened fresh.
         else {
           returnToRef.current = 'triage';
-          void beginScreening({ rows: chosen, targets, bytes: totalBytes });
+          void beginScreening({ rows: chosen, targets, bytes: totalBytes, source: 'selection' });
         }
       }
     },
@@ -1138,11 +1145,17 @@ export function App({
 
   if (mode.kind === 'confirm') {
     const { snapshot } = mode;
-    // Rows the scan turned up after the question was asked. They stay in the background
-    // list and are offered on the next pass; what they must not do is join this run
-    // unannounced. Counting them is the difference between "not included" and "hidden".
+    // Rows the scan turned up after the question was asked, under the *same* policy that
+    // froze the snapshot. Home freezes recommended; Triage freezes selection. Comparing
+    // either against triage `chosen` alone would count Triage-only edits as "arrivals"
+    // after a Home confirm. They stay in the background list and are offered on the next
+    // pass; what they must not do is join this run unannounced.
     const frozen = new Set(snapshot.rows.map((row) => row.id));
-    const arrivals = chosen.filter((row) => !frozen.has(row.id)).length;
+    const live = snapshot.source === 'recommended' ? recommendedChosen : chosen;
+    const arrivals = live.filter((row) => !frozen.has(row.id)).length;
+    // Esc returns via `returnToRef` (home vs triage). Copy must match that destination —
+    // "esc to review" implies a list; Home has none.
+    const escHint = snapshot.source === 'recommended' ? 'esc back' : 'esc to review';
 
     return (
       <Box flexDirection="column">
@@ -1161,7 +1174,7 @@ export function App({
         {arrivals > 0 ? (
           <Box paddingX={1}>
             <Text dimColor>
-              {`${arrivals} more found while confirming · not in this run, esc to review`}
+              {`${arrivals} more found while confirming · not in this run, ${escHint}`}
             </Text>
           </Box>
         ) : null}

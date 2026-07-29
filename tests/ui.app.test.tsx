@@ -740,6 +740,62 @@ describe('session modes', () => {
     expect(ui.screened).toHaveLength(0);
   });
 
+  /**
+   * Home freezes recommended; Triage edits must not look like scan arrivals on that path.
+   * A false "N more found while confirming" would push esc-to-review copy while returnTo
+   * is Home (no list).
+   */
+  it('home confirm ignores triage-only selection when counting arrivals', async () => {
+    const ui = mount(
+      fastStream([
+        projectEvent(makeProject('alpha', 'dormant', [artifact('dist', 'build', 5 * GB)])),
+        projectEvent(makeProject('busy', 'active', [artifact('dist', 'build', 4 * GB)])),
+      ]),
+      { screen: {}, ...homeLand },
+    );
+
+    await enterTriage(ui);
+    await ui.waitForText('busy');
+    await ui.press('j');
+    expect(ui.line('busy')).toContain(CURSOR);
+    await ui.press(SPACE);
+    await vi.waitFor(() => expect(ui.frame()).toContain('selected 2'), {
+      timeout: RENDER_TIMEOUT,
+      interval: 10,
+    });
+
+    await ui.press(ESCAPE);
+    await waitForHome(ui);
+    await ui.press(ENTER);
+    await ui.waitForText('Move to Trash?');
+
+    expect(ui.frame()).toContain('alpha');
+    expect(ui.frame()).not.toContain('busy');
+    expect(ui.frame()).not.toContain('more found while confirming');
+  });
+
+  it('home confirm still discloses real recommended arrivals', async () => {
+    const source = feed();
+    const ui = mount(source.stream, { screen: {}, ...homeLand });
+
+    await source.push(
+      projectEvent(makeProject('shown', 'dormant', [artifact('dist', 'build', 3 * GB)])),
+    );
+    await waitForHome(ui);
+    await ui.press(ENTER);
+    await ui.waitForText('Move to Trash?');
+    expect(ui.frame()).not.toContain('found while confirming');
+
+    await source.push(
+      projectEvent(makeProject('latecomer', 'dormant', [artifact('target', 'build', 40 * GB)])),
+    );
+    await delay(50);
+
+    expect(ui.frame()).toContain('1 more found while confirming');
+    expect(ui.frame()).toContain('esc back');
+    expect(ui.frame()).not.toContain('esc to review');
+  });
+
   it('triage esc returns home; done esc returns home and q quits', async () => {
     const ui = mount(
       fastStream([
