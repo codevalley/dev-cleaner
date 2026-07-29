@@ -56,9 +56,9 @@
 import { Box, Text } from 'ink';
 import React, { useMemo } from 'react';
 
-import { BYTES_WIDTH, CURSOR, MARK_OFF, MARK_ON, formatBytesPadded, padLabel } from './format.js';
-import { joinLabels, labelsFor, type Label, type LabelKind } from './labels.js';
-import { isSelectable, isSelected, type Row, type Selection } from './model.js';
+import { BYTES_WIDTH, CURSOR, MARK_OFF, MARK_ON, formatBytes, formatBytesPadded, padLabel, truncateLabel } from './format.js';
+import { joinLabels, labelsFor, LABEL_SEPARATOR, type Label, type LabelKind } from './labels.js';
+import { enabledArtifacts, isSelectable, isSelected, type Row, type Selection } from './model.js';
 import { scrollHint, visibleSlice, type Viewport } from './viewport.js';
 import type { Category, Project } from '../types.js';
 
@@ -247,6 +247,43 @@ export function renderRow(
   const mark = selected ? MARK_ON : MARK_OFF;
   const tail = column > 0 ? `${' '.repeat(CHIP_GAP)}${chips.padStart(chipWidth)}` : '';
   return `${cursor}${mark} ${padLabel(row.label, labelWidth)}${tail} ${bytes}`;
+}
+
+/**
+ * The focused-row summary under the triage list: name, every chip, and the largest enabled
+ * artifact. Full width at triage — unlike `chipPlan`, nothing is sacrificed for column room.
+ * Empty when no row is focused; App still draws one blank line for height stability.
+ */
+export function statusLine(
+  row: Row | undefined,
+  categories: ReadonlySet<Category>,
+  width: number,
+): string {
+  if (row === undefined) return '';
+
+  const parts = [`${CURSOR} ${row.label}`];
+
+  if (row.kind === 'project') {
+    const chips = joinLabels(labelsFor(row.project, categories));
+    if (chips.length > 0) parts.push(chips);
+
+    const artifacts = enabledArtifacts(row.project, categories);
+    if (artifacts.length > 0) {
+      const primary = artifacts.reduce((best, artifact) =>
+        artifact.bytes > best.bytes ||
+        (artifact.bytes === best.bytes && artifact.relPath.localeCompare(best.relPath) < 0)
+          ? artifact
+          : best,
+      );
+      parts.push(`${primary.relPath} ${formatBytes(primary.bytes)}`);
+    }
+  } else if (row.kind === 'cache') {
+    parts.push('global cache', `${row.cache.path} ${formatBytes(row.cache.bytes)}`);
+  } else {
+    parts.push(String(row.count), formatBytes(row.bytes));
+  }
+
+  return truncateLabel(parts.join(LABEL_SEPARATOR), width);
 }
 
 export interface ListProps {

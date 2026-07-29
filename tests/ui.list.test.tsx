@@ -22,7 +22,7 @@ import { render } from 'ink-testing-library';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { Detail } from '../src/ui/Detail.js';
-import { List, chipBudget, chipPlan, chipsFor, renderRow } from '../src/ui/List.js';
+import { List, chipBudget, chipPlan, chipsFor, renderRow, statusLine } from '../src/ui/List.js';
 import { LABEL_HELP, LABEL_SEPARATOR, joinLabels, labelsFor } from '../src/ui/labels.js';
 import { EMPTY_SELECTION, type Row } from '../src/ui/model.js';
 import type { Viewport } from '../src/ui/viewport.js';
@@ -481,6 +481,42 @@ describe('the detail pane carries every chip', () => {
  * The second is the fixed-height budget: one unpadded, untruncated line is enough to wrap the
  * pane and push the pinned footer off the screen.
  */
+describe('statusLine', () => {
+  it('returns an empty string when no row is focused', () => {
+    expect(statusLine(undefined, AGGRESSIVE, 80)).toBe('');
+  });
+
+  it('names the project, every chip, and the largest enabled artifact', () => {
+    const row = projectRow(CROWDED);
+    const chips = joinLabels(labelsFor(CROWDED, AGGRESSIVE));
+    expect(statusLine(row, AGGRESSIVE, 200)).toBe(
+      `▸ crowded${LABEL_SEPARATOR}${chips}${LABEL_SEPARATOR}target 9.0G`,
+    );
+  });
+
+  it('summarizes a cache row with its path and size', () => {
+    const row = cacheRow('npm', 60.6 * MB);
+    expect(statusLine(row, AGGRESSIVE, 120)).toBe(
+      `▸ npm${LABEL_SEPARATOR}global cache${LABEL_SEPARATOR}/caches/npm 60.6M`,
+    );
+  });
+
+  it('summarizes a section header with its count and total', () => {
+    const row = headerRow('IN USE RECENTLY', 3, 210 * MB);
+    expect(statusLine(row, AGGRESSIVE, 80)).toBe(
+      `▸ IN USE RECENTLY${LABEL_SEPARATOR}3${LABEL_SEPARATOR}210M`,
+    );
+  });
+
+  it('truncates to the pane width without wrapping', () => {
+    const row = projectRow(CROWDED);
+    const line = statusLine(row, AGGRESSIVE, 40);
+    expect(line).toHaveLength(40);
+    expect(line.endsWith('…')).toBe(true);
+    expect(line).not.toContain('\n');
+  });
+});
+
 describe('the chip column is actually reachable from the app', () => {
   it('passes a category set through to the list, so connectivity chips can appear', () => {
     const deps = new Set<Category>(['build', 'deps', 'cache']);
