@@ -117,30 +117,30 @@ documented here.
 Run it in a terminal and you get a full-screen session: **Splash → Home → Triage →
 Confirm → Done**. The scan starts behind a short brand splash; once there is an honest
 recommended total, you land on Home with one primary action. Browse and adjust is opt-in
-(`b`). The footer shows only the keys valid in the current mode — not the full binding
-list on every screen.
+(`b`). Home lists actions in a boxed menu; Triage and later modes use a contextual footer
+with only the keys valid there.
 
 **Home** — default after splash (same demo tree as the piped report above):
 
 ```
- ▓▒░ DEV-CLEANER  ~/develop          ✓ scan complete · 5 projects · 2 caches · 9.7G
- ██████████████▓░░░░░░░  67%  309G used of 460G · 152G free
-
-      █▀█ █   9.7G
-      █▄█ █   in the recommended set
-
-      enter — trash 5 items · 9.7G
-      b     — browse & adjust
-      t     — Trash · q quit
-
- enter reclaim · b browse · p preset · t Trash · q quit
+ ▓▒░ dev-cleaner · ✓ ready · ~/projects
+  █    ███ █▀▀   4 dormants · 1 active · 2 caches · 152G free
+ ▄█▄ ▄ █▄█ ▀▄█   → 153G free once emptied
+ ╭──────────────────────────────────────────────────────────────╮
+ │ enter  trash the recommended 4 items · 1.8G                  │
+ │ b browse & adjust                                            │
+ │ t Trash                                                      │
+ │ q quit                                                       │
+ ╰──────────────────────────────────────────────────────────────╯
 ```
 
 **Triage** — full-width list; detail on demand (`d`):
 
 ```
- ▓▒░ DEV-CLEANER  triage                reclaim 9.7G
+ ▓▒░ dev-cleaner  preset recommended      ✓ scan complete · 5 projects · 2 caches · 9.7G
  ██████████████▓░░░░░░░  67%  309G used of 460G · 152G free
+  █    █▀█ █▀▀   selected 4 of 7 · → 154G free once emptied
+ ▄█▄ ▄ ▄▄█ ▀▄█   Trashed files still occupy the disk until you empty the Trash.
 
  PROJECTS 4                                          1.8G
   ◉ tinysync             edited 8mo · slow   1.2G
