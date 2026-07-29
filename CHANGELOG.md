@@ -15,6 +15,11 @@ One extra section type is used, and it is the important one:
 
 ## [Unreleased]
 
+### Changed
+
+- Interactive session is now Splash → Home → Triage → Confirm → Done (lazygit-style
+  full-width triage; detail on demand). Same safety model and non-TTY report.
+
 ## [0.1.1] — 2026-07-28
 
 No functional change. Identical code to 0.1.0; cut to exercise the automated release path

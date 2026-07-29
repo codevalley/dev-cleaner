@@ -114,48 +114,59 @@ documented here.
 
 ## The interface
 
-Run it in a terminal and you get a two-pane full-screen app. A real frame, from a scan of
-the same demo tree:
+Run it in a terminal and you get a full-screen session: **Splash → Home → Triage →
+Confirm → Done**. The scan starts behind a short brand splash; once there is an honest
+recommended total, you land on Home with one primary action. Browse and adjust is opt-in
+(`b`). The footer shows only the keys valid in the current mode — not the full binding
+list on every screen.
+
+**Home** — default after splash (same demo tree as the piped report above):
 
 ```
- ▓▒░ dev-cleaner  preset recommended             ✓ scan complete · 5 projects · 2 caches · 9.7G
+ ▓▒░ DEV-CLEANER  ~/develop          ✓ scan complete · 5 projects · 2 caches · 9.7G
  ██████████████▓░░░░░░░  67%  309G used of 460G · 152G free
-  █    █▀█ █▀▀   selected 5 of 7 · → 154G free once emptied
- ▄█▄ ▄ ▄▄█ ▀▄█   Trashed files still occupy the disk until you empty the Trash.
-╭──────────────────────────────────────────────────╮╭──────────────────────────────────────────╮
-│ PROJECTS 4                                  1.8G ││ api                                      │
-│  ◉ tinysync             edited 8mo · slow   1.2G ││ node · dormant 6mo                       │
-│  ◉ mobile                edited 1y · slow   580M ││ edited 6mo ago · rebuilds offline        │
-│ ▸◉ api                         edited 6mo  53.0M ││                                          │
-│  ◉ site                        edited 5mo  38.0M ││   .turbo                            9.0M │
-│ IN USE RECENTLY 1                           210M ││   dist                             44.0M │
-│  ○ portfolio                    edited 7d   210M ││   total                            53.0M │
-│ CACHES 2                                    7.6G ││                                          │
-│  ○ pnpm store                               7.5G ││   not a git repository                   │
-│  ◉ npm cache                               60.6M ││                                          │
-│                                                  ││   edited 6mo ago                         │
-│                                                  ││     How long since you last touched      │
-│                                                  ││     this, and the signal that decided    │
-│                                                  ││     its score. The warmer it is, the     │
-│                                                  ││     sooner you will pay for the rebuild. │
-│                                                  ││   rebuilds offline                       │
-│                                                  ││     Rebuilds from source you already     │
-│                                                  ││     have. No connectivity needed, so     │
-│                                                  ││     this one is safe to clear anywhere.  │
-│                                                  ││                                          │
-│                                                  ││ No commits or edits for a while. Checked │
-│                                                  ││ by default.                              │
-╰──────────────────────────────────────────────────╯╰──────────────────────────────────────────╯
- space toggle · a section · j/k move · p preset · enter clean · t Trash · q quit
+
+      █▀█ █   9.7G
+      █▄█ █   in the recommended set
+
+      enter — trash 5 items · 9.7G
+      b     — browse & adjust
+      t     — Trash · q quit
+
+ enter reclaim · b browse · p preset · t Trash · q quit
+```
+
+**Triage** — full-width list; detail on demand (`d`):
+
+```
+ ▓▒░ DEV-CLEANER  triage                reclaim 9.7G
+ ██████████████▓░░░░░░░  67%  309G used of 460G · 152G free
+
+ PROJECTS 4                                          1.8G
+  ◉ tinysync             edited 8mo · slow   1.2G
+  ◉ mobile                edited 1y · slow   580M
+ ▸◉ api                         edited 6mo  53.0M
+  ◉ site                        edited 5mo  38.0M
+ IN USE RECENTLY 1                                   210M
+  ○ portfolio                    edited 7d   210M
+ CACHES 2                                            7.6G
+  ○ pnpm store                                      7.5G
+  ◉ npm cache                                      60.6M
+
+ ▸ api · node · dormant 6mo · dist 44.0M
+ space · a · j/k · d detail · p · enter · esc home · t · q
 ```
 
 | Key | Does |
 | --- | ---- |
-| `↑` `↓` / `j` `k` | Move the cursor |
-| `space` | Toggle the highlighted row |
-| `a` | Toggle everything in the current section |
+| `↑` `↓` / `j` `k` | Move the cursor (Triage) |
+| `space` | Toggle the highlighted row (Triage) |
+| `a` | Toggle everything in the current section (Triage) |
+| `b` | Browse & adjust — Home → Triage |
+| `d` | Full detail for the focused row (Triage); `esc` back |
 | `p` | Cycle the preset (recommended ⇄ aggressive) |
-| `enter` | Screen the selection, then ask for confirmation |
+| `enter` | Home or Triage: screen the selection, then ask for confirmation; Confirm: execute |
+| `esc` | Triage → Home; Confirm → back; Done → Home |
 | `t` | Empty the Trash (requires typing the word `empty`) |
 | `q` | Quit |
 
@@ -168,7 +179,7 @@ the honest total. Only a second `enter` on that screen actually moves anything. 
 confirmation transition is single-use, so a held or double-tapped `enter` cannot run a
 round twice.
 
-That is also why `site` is ticked in the frame above but `[-]` in the report. The
+That is also why `site` is ticked in the triage list above but `[-]` in the report. The
 interactive list does not screen while you browse; it screens when you press `enter`, on
 the selection you actually chose, and shows you the refusal then. The piped report has no
 "moment you ask", so it screens every row up front instead. Same guards, same verdict,

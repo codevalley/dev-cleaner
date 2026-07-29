@@ -381,6 +381,12 @@ invariant while defeating its purpose.
 
 ## User interface
 
+> **Superseded (2026-07-29):** The interactive session is now Splash → Home → Triage →
+> Confirm → Done, with a full-width list and detail on demand. See
+> [`2026-07-29-tui-session-redesign.md`](./2026-07-29-tui-session-redesign.md) for the
+> current UI spec. The two-pane frame below is kept as historical context; discovery,
+> safety, clean, and non-TTY behaviour are unchanged.
+
 An Ink (React for terminals) full-screen application, two panes.
 
 ```
