@@ -77,9 +77,11 @@ import { Confirm, type BlockedEntry, type ConfirmEntry } from './Confirm.js';
 import { Detail } from './Detail.js';
 import { BAR_LEGEND, Gauge } from './Gauge.js';
 import { Footer, hintsFor } from './Footer.js';
-import { List } from './List.js';
+import { Home } from './Home.js';
+import { List, statusLine } from './List.js';
 import { RoundSummary, type ProblemEntry, type RoundReport } from './Round.js';
 import { ScanStatus } from './ScanStatus.js';
+import { Splash, splashReady } from './Splash.js';
 import { EMPTY_TRASH_WORD, TrashConfirm, TrashResult, trashConfirmArmed } from './Trash.js';
 import { formatBytes } from './format.js';
 import {
@@ -90,6 +92,7 @@ import {
   cursorIndex,
   cyclePreset,
   defaultSelection,
+  firstReclaimableId,
   firstSelectableId,
   isSelectable,
   moveCursor,
@@ -144,6 +147,9 @@ const NOTHING_HAPPENED: ExitSummary = {
   trashEmptied: false,
 };
 
+/** Surfaces that can open Confirm / Trash and expect esc to return. */
+type WorkspaceKind = 'home' | 'triage';
+
 export interface AppProps {
   /** Live scan events. Rendered as they arrive; `done` only settles the indicator. */
   stream: AsyncIterable<ScanEvent>;
@@ -183,6 +189,8 @@ export interface AppProps {
   onExit?: ((summary: ExitSummary) => void) | undefined;
   preset?: Preset | undefined;
   nowMs?: number | undefined;
+  /** Shown on Splash / Home chrome. Defaults to `.` when the CLI has not wired roots. */
+  rootsLabel?: string | undefined;
   /** Terminal geometry. Defaults to stdout's, overridable for tests. */
   width?: number | undefined;
   height?: number | undefined;
@@ -223,18 +231,24 @@ interface ConfirmSnapshot extends Candidate {
 }
 
 /**
+ * Named session modes with distinct layouts — Splash → Home → Triage → Confirm → Done —
+ * rather than overlays on one two-pane workspace.
+ *
  * Modelled as a union rather than a string plus a pile of nullable fields: `screening`,
- * `confirm` and `cleaning` cannot exist without the frozen list, `result` cannot exist without
+ * `confirm` and `cleaning` cannot exist without the frozen list, `done` cannot exist without
  * a round to report, and `trash-confirm` cannot exist without the summary whose figures the
  * prompt is required to show. The type is what says so.
  */
-type Phase =
-  | { kind: 'list' }
+type Mode =
+  | { kind: 'splash' }
+  | { kind: 'home' }
+  | { kind: 'triage' }
+  | { kind: 'detail' }
   | { kind: 'screening'; candidate: Candidate; provisional: readonly BlockedEntry[] }
   | { kind: 'confirm'; snapshot: ConfirmSnapshot }
   | { kind: 'cleaning'; snapshot: ConfirmSnapshot }
-  | { kind: 'result'; report: RoundReport }
-  | { kind: 'trash-check' }
+  | { kind: 'done'; report: RoundReport }
+  | { kind: 'trash-reading' }
   | { kind: 'trash-confirm'; summary: TrashSummary; typed: string }
   | { kind: 'emptying' }
   | { kind: 'trash-result'; ok: boolean; detail: string | undefined; summary: TrashSummary | undefined };
@@ -354,15 +368,6 @@ function problemsOf(outcomes: readonly CleanOutcome[]): ProblemEntry[] {
   );
 }
 
-const MIN_LIST_WIDTH = 28;
-const MAX_LIST_WIDTH = 52;
-
-/**
- * Columns the scan indicator must keep on the title line before anything else may share it.
- *
- * `✓ scan complete` is fifteen; eighteen leaves the running count a character or two as well.
- * Below this the line carries the wordmark and the indicator, and nothing else.
- */
 const MIN_SCAN_WIDTH = 18;
 
 /**
@@ -380,31 +385,34 @@ const MIN_SCAN_WIDTH = 18;
 const RESERVED_ROW = 1;
 
 /**
- * The fixed part of the frame, in lines. Everything here is drawn on every list frame, so the
- * list gets the budget minus this and not one line more.
+ * The fixed part of the triage frame, in lines. Everything here is drawn on every triage
+ * frame, so the list gets the budget minus this and not one line more.
  *
  * - 2 header: the wordmark-and-scan line, and the one-line disk gauge.
  * - 2 headline: the selection total, in the block face, which is the number the user came for.
  * - 2 pane borders (top and bottom).
  * - 1 scroll hint, drawn *inside* the list pane by `List` whether or not it has anything to
  *   say — a line that came and went would change the frame height as the user scrolled.
+ * - 1 status line under the list for the focused row.
  * - 1 footer: the key hints, with the session ledger or a message on the right.
- *
- * What is *not* here any more: the section note, which restated at one truncated line what the
- * detail pane says in full beside every row it applies to, and the gauge's second line, whose
- * contents now sit beside the headline figure they describe.
  */
 const HEADER_HEIGHT = 2;
 const HEADLINE_HEIGHT = 2;
 const PANE_BORDER_HEIGHT = 2;
 const SCROLL_HINT_HEIGHT = 1;
+const STATUS_LINE_HEIGHT = 1;
 const FOOTER_HEIGHT = 1;
 const CHROME_HEIGHT =
-  HEADER_HEIGHT + HEADLINE_HEIGHT + PANE_BORDER_HEIGHT + SCROLL_HINT_HEIGHT + FOOTER_HEIGHT;
+  HEADER_HEIGHT +
+  HEADLINE_HEIGHT +
+  PANE_BORDER_HEIGHT +
+  SCROLL_HINT_HEIGHT +
+  STATUS_LINE_HEIGHT +
+  FOOTER_HEIGHT;
 
 /**
  * The chrome a terminal too short for the full layout gets instead: the wordmark line, the
- * panes and the footer, with the gauge and the headline dropped.
+ * panes, status line and the footer, with the gauge and the headline dropped.
  *
  * Not a nicety. Without it the budget goes negative on a short terminal and the floor below
  * takes over, at which point the frame is taller than the screen again and the header
@@ -412,7 +420,14 @@ const CHROME_HEIGHT =
  * end. Which tier applies is a function of the terminal's height alone, so the number of lines
  * rendered is always the number the list was budgeted against.
  */
-const COMPACT_CHROME_HEIGHT = 1 + PANE_BORDER_HEIGHT + SCROLL_HINT_HEIGHT + FOOTER_HEIGHT;
+const COMPACT_CHROME_HEIGHT =
+  1 + PANE_BORDER_HEIGHT + SCROLL_HINT_HEIGHT + STATUS_LINE_HEIGHT + FOOTER_HEIGHT;
+
+/**
+ * Shortest triage chrome: drop the status line too when even compact exceeds `rows - 1`.
+ * The focused-row summary is useful, not load-bearing for the reserved-row invariant.
+ */
+const MINI_CHROME_HEIGHT = 1 + PANE_BORDER_HEIGHT + SCROLL_HINT_HEIGHT + FOOTER_HEIGHT;
 
 /** Below this the pane is unusable anyway, and a negative window is not a window. */
 const MIN_LIST_HEIGHT = 3;
@@ -426,11 +441,18 @@ const MIN_LIST_HEIGHT = 3;
  * that a terminal cannot hold the borders, the hint and the footer at all, and the floor of one
  * list row is the least-bad answer.
  */
-export function frameBudget(rows: number): { chrome: number; listHeight: number; full: boolean } {
+export function frameBudget(rows: number): {
+  chrome: number;
+  listHeight: number;
+  full: boolean;
+  statusLine: boolean;
+} {
   const budget = Math.max(0, (Number.isFinite(rows) ? Math.floor(rows) : 0) - RESERVED_ROW);
   const full = budget - CHROME_HEIGHT >= MIN_LIST_HEIGHT;
-  const chrome = full ? CHROME_HEIGHT : COMPACT_CHROME_HEIGHT;
-  return { chrome, listHeight: Math.max(1, budget - chrome), full };
+  let chrome = full ? CHROME_HEIGHT : COMPACT_CHROME_HEIGHT;
+  if (budget - chrome < 1) chrome = MINI_CHROME_HEIGHT;
+  const statusLine = chrome > MINI_CHROME_HEIGHT;
+  return { chrome, listHeight: Math.max(1, budget - chrome), full, statusLine };
 }
 
 function messageOf(error: unknown): string {
@@ -447,6 +469,7 @@ export function App({
   onEmptyTrash,
   onExit,
   preset: initialPreset,
+  rootsLabel: rootsLabelProp,
   width,
   height,
 }: AppProps): React.ReactElement {
@@ -483,9 +506,13 @@ export function App({
   const [scanning, setScanning] = useState(true);
   const [preset, setPreset] = useState<Preset>(initialPreset ?? 'recommended');
   const [cursorId, setCursorId] = useState<string | undefined>(undefined);
-  const [phase, setPhase] = useState<Phase>({ kind: 'list' });
+  const [mode, setMode] = useState<Mode>({ kind: 'splash' });
   const [message, setMessage] = useState<string | undefined>(undefined);
   const [disk, setDisk] = useState<DiskUsage | undefined>(undefined);
+  const rootsLabel = rootsLabelProp ?? '.';
+
+  /** Where screening / trash cancel and clean-failure return. */
+  const returnToRef = useRef<WorkspaceKind>('home');
 
   /** Every outcome of every round, for the exit summary. A ref: only read on the way out. */
   const outcomesRef = useRef<CleanOutcome[]>([]);
@@ -499,8 +526,8 @@ export function App({
    *
    * Ink re-subscribes `useInput` in a passive effect, so two keystrokes delivered in one
    * tick — a double-tap, or the key repeat of a held ENTER, which on a confirmation dialog
-   * is entirely ordinary — both reach the *previous* render's handler while `phase` still
-   * reads `confirm`. A `setPhase` cannot stop the second one: state updates are asynchronous,
+   * is entirely ordinary — both reach the *previous* render's handler while `mode` still
+   * reads `confirm`. A `setMode` cannot stop the second one: state updates are asynchronous,
    * and that asynchrony is the race. Only a ref latched synchronously, before the first
    * `await`, makes the transition single-use. Trashing the same path twice is mostly
    * idempotent, but the reported summary would describe the second run, and a trash backend
@@ -519,8 +546,8 @@ export function App({
    * Which screening run owns the screen.
    *
    * A screen can take seconds (the nested scan is budgeted at 50,000 directories per
-   * candidate) and the user can leave it — `esc` back to the list, `q` out of the app. The
-   * `await` does not know that, so its result would arrive and open a confirmation for a
+   * candidate) and the user can leave it — `esc` back to the workspace, `q` out of the app.
+   * The `await` does not know that, so its result would arrive and open a confirmation for a
    * selection the user has since changed, or set state on a component that is gone. Every
    * departure bumps this counter; a result whose run is no longer the current one is
    * dropped. Freezing the set is worth nothing if a stale verdict can unfreeze it.
@@ -529,6 +556,7 @@ export function App({
   /** The same, for the Trash read, which walks `~/.Trash` and is just as abandonable. */
   const trashRun = useRef(0);
   const mounted = useRef(true);
+  const splashStartedAt = useRef(Date.now());
   useEffect(
     () => () => {
       mounted.current = false;
@@ -537,21 +565,11 @@ export function App({
   );
 
   const columns = width ?? stdout?.columns ?? 80;
-  // Two panes only fit when both can meet their minimum. Below that, one pane takes the
-  // full width and the detail is dropped rather than squeezed.
-  //
-  // The previous form clamped each pane independently — `min(52, max(28, columns*0.55))`
-  // for the list and `max(28, columns - listWidth)` for the detail — so between 40 and 60
-  // columns the second clamp fired and the two widths summed to MORE than the terminal.
-  // Yoga then wrapped every row, and the frame rendered ~1.7x the declared height, which
-  // defeats the pinned footer the viewport work exists to guarantee.
-  const twoPane = columns >= MIN_LIST_WIDTH * 2;
-  const listWidth = twoPane
-    ? Math.min(MAX_LIST_WIDTH, Math.max(MIN_LIST_WIDTH, columns - MIN_LIST_WIDTH))
-    : columns;
-  const detailWidth = twoPane ? columns - listWidth : 0;
   const rowsAvailable = height ?? stdout?.rows ?? 24;
-  const { listHeight, full: fullChrome } = frameBudget(rowsAvailable);
+  const frameRows = Math.max(1, rowsAvailable - RESERVED_ROW);
+  const { listHeight, full: fullChrome, statusLine: showStatusLine } = frameBudget(rowsAvailable);
+  // Full-width triage: the list owns the terminal width (borders + padding subtracted later).
+  const listWidth = columns;
 
   const categories = useMemo(() => categoriesFor(preset), [categoriesFor, preset]);
   const rows = useMemo(
@@ -605,13 +623,62 @@ export function App({
   }, [rows, writeSelection]);
 
   // Keep the cursor on a row that exists — a preset change or a completed round removes rows.
+  // Seed with the largest reclaimable selected row (lazygit-style triage entry).
   useEffect(() => {
     setCursorId((current) =>
       current !== undefined && rows.some((row) => row.id === current)
         ? current
-        : firstSelectableId(rows),
+        : (firstReclaimableId(rows, selectionRef.current) ?? firstSelectableId(rows)),
     );
   }, [rows]);
+
+  /**
+   * Recommended set for Home: defaults for the current preset, independent of Triage edits.
+   * Scan arrivals update these figures as `rows` grow.
+   */
+  const recommended = useMemo(() => defaultSelection(rows), [rows]);
+  const recommendedBytes = selectedBytes(rows, recommended);
+  const recommendedCount = selectedCount(rows, recommended);
+  const recommendedChosen = selectedRows(rows, recommended);
+  const recommendedTargets = useMemo(
+    () => toTargets({ rows, selection: recommended, categories }),
+    [rows, recommended, categories],
+  );
+
+  const dormantCount = useMemo(
+    () => rows.filter((row) => row.kind === 'project' && row.section === 'projects').length,
+    [rows],
+  );
+  const activeCount = useMemo(
+    () => rows.filter((row) => row.kind === 'project' && row.section === 'active').length,
+    [rows],
+  );
+  const cacheCount = useMemo(
+    () => rows.filter((row) => row.kind === 'cache').length,
+    [rows],
+  );
+  const hasAnyRow = rows.some((row) => row.kind !== 'header');
+  const foundBytes = rows.reduce((sum, row) => (row.kind === 'header' ? sum + row.bytes : sum), 0);
+
+  // Splash → Home once the brand has been visible and the scan has something honest to say.
+  useEffect(() => {
+    if (mode.kind !== 'splash') return;
+    const tick = (): void => {
+      if (
+        splashReady({
+          dwellElapsedMs: Date.now() - splashStartedAt.current,
+          scanning,
+          recommendedBytes,
+          hasAnyRow,
+        })
+      ) {
+        setMode({ kind: 'home' });
+      }
+    };
+    tick();
+    const id = setInterval(tick, 50);
+    return () => clearInterval(id);
+  }, [mode.kind, scanning, recommendedBytes, hasAnyRow]);
 
   const currentRow: Row | undefined = rows.find((row) => row.id === cursorId);
   const chosen = selectedRows(rows, selection);
@@ -663,7 +730,7 @@ export function App({
   }, [exit, onExit]);
 
   /**
-   * Run the clean, then **return to the list**.
+   * Run the clean, then land on **Done**.
    *
    * Takes the snapshot as an argument rather than reading state: the work list handed to
    * `clean` is the one the user saw, not whatever the stream has made of it since.
@@ -679,7 +746,7 @@ export function App({
       if (cleanStarted.current) return;
       cleanStarted.current = true;
 
-      setPhase({ kind: 'cleaning', snapshot });
+      setMode({ kind: 'cleaning', snapshot });
       try {
         const outcomes = await onClean(snapshot.targets);
         if (!mounted.current) return;
@@ -693,8 +760,8 @@ export function App({
         writeSelection(() => round.selection);
         outcomesRef.current = [...outcomesRef.current, ...outcomes];
 
-        setPhase({
-          kind: 'result',
+        setMode({
+          kind: 'done',
           report: {
             // From `applyRound`, which counts `trashed` and nothing else. Invariant 8.
             reclaimedBytes: round.reclaimedBytes,
@@ -711,7 +778,7 @@ export function App({
         // describing a set of rows that no longer exists.
         void refreshDisk();
       } catch (error) {
-        setPhase({ kind: 'list' });
+        setMode({ kind: returnToRef.current });
         setMessage(`clean failed: ${messageOf(error)}`);
       } finally {
         // The latch spends the *round*, not the app: the next one is a new decision over a new
@@ -733,9 +800,9 @@ export function App({
    *   which is the only tier that can find a worktree *inside* a candidate, and is what the
    *   confirmation is finally built from.
    *
-   * A screen that throws sends the user back to the list with the error rather than to the
-   * question. Proceeding would mean rendering a total nobody checked, which is precisely the
-   * defect this path exists to close; `clean` would still refuse at the boundary, but the
+   * A screen that throws sends the user back to the workspace with the error rather than to
+   * the question. Proceeding would mean rendering a total nobody checked, which is precisely
+   * the defect this path exists to close; `clean` would still refuse at the boundary, but the
    * promise on screen would already have been made.
    */
   const beginScreening = useCallback(
@@ -744,17 +811,17 @@ export function App({
       screenRun.current = run;
       const stale = (): boolean => !mounted.current || screenRun.current !== run;
 
-      setPhase({ kind: 'screening', candidate, provisional: [] });
+      setMode({ kind: 'screening', candidate, provisional: [] });
 
       if (onScreen === undefined) {
-        setPhase({ kind: 'confirm', snapshot: screenedSnapshot(candidate, []) });
+        setMode({ kind: 'confirm', snapshot: screenedSnapshot(candidate, []) });
         return;
       }
 
       try {
         const cheap = await onScreen(candidate.targets, 'cheap');
         if (stale()) return;
-        setPhase({
+        setMode({
           kind: 'screening',
           candidate,
           provisional: blockedEntriesOf(candidate.targets, cheap),
@@ -762,10 +829,10 @@ export function App({
 
         const full = await onScreen(candidate.targets, 'full');
         if (stale()) return;
-        setPhase({ kind: 'confirm', snapshot: screenedSnapshot(candidate, full) });
+        setMode({ kind: 'confirm', snapshot: screenedSnapshot(candidate, full) });
       } catch (error) {
         if (stale()) return;
-        setPhase({ kind: 'list' });
+        setMode({ kind: returnToRef.current });
         setMessage(`check failed: ${messageOf(error)}`);
       }
     },
@@ -775,7 +842,7 @@ export function App({
   /**
    * Read the Trash, then show what emptying it would destroy.
    *
-   * The read is a directory walk and can take seconds, so it gets a phase of its own and an
+   * The read is a directory walk and can take seconds, so it gets a mode of its own and an
    * abandonment counter, exactly like the screening. It is also the only source of the figures
    * the prompt may show: `trash.ts` is explicit that the **whole** Trash must be disclosed,
    * never this run's contribution, because emptying takes the user's holiday photos along with
@@ -787,14 +854,14 @@ export function App({
     trashRun.current = run;
     const stale = (): boolean => !mounted.current || trashRun.current !== run;
 
-    setPhase({ kind: 'trash-check' });
+    setMode({ kind: 'trash-reading' });
     try {
       const summary = await readTrash();
       if (stale()) return;
-      setPhase({ kind: 'trash-confirm', summary, typed: '' });
+      setMode({ kind: 'trash-confirm', summary, typed: '' });
     } catch (error) {
       if (stale()) return;
-      setPhase({ kind: 'list' });
+      setMode({ kind: returnToRef.current });
       setMessage(`could not read the Trash: ${messageOf(error)}`);
     }
   }, [readTrash]);
@@ -812,7 +879,7 @@ export function App({
     if (emptyStarted.current) return;
     emptyStarted.current = true;
 
-    setPhase({ kind: 'emptying' });
+    setMode({ kind: 'emptying' });
     try {
       const result = await onEmptyTrash();
       let after: TrashSummary | undefined;
@@ -823,15 +890,23 @@ export function App({
       }
       if (!mounted.current) return;
       if (result.ok) trashEmptiedRef.current = true;
-      setPhase({ kind: 'trash-result', ok: result.ok, detail: result.detail, summary: after });
+      setMode({ kind: 'trash-result', ok: result.ok, detail: result.detail, summary: after });
       void refreshDisk();
     } catch (error) {
       if (!mounted.current) return;
-      setPhase({ kind: 'trash-result', ok: false, detail: messageOf(error), summary: undefined });
+      setMode({ kind: 'trash-result', ok: false, detail: messageOf(error), summary: undefined });
     } finally {
       emptyStarted.current = false;
     }
   }, [onEmptyTrash, readTrash, refreshDisk]);
+
+  const openTriage = useCallback(() => {
+    setCursorId(
+      firstReclaimableId(rows, selectionRef.current) ?? firstSelectableId(rows),
+    );
+    setMode({ kind: 'triage' });
+    setMessage(undefined);
+  }, [rows]);
 
   useInput(
     (input, key) => {
@@ -839,20 +914,26 @@ export function App({
       // keyboard is dead. `q` is the key that proves why — let through mid-clean it reports
       // "nothing was cleaned" to the CLI while `onClean` is still working, so the invariant-8
       // disclosure is skipped entirely and the user is never told what is in their Trash.
-      // `phase` is React state, and state does not commit within the tick that scheduled it.
+      // `mode` is React state, and state does not commit within the tick that scheduled it.
       // Two keys delivered in one read — a double-tap, a held key, a terminal batching two
       // events — both reach the handler closure from the render BEFORE the clean started, so
       // this test still sees `confirm` and lets the second key through. The `cleanStarted`
       // ref is set synchronously inside `runClean`, so it is the only thing that is already
-      // true by then; the phase test stays because the ref is cleared when a round ends and
-      // the phase covers `emptying` too.
-      if (phase.kind === 'cleaning' || phase.kind === 'emptying' || cleanStarted.current) return;
+      // true by then; the mode test stays because the ref is cleared when a round ends and
+      // the mode covers `emptying` too.
+      if (mode.kind === 'cleaning' || mode.kind === 'emptying' || cleanStarted.current) return;
+
+      // Splash waits; no keys advance it (q still quits).
+      if (mode.kind === 'splash') {
+        if (input === 'q' || (key.ctrl && input === 'c')) quit();
+        return;
+      }
 
       // Mid-screen, the keyboard is as inert as it is mid-clean — no key may advance to the
-      // question, and none may reach the list underneath and change what is being screened.
+      // question, and none may reach the workspace underneath and change what is being screened.
       // The exception is leaving: nothing has been touched yet, so `q` reports the truth and
       // `esc` abandons a check whose result is then dropped by the run counter.
-      if (phase.kind === 'screening' || phase.kind === 'trash-check') {
+      if (mode.kind === 'screening' || mode.kind === 'trash-reading') {
         if (input === 'q' || (key.ctrl && input === 'c')) {
           screenRun.current += 1;
           trashRun.current += 1;
@@ -860,7 +941,7 @@ export function App({
         } else if (key.escape) {
           screenRun.current += 1;
           trashRun.current += 1;
-          setPhase({ kind: 'list' });
+          setMode({ kind: returnToRef.current });
         }
         return;
       }
@@ -870,21 +951,21 @@ export function App({
        * spelling a word, letters are text, and a `q` that quit the application mid-word would
        * be indistinguishable from a typo. Ctrl-C still leaves, because it always does.
        */
-      if (phase.kind === 'trash-confirm') {
+      if (mode.kind === 'trash-confirm') {
         if (key.ctrl && input === 'c') {
           quit();
         } else if (key.escape) {
-          setPhase({ kind: 'list' });
+          setMode({ kind: returnToRef.current });
         } else if (key.backspace || key.delete) {
-          setPhase({ ...phase, typed: phase.typed.slice(0, -1) });
+          setMode({ ...mode, typed: mode.typed.slice(0, -1) });
         } else if (key.return) {
           // Exact equality, never a prefix, and only when a total was actually disclosed:
           // an empty offered without a figure is an offer the user cannot evaluate.
-          if (trashConfirmArmed(phase.summary, phase.typed)) void runEmptyTrash();
+          if (trashConfirmArmed(mode.summary, mode.typed)) void runEmptyTrash();
         } else if (/^[a-z]+$/i.test(input)) {
-          setPhase({
-            ...phase,
-            typed: (phase.typed + input.toLowerCase()).slice(0, EMPTY_TRASH_WORD.length),
+          setMode({
+            ...mode,
+            typed: (mode.typed + input.toLowerCase()).slice(0, EMPTY_TRASH_WORD.length),
           });
         }
         return;
@@ -895,36 +976,77 @@ export function App({
         return;
       }
 
-      if (phase.kind === 'confirm') {
-        if (key.escape) setPhase({ kind: 'list' });
+      if (mode.kind === 'confirm') {
+        if (key.escape) setMode({ kind: returnToRef.current });
         // Nothing deletable survived the screen, so there is nothing to say yes to: `enter`
         // would otherwise run a clean of zero targets and report "nothing was selected" to a
         // user who selected plenty and was refused all of it.
-        else if (key.return && phase.snapshot.targets.length > 0) void runClean(phase.snapshot);
+        else if (key.return && mode.snapshot.targets.length > 0) void runClean(mode.snapshot);
         return;
       }
 
       /**
-       * The round summary, and the one screen in this application where `enter` does nothing.
+       * Done / trash-result: the one place `enter` does nothing.
        *
        * `enter` is the commit key: it opens the confirmation and it spends consent. A held
        * `enter` — and the confirmation dialog is exactly where people hold keys — would
-       * otherwise chain *dismiss → list → enter → screening → confirm → enter* and run a
-       * second round nobody asked for. The screen that sits between two rounds therefore
-       * refuses the key that starts them.
+       * otherwise chain *dismiss → home → enter → screening → confirm → enter* and run a
+       * second round nobody asked for. Dismissal is `esc` → Home (or the prior workspace for
+       * trash-result).
        */
-      if (phase.kind === 'result' || phase.kind === 'trash-result') {
+      if (mode.kind === 'done' || mode.kind === 'trash-result') {
         if (key.escape || input === ' ') {
-          setPhase({ kind: 'list' });
+          setMode({ kind: mode.kind === 'done' ? 'home' : returnToRef.current });
           setMessage(undefined);
-        } else if (input === 't' && phase.kind === 'result' && canEmptyTrash) {
+        } else if (input === 't' && mode.kind === 'done' && canEmptyTrash) {
+          returnToRef.current = 'home';
           void beginTrash();
         }
         return;
       }
 
+      if (mode.kind === 'detail') {
+        if (key.escape) setMode({ kind: 'triage' });
+        return;
+      }
+
+      if (mode.kind === 'home') {
+        setMessage(undefined);
+        if (input === 'b') {
+          openTriage();
+        } else if (input === 'p') {
+          setPreset(cyclePreset);
+        } else if (input === 't') {
+          if (canEmptyTrash) {
+            returnToRef.current = 'home';
+            void beginTrash();
+          } else setMessage('Emptying the Trash is not available here');
+        } else if (key.return) {
+          if (recommendedCount === 0 || recommendedTargets.length === 0) {
+            // Never open Confirm of zero under a celebratory number.
+            return;
+          }
+          returnToRef.current = 'home';
+          void beginScreening({
+            rows: recommendedChosen,
+            targets: recommendedTargets,
+            bytes: recommendedBytes,
+          });
+        }
+        return;
+      }
+
+      // Triage
       setMessage(undefined);
 
+      if (key.escape) {
+        setMode({ kind: 'home' });
+        return;
+      }
+      if (input === 'd') {
+        setMode({ kind: 'detail' });
+        return;
+      }
       if (key.upArrow || input === 'k') {
         setCursorId((current) => moveCursor(rows, current, -1));
       } else if (key.downArrow || input === 'j') {
@@ -940,13 +1062,18 @@ export function App({
       } else if (input === 'p') {
         setPreset(cyclePreset);
       } else if (input === 't') {
-        if (canEmptyTrash) void beginTrash();
-        else setMessage('Emptying the Trash is not available here');
+        if (canEmptyTrash) {
+          returnToRef.current = 'triage';
+          void beginTrash();
+        } else setMessage('Emptying the Trash is not available here');
       } else if (key.return) {
         if (targets.length === 0) setMessage('Nothing selected');
         // A *new* snapshot, every time. Nothing is carried over from a previous round: the
         // rows, the targets and the total are read fresh and screened fresh.
-        else void beginScreening({ rows: chosen, targets, bytes: totalBytes });
+        else {
+          returnToRef.current = 'triage';
+          void beginScreening({ rows: chosen, targets, bytes: totalBytes });
+        }
       }
     },
     { isActive: isRawModeSupported },
@@ -956,8 +1083,40 @@ export function App({
   // warning that wraps mid-clause is a warning people skim.
   const paneWidth = Math.min(columns - 4, 72);
 
-  if (phase.kind === 'screening') {
-    const { candidate, provisional } = phase;
+  if (mode.kind === 'splash') {
+    return (
+      <Splash
+        width={columns}
+        height={frameRows}
+        scanning={scanning}
+        rootsLabel={rootsLabel}
+        projects={session.projects.length}
+        caches={session.caches.length}
+        bytes={foundBytes}
+      />
+    );
+  }
+
+  if (mode.kind === 'home') {
+    return (
+      <Home
+        width={columns}
+        height={frameRows}
+        rootsLabel={rootsLabel}
+        scanning={scanning}
+        recommendedCount={recommendedCount}
+        recommendedBytes={recommendedBytes}
+        dormantCount={dormantCount}
+        activeCount={activeCount}
+        cacheCount={cacheCount}
+        disk={disk}
+        session={sessionSummary(session)}
+      />
+    );
+  }
+
+  if (mode.kind === 'screening') {
+    const { candidate, provisional } = mode;
     const checking = candidate.targets.length;
     return (
       <Box flexDirection="column" paddingX={1}>
@@ -971,13 +1130,13 @@ export function App({
         {provisional.length > 0 ? (
           <Text color="red">{`${provisional.length} blocked so far`}</Text>
         ) : null}
-        <Text dimColor>esc cancel · q quit</Text>
+        <Text dimColor>{hintsFor('screening')}</Text>
       </Box>
     );
   }
 
-  if (phase.kind === 'confirm') {
-    const { snapshot } = phase;
+  if (mode.kind === 'confirm') {
+    const { snapshot } = mode;
     // Rows the scan turned up after the question was asked. They stay in the background
     // list and are offered on the next pass; what they must not do is join this run
     // unannounced. Counting them is the difference between "not included" and "hidden".
@@ -1009,8 +1168,8 @@ export function App({
     );
   }
 
-  if (phase.kind === 'cleaning') {
-    const { snapshot } = phase;
+  if (mode.kind === 'cleaning') {
+    const { snapshot } = mode;
     const cleaningCount = snapshot.targets.length;
     // The one screen with the terminal to itself and a user who has nothing to do but wait, so
     // it is the one screen that can afford the tall wordmark — and the one that should have it,
@@ -1036,27 +1195,31 @@ export function App({
     );
   }
 
-  if (phase.kind === 'result') {
-    return <RoundSummary report={phase.report} width={paneWidth} canEmptyTrash={canEmptyTrash} />;
+  if (mode.kind === 'done') {
+    return (
+      <Box flexDirection="column">
+        <RoundSummary report={mode.report} width={paneWidth} canEmptyTrash={canEmptyTrash} />
+      </Box>
+    );
   }
 
-  if (phase.kind === 'trash-check') {
+  if (mode.kind === 'trash-reading') {
     return (
       <Box flexDirection="column" paddingX={1}>
         <Text bold color="cyan">
           Reading the Trash…
         </Text>
         <Text dimColor>measuring everything in it, so you can see what emptying would destroy</Text>
-        <Text dimColor>esc cancel · q quit</Text>
+        <Text dimColor>{hintsFor('screening')}</Text>
       </Box>
     );
   }
 
-  if (phase.kind === 'trash-confirm') {
-    return <TrashConfirm summary={phase.summary} typed={phase.typed} width={paneWidth} />;
+  if (mode.kind === 'trash-confirm') {
+    return <TrashConfirm summary={mode.summary} typed={mode.typed} width={paneWidth} />;
   }
 
-  if (phase.kind === 'emptying') {
+  if (mode.kind === 'emptying') {
     return (
       <Box flexDirection="column" paddingX={1}>
         <Text bold color="red">
@@ -1067,13 +1230,34 @@ export function App({
     );
   }
 
-  if (phase.kind === 'trash-result') {
+  if (mode.kind === 'trash-result') {
     return (
-      <TrashResult ok={phase.ok} detail={phase.detail} summary={phase.summary} width={paneWidth} />
+      <TrashResult ok={mode.ok} detail={mode.detail} summary={mode.summary} width={paneWidth} />
     );
   }
 
-  const foundBytes = rows.reduce((sum, row) => (row.kind === 'header' ? sum + row.bytes : sum), 0);
+  if (mode.kind === 'detail') {
+    return (
+      <Box flexDirection="column">
+        <Box borderStyle="round" flexDirection="column" paddingX={1} width={columns}>
+          <Detail
+            row={currentRow}
+            categories={categories}
+            width={Math.max(0, columns - 4)}
+            height={Math.max(1, frameRows - PANE_BORDER_HEIGHT - FOOTER_HEIGHT)}
+          />
+        </Box>
+        <Footer
+          hints={hintsFor('detail')}
+          session={sessionSummary(session)}
+          message={message}
+          width={columns}
+        />
+      </Box>
+    );
+  }
+
+  // Triage: full-width list + focused-row status line + contextual footer. No Detail sibling.
   const selectable = rows.reduce((sum, row) => (row.kind === 'header' ? sum : sum + 1), 0);
 
   /**
@@ -1109,6 +1293,7 @@ export function App({
    */
   const presetText = `  preset ${preset}`;
   const showPreset = columns - 2 >= WORDMARK.length + presetText.length + MIN_SCAN_WIDTH + 2;
+  const focusedStatus = statusLine(currentRow, categories, Math.max(0, columns - 2));
 
   return (
     <Box flexDirection="column">
@@ -1150,37 +1335,34 @@ export function App({
           />
         ) : null}
       </Box>
-      <Box>
-        <Box borderStyle="round" flexDirection="column" paddingX={1} width={listWidth}>
-          <List
-            rows={rows}
-            cursorId={cursorId}
-            selection={selection}
-            width={listWidth - 4}
-            view={view}
-            // Without this the network/offline pair — 2 of the 6 chip kinds — can never
-            // appear in the list, the surface they were built for. `chipsOf` drops them
-            // when `categories` is undefined, because "needs network" is false under a
-            // preset that does not clean node_modules and a chip that guesses is worse
-            // than no chip. The value was already computed and already handed to Detail.
-            categories={categories}
-          />
-        </Box>
-        {/* Narrow terminals get the list at full width rather than two squeezed panes.
-            A detail pane below ~28 columns wraps every line it holds, which costs more
-            rows than the information is worth. */}
-        {twoPane ? (
-          <Box borderStyle="round" flexDirection="column" paddingX={1} width={detailWidth}>
-            <Detail
-              row={currentRow}
-              categories={categories}
-              width={detailWidth - 4}
-              height={listHeight + SCROLL_HINT_HEIGHT}
-            />
-          </Box>
-        ) : null}
+      <Box borderStyle="round" flexDirection="column" paddingX={1} width={listWidth}>
+        <List
+          rows={rows}
+          cursorId={cursorId}
+          selection={selection}
+          width={Math.max(0, listWidth - 4)}
+          view={view}
+          // Without this the network/offline pair — 2 of the 6 chip kinds — can never
+          // appear in the list, the surface they were built for. `chipsOf` drops them
+          // when `categories` is undefined, because "needs network" is false under a
+          // preset that does not clean node_modules and a chip that guesses is worse
+          // than no chip.
+          categories={categories}
+        />
       </Box>
-      <Footer hints={hintsFor('triage')} session={sessionSummary(session)} message={message} width={columns} />
+      {showStatusLine ? (
+        <Box paddingX={1}>
+          <Text dimColor wrap="truncate-end">
+            {focusedStatus.length > 0 ? focusedStatus : ' '}
+          </Text>
+        </Box>
+      ) : null}
+      <Footer
+        hints={hintsFor('triage')}
+        session={sessionSummary(session)}
+        message={message}
+        width={columns}
+      />
     </Box>
   );
 }

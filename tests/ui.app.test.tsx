@@ -27,10 +27,11 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { App, frameBudget, runApp, type ExitSummary } from '../src/ui/App.js';
 import { LOGO_TEXT, WORDMARK, bigText } from '../src/ui/Banner.js';
-import { KEY_HINTS } from '../src/ui/Footer.js';
+import { KEY_HINTS, hintsFor } from '../src/ui/Footer.js';
 import { ScanStatus, SPINNER_FRAMES } from '../src/ui/ScanStatus.js';
 import { CURSOR, MARK_OFF, MARK_ON, formatBytes } from '../src/ui/format.js';
 import { LABEL_HELP } from '../src/ui/labels.js';
+import { SPLASH_MIN_DWELL_MS, SPLASH_PURPOSE } from '../src/ui/Splash.js';
 import type { ScanEvent } from '../src/scan.js';
 import type { Screening, ScreeningTier } from '../src/clean.js';
 import type { DiskUsage } from '../src/ui/diskbar.js';
@@ -375,6 +376,11 @@ function mount(
     /** Successive Trash readings, likewise — before the empty, and after it. */
     trash?: TrashSummary[];
     emptyTrash?: () => Promise<EmptyTrashResult>;
+    /**
+     * Where the harness settles after Splash. Default `triage` keeps legacy list tests
+     * working; session-mode tests that assert Home pass `home`.
+     */
+    land?: 'home' | 'triage';
   } = {},
 ): Harness {
   const cleaned: CleanTarget[][] = [];
@@ -463,6 +469,83 @@ function mount(
 
   const frame = (): string => instance.lastFrame() ?? '';
 
+  const land = overrides.land ?? 'triage';
+  let landed = false;
+
+  /**
+   * Splash → Home (min dwell), then optionally Triage. Most suite tests assume a list;
+   * session-mode tests pass `land: 'home'` and navigate themselves.
+   *
+   * Does **not** dismiss Done — waiting for "Moved … to the Trash" must not ESCAPE away.
+   * Re-opens Triage from Home only.
+   */
+  async function ensureLanded(timeout = RENDER_TIMEOUT): Promise<void> {
+    const budget = Math.max(timeout, SPLASH_MIN_DWELL_MS + 800);
+    const isModal = (shown: string): boolean =>
+      shown.includes('Move to Trash?') ||
+      shown.includes('Empty the Trash?') ||
+      shown.includes('Checking what can be trashed') ||
+      shown.includes('Trash emptied') ||
+      shown.includes('Reading the Trash') ||
+      shown.includes('type empty') ||
+      shown.includes('clean failed:') ||
+      shown.includes('moving to the Trash') ||
+      shown.includes('esc back'); // detail mode
+
+    const isDone = (shown: string): boolean =>
+      /\bMoved\b/.test(shown) ||
+      (shown.includes('esc home') && !shown.includes('space toggle') && !shown.includes('b browse'));
+
+    await vi.waitFor(
+      () => {
+        const shown = frame();
+        expect(
+          shown.includes('b browse') ||
+            shown.includes('space toggle') ||
+            isDone(shown) ||
+            isModal(shown),
+        ).toBe(true);
+      },
+      { timeout: budget, interval: 20 },
+    );
+
+    if (land !== 'triage') return;
+    if (isModal(frame()) || isDone(frame())) return;
+    if (frame().includes('space toggle')) return;
+
+    if (frame().includes('b browse')) {
+      await settle();
+      instance.stdin.write('b');
+      await delay(100);
+      await vi.waitFor(() => expect(frame()).toContain('space toggle'), {
+        timeout: budget,
+        interval: 20,
+      });
+    }
+  }
+
+  async function reopenTriageFromHomeOrDone(timeout = RENDER_TIMEOUT): Promise<void> {
+    const budget = Math.max(timeout, SPLASH_MIN_DWELL_MS + 800);
+    if (frame().includes('space toggle')) return;
+    if (/\bMoved\b/.test(frame()) || frame().includes('esc home')) {
+      instance.stdin.write(ESCAPE);
+      await delay(100);
+      await vi.waitFor(() => expect(frame()).toContain('b browse'), {
+        timeout: budget,
+        interval: 20,
+      });
+    }
+    if (frame().includes('b browse') && !frame().includes('space toggle')) {
+      await settle();
+      instance.stdin.write('b');
+      await delay(100);
+      await vi.waitFor(() => expect(frame()).toContain('space toggle'), {
+        timeout: budget,
+        interval: 20,
+      });
+    }
+  }
+
   /**
    * The list row for `match`. Both panes share every physical line of the frame, so a name
    * can appear twice — once in the list, once in the detail pane. The row is the one
@@ -495,18 +578,52 @@ function mount(
       return frame().split('\n');
     },
     async press(data: string): Promise<void> {
+      await ensureLanded();
+      const shown = frame();
+      const onDone =
+        /\bMoved\b/.test(shown) ||
+        (shown.includes('esc home') && !shown.includes('space toggle') && !shown.includes('b browse'));
+      const onModal =
+        shown.includes('Move to Trash?') ||
+        shown.includes('Empty the Trash?') ||
+        shown.includes('Checking what can be trashed') ||
+        shown.includes('Trash emptied') ||
+        shown.includes('Reading the Trash') ||
+        shown.includes('type empty') ||
+        shown.includes('clean failed:') ||
+        shown.includes('moving to the Trash') ||
+        shown.includes('esc back');
+      // Never auto-dismiss Done/Confirm — ENTER on Done must stay inert.
+      if (land === 'triage' && !onDone && !onModal && !shown.includes('space toggle')) {
+        await reopenTriageFromHomeOrDone();
+      }
+      // Confirm/Done paints before useInput re-subscribes; wait one tick so ENTER commits.
+      if (shown.includes('Move to Trash?') || onDone) await settle();
       instance.stdin.write(data);
-      // A flat settle, deliberately. Waiting for the frame to CHANGE was tried and is the
-      // wrong trade: keys that legitimately repaint nothing — `q`, anything ignored by a
-      // phase guard — then pay the full ceiling, and the suite went from 15s to 243s.
-      //
-      // 20ms was too tight and produced CI-only flakes; 60ms is the margin without the cost.
-      // Where a test genuinely depends on a commit having landed, it says so explicitly with
-      // `waitForText` rather than trusting this number — which is the honest way to express
-      // "wait until the interface actually shows X" in any case.
       await delay(60);
     },
     async waitForText(text: string, timeout = RENDER_TIMEOUT): Promise<void> {
+      if (text === SPLASH_PURPOSE) {
+        await vi.waitFor(() => expect(frame()).toContain(text), { timeout, interval: 10 });
+        return;
+      }
+      if (text.startsWith('b browse')) {
+        await vi.waitFor(() => expect(frame()).toContain(text), {
+          timeout: Math.max(timeout, SPLASH_MIN_DWELL_MS + 800),
+          interval: 20,
+        });
+        return;
+      }
+      await ensureLanded(timeout);
+      const wantsList =
+        land === 'triage' &&
+        text !== 'Move to Trash?' &&
+        !text.includes('Trash') &&
+        !text.startsWith('Moved') &&
+        !text.includes('to the Trash') &&
+        !text.includes('clean failed') &&
+        !text.includes('Checking');
+      if (wantsList) await reopenTriageFromHomeOrDone(timeout);
       await vi.waitFor(() => expect(frame()).toContain(text), { timeout, interval: 10 });
     },
   };
@@ -519,6 +636,134 @@ afterEach(() => {
   for (const instance of inkRendered.splice(0)) instance.unmount();
 });
 
+/** Wait until Splash has handed off to Home (min dwell + recommended/rows/scan-done). */
+async function waitForHome(ui: Harness, timeout = RENDER_TIMEOUT): Promise<void> {
+  await ui.waitForText('b browse', Math.max(timeout, SPLASH_MIN_DWELL_MS + 500));
+}
+
+/** Home → Triage (full-width list). */
+async function enterTriage(ui: Harness): Promise<void> {
+  await waitForHome(ui);
+  await ui.press('b');
+  await ui.waitForText('space toggle');
+}
+
+describe('session modes', () => {
+  const detailHelp = LABEL_HELP.recency.slice(0, 40);
+  const homeLand = { land: 'home' as const };
+
+  it('shows splash then home, and enter opens confirm for recommended', async () => {
+    const ui = mount(
+      fastStream([
+        projectEvent(makeProject('alpha', 'dormant', [artifact('dist', 'build', 5 * GB)])),
+      ]),
+      { screen: {}, ...homeLand },
+    );
+
+    await vi.waitFor(() => expect(ui.frame()).toContain(SPLASH_PURPOSE), {
+      timeout: RENDER_TIMEOUT,
+      interval: 10,
+    });
+
+    await waitForHome(ui);
+    expect(ui.frame()).toContain('enter');
+    expect(ui.frame()).toContain('recommended');
+    expect(ui.frame()).toContain('b browse');
+
+    await ui.press(ENTER);
+    await ui.waitForText('Move to Trash?');
+    expect(ui.cleaned).toHaveLength(0);
+  });
+
+  it('b opens triage without a detail pane', async () => {
+    const ui = mount(
+      fastStream([
+        projectEvent(makeProject('alpha', 'dormant', [artifact('dist', 'build', 5 * GB)])),
+      ]),
+      homeLand,
+    );
+
+    await enterTriage(ui);
+    await ui.waitForText('alpha');
+    expect(ui.frame()).toContain('space toggle');
+    expect(ui.frame()).not.toContain(detailHelp);
+    // Full-width triage: no side-by-side pane seam.
+    expect(ui.frame()).not.toMatch(/││/);
+  });
+
+  it('d opens detail and esc returns to triage', async () => {
+    const ui = mount(
+      fastStream([
+        projectEvent(makeProject('alpha', 'dormant', [artifact('dist', 'build', 5 * GB)])),
+      ]),
+      { width: 100, height: 40, ...homeLand },
+    );
+
+    await enterTriage(ui);
+    await ui.waitForText('alpha');
+    expect(ui.frame()).not.toContain(detailHelp);
+
+    await ui.press('d');
+    await vi.waitFor(() => expect(ui.frame()).toContain(detailHelp), {
+      timeout: RENDER_TIMEOUT,
+      interval: 10,
+    });
+    expect(ui.frame()).toContain(hintsFor('detail').slice(0, 8));
+
+    await ui.press(ESCAPE);
+    await ui.waitForText('space toggle');
+    expect(ui.frame()).not.toContain(detailHelp);
+    expect(ui.frame()).toContain('alpha');
+  });
+
+  it('ignores home enter when nothing is recommended', async () => {
+    const ui = mount(
+      fastStream([
+        projectEvent(makeProject('busy', 'active', [artifact('dist', 'build', GB)])),
+      ]),
+      { screen: {}, ...homeLand },
+    );
+
+    await waitForHome(ui);
+    expect(ui.frame()).toContain('nothing recommended');
+    await ui.press(ENTER);
+    await settle();
+    expect(ui.frame()).not.toContain('Move to Trash?');
+    expect(ui.frame()).not.toContain('Checking what can be trashed');
+    expect(ui.screened).toHaveLength(0);
+  });
+
+  it('triage esc returns home; done esc returns home and q quits', async () => {
+    const ui = mount(
+      fastStream([
+        projectEvent(makeProject('alpha', 'dormant', [artifact('dist', 'build', 5 * GB)])),
+      ]),
+      { screen: {}, ...homeLand },
+    );
+
+    await enterTriage(ui);
+    await ui.waitForText('alpha');
+    await ui.press(ESCAPE);
+    await waitForHome(ui);
+
+    await ui.press(ENTER);
+    await ui.waitForText('Move to Trash?');
+    await ui.press(ENTER);
+    await ui.waitForText('Moved');
+    expect(ui.frame()).toMatch(/esc home|esc back/);
+
+    await ui.press(ESCAPE);
+    await waitForHome(ui);
+
+    await ui.press('q');
+    await vi.waitFor(() => expect(ui.exits).toHaveLength(1), {
+      timeout: RENDER_TIMEOUT,
+      interval: 10,
+    });
+    expect(ui.exits[0]?.cleaned).toBe(true);
+  });
+});
+
 describe('progressive rendering', () => {
   it('paints the first project long before the scan finishes', async () => {
     const held = gate();
@@ -526,8 +771,8 @@ describe('progressive rendering', () => {
       slowStream([projectEvent(makeProject('tinysync', 'dormant', [artifact('target', 'build', 67 * GB)]))], held),
     );
 
-    // The stream will not reach `done` for three seconds; one second is the budget.
-    await ui.waitForText('tinysync', 1_000);
+    // Splash dwell + triage handoff, then the project — still well under the stream's 3s stall.
+    await ui.waitForText('tinysync', Math.max(RENDER_TIMEOUT, SPLASH_MIN_DWELL_MS + 1_200));
     expect(ui.frame()).toContain('67.0G');
     expect(ui.frame()).toContain('scanning');
   });
@@ -696,6 +941,8 @@ describe('selection', () => {
     const ui = mount(stream());
     await ui.waitForText('big-dormant');
 
+    await ui.press('d');
+    await ui.waitForText(LABEL_HELP.recency.slice(0, 24));
     expect(ui.frame()).toContain('dormant');
     expect(ui.frame()).toContain('target');
     expect(ui.frame()).toContain('main');
@@ -1626,6 +1873,7 @@ describe('the confirmation is screened before it is asked', () => {
     expect(ui.frame()).toContain('3.0G across 1 directory');
     expect(ui.frame()).toContain('1 more found while confirming');
 
+    await settle();
     await ui.press(ENTER);
     await vi.waitFor(() => expect(ui.cleaned).toHaveLength(1), { timeout: RENDER_TIMEOUT, interval: 10 });
     expect(targetPaths(ui.cleaned[0] ?? [])).toEqual(['/dev/shown/dist']);
@@ -1891,12 +2139,13 @@ describe('the chips reach the screen', () => {
       hasUncommittedChanges: true,
       isWorktree: true,
     });
+    // Narrow triage: chip sacrifice still applies when the full-width pane is tight.
     const ui = mount(
       fastStream([
         projectEvent(held),
         projectEvent(makeProject('quiet', 'dormant', [artifact('dist', 'build', 5 * GB)])),
       ]),
-      { width: 100, height: 24 },
+      { width: 56, height: 24 },
     );
     await ui.waitForText('scan complete');
 
@@ -1911,15 +2160,19 @@ describe('the chips reach the screen', () => {
       isWorktree: true,
     });
     // A tall terminal: the pane's height cut is a separate guarantee, tested on its own below.
-    const ui = mount(fastStream([projectEvent(held)]), { width: 100, height: 56 });
+    const ui = mount(fastStream([projectEvent(held)]), { width: 56, height: 56 });
     await ui.waitForText('scan complete');
     await settle();
 
-    // The row said `uncommitted` and nothing else…
-    expect(rowText(ui.line('held')).trim()).toMatch(/uncommitted\s+9\.0G$/);
+    // The narrow row leads with `uncommitted` (chip sacrifice may keep worktree too).
+    expect(rowText(ui.line('held'))).toContain('uncommitted');
+    expect(rowText(ui.line('held'))).toContain('9.0G');
 
-    // …the pane says all four, each with its sentence.
-    const detail = detailText(ui.frame());
+    await ui.press('d');
+    await ui.waitForText(LABEL_HELP.worktree.slice(0, 20));
+
+    // …the detail mode says all four, each with its sentence.
+    const detail = flat(ui.frame());
     for (const phrase of [
       'uncommitted changes',
       'committed 8mo ago',
@@ -1928,8 +2181,8 @@ describe('the chips reach the screen', () => {
     ]) {
       expect(detail, phrase).toContain(phrase);
     }
-    expect(detail).toContain(flat(LABEL_HELP.worktree));
-    expect(detail).toContain(flat(LABEL_HELP.offline));
+    expect(detail).toContain(flat(LABEL_HELP.worktree).slice(0, 40));
+    expect(detail).toContain(flat(LABEL_HELP.offline).slice(0, 40));
   });
 
   it('costs the frame no line at any width, however many chips a row has', async () => {
@@ -1958,6 +2211,7 @@ describe('the chips reach the screen', () => {
       // The pinned chrome, top and bottom, is still on the frame.
       expect(ui.frame()).toContain('dev-cleaner');
       expect(ui.frame()).toContain('space toggle');
+      ui.instance.unmount();
     }
   });
 });
@@ -2013,8 +2267,8 @@ describe('the session survives a clean', () => {
 
     await ui.press(ESCAPE);
 
-    // Home again — and `alpha` is not offered a second time.
-    expect(ui.frame()).toContain('space toggle');
+    // Triage again — and `alpha` is not offered a second time.
+    await ui.waitForText('space toggle');
     expect(ui.frame()).not.toContain('alpha');
     expect(ui.frame()).toContain('beta');
     expect(ui.frame()).toContain('gamma');
@@ -2044,6 +2298,8 @@ describe('the session survives a clean', () => {
       ['/dev/alpha/dist'],
       ['/dev/alpha/dist'],
     ]);
+
+    await ui.waitForText('space toggle');
 
     // Round two: a different selection, taken now, over the list as it stands.
     await ui.press(SPACE); // beta, 5.0G — the cursor fell to the first surviving row
@@ -2106,6 +2362,7 @@ describe('the session survives a clean', () => {
     expect(ui.frame()).toContain('5.0G');
 
     await ui.press(ESCAPE);
+    await ui.waitForText('space toggle');
     expect(ui.frame()).not.toContain('alpha');
     expect(ui.line('beta')).toContain('5.0G');
     expect(ui.line('beta')).toContain(MARK_OFF);
@@ -2238,6 +2495,7 @@ describe('the disk gauge', () => {
     await ui.waitForText('Moved 10.0G to the Trash.');
     await ui.press(ESCAPE);
 
+    await ui.waitForText('space toggle');
     await vi.waitFor(() => expect(ui.frame()).toContain('70.0G used of 100G'), {
       timeout: RENDER_TIMEOUT,
       interval: 10,
@@ -2690,7 +2948,8 @@ describe('the frame leaves the terminal a spare row', () => {
     await ui.press(ESCAPE);
     await settle();
 
-    // Back on the list, with the ledger now in the footer.
+    // Back on triage (via Home), with the ledger now in the footer.
+    await ui.waitForText('space toggle');
     expect(ui.frame()).toContain('trashed this session');
     expect(ui.lines().length, `at ${rows} rows`).toBeLessThanOrEqual(rows - 1);
 
@@ -2710,6 +2969,7 @@ describe('the frame leaves the terminal a spare row', () => {
    */
   it.each([40, 56, 60, 80, 100, 120])('keeps every line inside %i columns', async (columns) => {
     const stdout = new FixedStdout(columns, 24);
+    const stdin = new FixedStdin();
     const instance = inkRender(
       <App
         stream={many(30)}
@@ -2720,7 +2980,7 @@ describe('the frame leaves the terminal a spare row', () => {
       />,
       {
         stdout: stdout as unknown as NodeJS.WriteStream,
-        stdin: new FixedStdin() as unknown as NodeJS.ReadStream,
+        stdin: stdin as unknown as NodeJS.ReadStream,
         debug: true,
         exitOnCtrlC: false,
         patchConsole: false,
@@ -2728,6 +2988,15 @@ describe('the frame leaves the terminal a spare row', () => {
     );
     inkRendered.push(instance);
 
+    await vi.waitFor(() => expect(stdout.lastFrame()).toContain('b browse'), {
+      timeout: Math.max(RENDER_TIMEOUT, SPLASH_MIN_DWELL_MS + 800),
+      interval: 20,
+    });
+    stdin.write('b');
+    await vi.waitFor(() => expect(stdout.lastFrame()).toContain('space toggle'), {
+      timeout: RENDER_TIMEOUT,
+      interval: 20,
+    });
     await vi.waitFor(() => expect(stdout.lastFrame()).toContain('scan complete'), {
       timeout: RENDER_TIMEOUT,
       interval: 10,
@@ -2778,8 +3047,8 @@ describe('the chrome is four lines above the panes and one below', () => {
 
     // Wordmark, gauge, and the two rows of the headline figure. Nothing else.
     expect(top).toBe(4);
-    // Exactly one line under the panes: the key hints. Not two, and not a section note.
-    expect(lines.length - bottom - 1).toBe(1);
+    // Status line under the list, then the key hints.
+    expect(lines.length - bottom - 1).toBe(2);
     expect(lines[lines.length - 1]).toContain('space toggle');
   });
 
@@ -2961,13 +3230,22 @@ describe('the wordmark', () => {
     );
     inkRendered.push(instance);
 
-    await vi.waitFor(() => expect(stdout.lastFrame()).toContain('selected 1'), {
+    await vi.waitFor(() => expect(stdout.lastFrame()).toContain('b browse'), {
+      timeout: Math.max(RENDER_TIMEOUT, SPLASH_MIN_DWELL_MS + 800),
+      interval: 20,
+    });
+    stdin.write('b');
+    await vi.waitFor(() => expect(stdout.lastFrame()).toContain('space toggle'), {
       timeout: RENDER_TIMEOUT,
-      interval: 10,
+      interval: 20,
     });
     await settle();
     stdin.write(ENTER);
-    await delay(30);
+    await vi.waitFor(() => expect(stdout.lastFrame()).toContain('Move to Trash?'), {
+      timeout: RENDER_TIMEOUT,
+      interval: 20,
+    });
+    await settle();
     stdin.write(ENTER);
     await vi.waitFor(() => expect(cleanedOnce).toBe(true), { timeout: RENDER_TIMEOUT, interval: 10 });
 
@@ -3051,6 +3329,7 @@ describe('the command bar', () => {
     await ui.press(ENTER);
     await ui.waitForText('to the Trash.');
     await ui.press(ESCAPE);
+    await ui.waitForText('space toggle');
 
     const bar = ui.lines()[ui.lines().length - 1] ?? '';
     expect(bar).toContain('5.0G trashed this session');

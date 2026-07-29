@@ -314,7 +314,7 @@ export function RoundSummary({
         `esc`, never `enter` — see the module note. The hint has to name the key that works,
         because a user who presses enter here and sees nothing happen will press it again.
       */}
-      <Text dimColor>{fit('esc back to the list · q quit')}</Text>
+      <Text dimColor>{fit('esc home · q quit')}</Text>
     </Box>
   );
 }
