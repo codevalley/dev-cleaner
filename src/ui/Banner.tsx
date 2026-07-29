@@ -135,6 +135,23 @@ export function bigTextWidth(text: string): number {
   return bigText(text)[0].length;
 }
 
+/**
+ * Splash entry title: block face when the terminal is wide enough, stacked words when only
+ * that fits, compact wordmark when nothing else will.
+ */
+export function splashTitle(width: number): { lines: string[]; degraded: boolean } {
+  const [top, bottom] = bigText(LOGO_TEXT);
+  if (top.length <= width) {
+    return { lines: [top, bottom], degraded: false };
+  }
+  const [d0, d1] = bigText('DEV');
+  const [c0, c1] = bigText('CLEANER');
+  if (Math.max(d0.length, c0.length) <= width) {
+    return { lines: [d0, d1, '', c0, c1], degraded: false };
+  }
+  return { lines: [truncateLabel(WORDMARK, Math.max(0, width))], degraded: true };
+}
+
 export interface HeadlineProps {
   /** Bytes the current selection would free. Redrawn on every keystroke that changes it. */
   bytes: number;

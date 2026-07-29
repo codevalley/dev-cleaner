@@ -20,8 +20,8 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { LOGO_TEXT, WORDMARK, bigText, bigTextWidth } from '../src/ui/Banner.js';
-import { formatBytes } from '../src/ui/format.js';
+import { LOGO_TEXT, WORDMARK, bigText, bigTextWidth, splashTitle } from '../src/ui/Banner.js';
+import { formatBytes, truncateLabel } from '../src/ui/format.js';
 
 const GB = 1024 ** 3;
 
@@ -87,5 +87,20 @@ describe('the block face', () => {
 
   it('spells the wordmark in ordinary letters, so it survives a terminal without blocks', () => {
     expect(WORDMARK).toContain('dev-cleaner');
+  });
+});
+
+describe('splashTitle', () => {
+  it('returns the block face when width allows', () => {
+    const [top] = bigText(LOGO_TEXT);
+    const result = splashTitle(top.length + 4);
+    expect(result.degraded).toBe(false);
+    expect(result.lines.join('\n')).toContain(top);
+  });
+
+  it('degrades to WORDMARK when too narrow', () => {
+    const result = splashTitle(10);
+    expect(result.degraded).toBe(true);
+    expect(result.lines).toEqual([truncateLabel(WORDMARK, 10)]);
   });
 });
