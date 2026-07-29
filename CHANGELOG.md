@@ -15,10 +15,30 @@ One extra section type is used, and it is the important one:
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-07-29
+
+Interface work. **Nothing about what the tool deletes has changed** — the artifact table is
+untouched, so no directory is offered that 0.1.x left alone.
+
 ### Changed
 
 - Interactive session is now Splash → Home → Triage → Confirm → Done (lazygit-style
   full-width triage; detail on demand). Same safety model and non-TTY report.
+
+### Added
+
+- A **Home screen** with a single reclaim call-to-action, reached after a brand splash while
+  the scan starts, rather than dropping straight into a list the user has to interpret.
+- A **triage status line** for the focused row, so a row's own facts are readable without
+  moving attention to the detail pane.
+- A **celebration on completing a clean**, scaled to what was freed, returning to Home
+  rather than exiting.
+- Footer hints keyed to the current mode, so the key list reflects the screen you are on.
+
+### Fixed
+
+- Home and Done frame budgets, which could exceed the terminal by one row.
+- Confirmation arrivals now follow the Home vs Triage freeze policy consistently.
 
 ## [0.1.1] — 2026-07-28
 
