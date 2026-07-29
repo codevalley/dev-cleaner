@@ -324,7 +324,7 @@ describe('emptying the Trash is the obvious next thing', () => {
   it('names esc, and not enter, as the way out', () => {
     const frame = show({ reclaimedBytes: 3 * GB });
 
-    expect(frame).toContain('esc back to the list · q quit');
+    expect(frame).toContain('esc home · q quit');
     expect(frame).not.toContain('enter');
   });
 
@@ -357,7 +357,7 @@ describe('it costs nothing to see twice', () => {
     expect(bannerRowsOn(first, '107G')).toBe(BIG_ROWS);
     expect(first).toContain('Moved 107G to the Trash.');
     expect(first).toContain('An enormous round.');
-    expect(first).toContain('esc back to the list');
+    expect(first).toContain('esc home');
   });
 });
 
@@ -378,6 +378,31 @@ describe('it degrades', () => {
       expect(line.length, `"${line}" at ${width} columns`).toBeLessThanOrEqual(width + 2);
     }
     expect(frame).toContain('107G');
+  });
+
+  it.each([12, 16, 20, 24])('fits inside %i rows when height is capped', (height) => {
+    const instance = render(
+      <RoundSummary
+        report={report({
+          reclaimedBytes: 107 * GB,
+          trashed: 41,
+          refused: 3,
+          problems: Array.from({ length: 8 }, (_, i) =>
+            problem(`proj-${i}/target`, GB, 'nested repository'),
+          ),
+          sessionBytes: 133 * GB,
+          rounds: 2,
+        })}
+        width={WIDTH}
+        height={height}
+        canEmptyTrash
+      />,
+    );
+    rendered.push(instance);
+    const frame = strip(instance.lastFrame() ?? '');
+    expect(lines(frame).length, `${height} rows`).toBeLessThanOrEqual(height);
+    expect(frame).toContain('Moved');
+    expect(frame).toContain('esc home');
   });
 
   it('drops the banner rather than wrap it, and keeps the sentence', () => {

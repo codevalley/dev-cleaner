@@ -150,6 +150,11 @@ export interface RoundReport {
 export interface RoundSummaryProps {
   report: RoundReport;
   width: number;
+  /**
+   * Rows this pane may occupy. Optional for unbounded component tests; App always passes
+   * `rows - 1` so Done cannot scroll the terminal the way Confirm used to.
+   */
+  height?: number | undefined;
   /** Whether the Trash can be measured and emptied — governs whether the offer is made. */
   canEmptyTrash: boolean;
 }
@@ -209,12 +214,11 @@ export function sessionLine(report: RoundReport): string | undefined {
 export function RoundSummary({
   report,
   width,
+  height,
   canEmptyTrash,
 }: RoundSummaryProps): React.ReactElement {
-  const listed = report.problems.slice(0, MAX_PROBLEMS);
-  const hidden = report.problems.length - listed.length;
-  const session = sessionLine(report);
   const nothingMoved = report.trashed === 0;
+  const session = sessionLine(report);
 
   /** Every line on this pane is clipped; a summary that wraps is one nobody re-reads. */
   const fit = (text: string): string => truncateLabel(text, width);
@@ -226,9 +230,71 @@ export function RoundSummary({
   const bannerWidth =
     banner === undefined ? 0 : banner.reduce((widest, line) => Math.max(widest, line.length), 0);
 
+  const offerLines = canEmptyTrash
+    ? promptBox(['t empty the Trash — the space is not free until you do'], width)
+    : undefined;
+
+  /**
+   * Height budget, cheapest decoration first to yield — same rule as Confirm.
+   * Core (moved / counts / offer / esc) stays; the block banner and problem list shrink.
+   */
+  const budget = height === undefined ? Number.POSITIVE_INFINITY : Math.max(1, height);
+  const bannerCost =
+    banner === undefined
+      ? 0
+      : 1 + (cheer.rule ? 1 : 0) + banner.length + (cheer.rule ? 1 : 0) + 1;
+
+  let showPhrase = cheer.phrase !== undefined;
+  let showSession = session !== undefined;
+  let boxedOffer = offerLines !== undefined;
+
+  const coreCostOf = (phrase: boolean, sess: boolean, boxed: boolean): number =>
+    1 + // moved
+    (phrase ? 1 : 0) +
+    1 + // counts
+    1 + // spacer before offer
+    (sess ? 2 : 0) +
+    (boxed && offerLines !== undefined ? offerLines.length : 1) +
+    1 + // spacer
+    1; // esc hint
+
+  let showBanner =
+    banner !== undefined &&
+    budget - bannerCost >= coreCostOf(showPhrase, showSession, boxedOffer);
+  let core = coreCostOf(showPhrase, showSession, boxedOffer);
+  while (showBanner && (showBanner ? bannerCost : 0) + core > budget) {
+    showBanner = false;
+  }
+  while (!showBanner && core > budget && showSession) {
+    showSession = false;
+    core = coreCostOf(showPhrase, showSession, boxedOffer);
+  }
+  while (core > budget && showPhrase) {
+    showPhrase = false;
+    core = coreCostOf(showPhrase, showSession, boxedOffer);
+  }
+  while (core > budget && boxedOffer) {
+    boxedOffer = false;
+    core = coreCostOf(showPhrase, showSession, boxedOffer);
+  }
+
+  let room = budget - (showBanner ? bannerCost : 0) - core;
+
+  // Problems: spacer + header + 2 lines each + optional "…and N more".
+  let problemCap = 0;
+  if (report.problems.length > 0 && room >= 4) {
+    const headerCost = 2; // spacer + "Left in place"
+    const perProblem = 2;
+    const maxByRoom = Math.floor((room - headerCost - 1) / perProblem);
+    problemCap = Math.max(0, Math.min(MAX_PROBLEMS, report.problems.length, maxByRoom));
+  }
+  const listed = report.problems.slice(0, problemCap);
+  const hidden = report.problems.length - listed.length;
+  const showProblems = listed.length > 0;
+
   return (
     <Box flexDirection="column" paddingX={1}>
-      {banner === undefined ? null : (
+      {showBanner && banner !== undefined ? (
         <Box flexDirection="column">
           <Text> </Text>
           {cheer.rule ? <Text color="green">{`  ${'━'.repeat(bannerWidth)}`}</Text> : null}
@@ -240,7 +306,7 @@ export function RoundSummary({
           {cheer.rule ? <Text color="green">{`  ${'━'.repeat(bannerWidth)}`}</Text> : null}
           <Text> </Text>
         </Box>
-      )}
+      ) : null}
 
       {/* Indented to two, so the caption sits under the banner it captions. */}
       <Text bold color={nothingMoved ? 'yellow' : 'green'}>
@@ -250,11 +316,11 @@ export function RoundSummary({
             : `  Moved ${formatBytes(report.reclaimedBytes)} to the Trash.`,
         )}
       </Text>
-      {cheer.phrase === undefined ? null : (
+      {showPhrase && cheer.phrase !== undefined ? (
         <Text bold color="green">
           {fit(`  ${cheer.sparks}  ${cheer.phrase}`)}
         </Text>
-      )}
+      ) : null}
       <Text dimColor>
         {fit(
           `  ${plural(report.trashed, 'directory', 'directories')} trashed` +
@@ -263,7 +329,7 @@ export function RoundSummary({
         )}
       </Text>
 
-      {listed.length === 0 ? null : (
+      {showProblems ? (
         <Box flexDirection="column">
           <Text> </Text>
           <Text bold color="red">
@@ -281,30 +347,28 @@ export function RoundSummary({
           ])}
           {hidden > 0 ? <Text dimColor>{fit(`  …and ${hidden} more`)}</Text> : null}
         </Box>
-      )}
+      ) : null}
 
       <Text> </Text>
-      {session === undefined ? null : (
+      {showSession && session !== undefined ? (
         <Box flexDirection="column">
           <Text bold>{fit(`  ${session}`)}</Text>
           <Text> </Text>
         </Box>
-      )}
+      ) : null}
       {/*
         Invariant 8, put where it is acted on. When the Trash can be emptied the disclosure
         rides on the offer itself — one line that says both what the key does and why it is
         the next thing worth doing. When it cannot, the same fact is stated on its own, because
         the fact does not depend on whether this tool happens to be able to act on it.
       */}
-      {canEmptyTrash ? (
+      {boxedOffer && offerLines !== undefined ? (
         <Box flexDirection="column">
-          {promptBox(['t empty the Trash — the space is not free until you do'], width).map(
-            (line, index) => (
-              <Text key={`offer-${index}`} bold color="cyan">
-                {line}
-              </Text>
-            ),
-          )}
+          {offerLines.map((line, index) => (
+            <Text key={`offer-${index}`} bold color="cyan">
+              {line}
+            </Text>
+          ))}
         </Box>
       ) : (
         <Text dimColor>{fit('  Trash still holds the space until you empty it.')}</Text>

@@ -597,8 +597,15 @@ function mount(
       if (land === 'triage' && !onDone && !onModal && !shown.includes('space toggle')) {
         await reopenTriageFromHomeOrDone();
       }
-      // Confirm/Done paints before useInput re-subscribes; wait one tick so ENTER commits.
-      if (shown.includes('Move to Trash?') || onDone) await settle();
+      // Mode paints before useInput re-subscribes; wait one tick so keys hit the new handler.
+      if (
+        shown.includes('b browse') ||
+        shown.includes('Move to Trash?') ||
+        shown.includes('esc back') ||
+        onDone
+      ) {
+        await settle();
+      }
       instance.stdin.write(data);
       await delay(60);
     },
@@ -761,6 +768,49 @@ describe('session modes', () => {
       interval: 10,
     });
     expect(ui.exits[0]?.cleaned).toBe(true);
+  });
+
+  it('home frame fits rows-1 without wrapping the action box', async () => {
+    const rows = 24;
+    const columns = 60;
+    const ui = mount(
+      fastStream([
+        projectEvent(makeProject('alpha', 'dormant', [artifact('dist', 'build', 5 * GB)])),
+      ]),
+      { width: columns, height: rows, ...homeLand },
+    );
+
+    await waitForHome(ui);
+    await settle();
+
+    expect(ui.lines().length).toBeLessThanOrEqual(rows - 1);
+    for (const line of ui.lines()) {
+      expect([...line].length, JSON.stringify(line)).toBeLessThanOrEqual(columns);
+    }
+    // promptBox top border is one physical line (corners not split by wrap).
+    const top = ui.lines().find((line) => line.includes('╭'));
+    expect(top).toBeDefined();
+    expect(top).toContain('╮');
+  });
+
+  it('done frame fits rows-1', async () => {
+    const rows = 24;
+    const ui = mount(
+      fastStream([
+        projectEvent(makeProject('alpha', 'dormant', [artifact('dist', 'build', 50 * GB)])),
+      ]),
+      { screen: {}, width: 80, height: rows, ...homeLand },
+    );
+
+    await waitForHome(ui);
+    await ui.press(ENTER);
+    await ui.waitForText('Move to Trash?');
+    await ui.press(ENTER);
+    await ui.waitForText('Moved');
+    await settle();
+
+    expect(ui.frame()).toContain('Moved');
+    expect(ui.lines().length).toBeLessThanOrEqual(rows - 1);
   });
 });
 

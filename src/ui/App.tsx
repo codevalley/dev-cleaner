@@ -1100,7 +1100,8 @@ export function App({
   if (mode.kind === 'home') {
     return (
       <Home
-        width={columns}
+        // Home owns paddingX={1}; width is the *inner* budget so promptBox corners do not wrap.
+        width={Math.max(0, columns - 2)}
         height={frameRows}
         rootsLabel={rootsLabel}
         scanning={scanning}
@@ -1197,9 +1198,12 @@ export function App({
 
   if (mode.kind === 'done') {
     return (
-      <Box flexDirection="column">
-        <RoundSummary report={mode.report} width={paneWidth} canEmptyTrash={canEmptyTrash} />
-      </Box>
+      <RoundSummary
+        report={mode.report}
+        width={paneWidth}
+        height={frameRows}
+        canEmptyTrash={canEmptyTrash}
+      />
     );
   }
 
