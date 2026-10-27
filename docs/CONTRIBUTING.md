@@ -21,9 +21,9 @@ npm run typecheck    # tsc over src + tests, no emit
 npm run build        # tsc -> dist/
 ```
 
-Both must be clean before anything is merged. The suite is large — 43 files and a little
-under a thousand cases at the time of writing — and the whole of it runs in about
-15 seconds, so there is no reason not to run it.
+All three checks must pass before merging. The suite has over a thousand cases; the
+terminal interaction tests take several minutes because they exercise splash timing and
+keyboard transitions. Use Vitest’s final file/test counts as the current inventory.
 
 Run a single file or a single case while you work:
 

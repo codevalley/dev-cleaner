@@ -1,5 +1,8 @@
 # Brainstorm: TUI UX / presentation
 
+> Historical brainstorming list. Splash, Home, full-width Triage, detail on demand, and
+> contextual hints shipped in 0.2.0. Unchecked boxes below are not a current backlog.
+
 **Problem:** The interactive presentation feels dense and unintuitive. The deeper issue is **UX** (session shape), not only **UI** paint.
 
 **Searched:** `src/ui/*`, `docs/CONTRIBUTING.md` dependency freeze, original two-pane contract in `docs/superpowers/specs/2026-07-25-dev-cleaner-design.md`.

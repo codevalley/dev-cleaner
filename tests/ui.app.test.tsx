@@ -1078,11 +1078,13 @@ describe('selection', () => {
     await ui.waitForText('big-dormant');
 
     await ui.press('d');
-    await ui.waitForText(LABEL_HELP.recency.slice(0, 24));
+    await ui.waitForText('Cleanup candidates');
     expect(ui.frame()).toContain('dormant');
     expect(ui.frame()).toContain('target');
     expect(ui.frame()).toContain('main');
     expect(ui.frame()).toContain('2025-11-27');
+    await ui.press('G');
+    await ui.waitForText(LABEL_HELP.recency.slice(0, 24));
   });
 });
 
@@ -2984,11 +2986,7 @@ describe('connectivity chips reach the list pane', () => {
     // On the ROW, not merely somewhere in the frame. `Detail` renders the same chips and
     // does receive `categories`, so a whole-frame assertion passes even when the list pane
     // is starved of them — which is exactly how the missing prop survived review.
-    // `needs` rather than `needs network`: ink-testing-library lays out against its own
-    // width, so the chip column is narrower than the declared 120 and the text is cut. The
-    // prefix is unambiguous — no other chip begins with it — and what is being tested is
-    // that the pane received a category set at all, not how wide the harness is.
-    expect(ui.line('app')).toContain('needs');
+    expect(ui.line('app')).toContain('downloads needed');
   });
 });
 
@@ -3179,8 +3177,8 @@ describe('the chrome is four lines above the panes and one below', () => {
     // Wordmark, gauge, and the two rows of the headline figure. Nothing else.
     expect(top).toBe(4);
     // Status line under the list, then the key hints.
-    expect(lines.length - bottom - 1).toBe(2);
-    expect(lines[lines.length - 1]).toContain('space toggle');
+    expect(lines.length - bottom - 1).toBe(3);
+    expect(lines[lines.length - 2]).toContain('space toggle');
   });
 
   /**
@@ -3387,9 +3385,8 @@ describe('the wordmark', () => {
 /**
  * The command bar is one line, and it keeps the keys visible whatever else it has to say.
  *
- * It used to be two: hints, and a status line whose contents have all moved somewhere better —
- * the selection total to the headline, the preset to the title line. What is left is the
- * session ledger, and a message when there is one. Both share the line with the hints.
+ * Primary actions occupy the first row. Secondary actions share the second row with
+ * messages and the session ledger. Selection totals and presets remain in the headline.
  *
  * The rule that matters is the one about messages: a user who has just seen `clean failed:` is
  * exactly the user who needs to know which key gets them out, so the right-hand column may
@@ -3399,7 +3396,7 @@ describe('the command bar', () => {
   const stream = (): AsyncIterable<ScanEvent> =>
     fastStream([projectEvent(makeProject('alpha', 'dormant', [artifact('dist', 'build', 5 * GB)]))]);
 
-  it('shows a message and the keybindings on the same single line', async () => {
+  it('shows messages beside secondary actions and preserves the primary actions', async () => {
     const ui = mount(stream(), { width: 100, height: 24 });
     await ui.waitForText('selected 1');
     await settle();
@@ -3418,8 +3415,8 @@ describe('the command bar', () => {
 
     const bar = lines[lines.length - 1] ?? '';
     expect(bar).toContain('Nothing selected');
-    expect(bar).toContain('space toggle');
-    expect(bar).toContain(KEY_HINTS.slice(0, 40));
+    expect(bar).toContain('q quit');
+    expect(lines[lines.length - 2]).toContain(KEY_HINTS);
   });
 
   it('never lets a long message take more than half the bar from the keys', async () => {
@@ -3441,8 +3438,8 @@ describe('the command bar', () => {
     expect([...bar].length).toBeLessThanOrEqual(100);
     // Half the bar is the message's ceiling, so the keys keep the rest — including the one
     // that gets the user out of the state the message is about.
-    expect(bar).toContain('space toggle');
-    expect(bar).toContain(KEY_HINTS.slice(0, 40));
+    expect(bar).toContain('q quit');
+    expect(ui.lines()[ui.lines().length - 2]).toContain(KEY_HINTS);
   });
 
   it('carries the session ledger once a round has completed', async () => {
@@ -3459,6 +3456,7 @@ describe('the command bar', () => {
 
     const bar = ui.lines()[ui.lines().length - 1] ?? '';
     expect(bar).toContain('5.0G trashed this session');
-    expect(bar).toContain('space toggle');
+    expect(bar).toContain('q quit');
+    expect(ui.lines()[ui.lines().length - 2]).toContain(KEY_HINTS);
   });
 });

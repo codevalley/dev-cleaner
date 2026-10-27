@@ -83,7 +83,7 @@ describe('splashReady', () => {
     ).toBe(true);
   });
 
-  it('splashReady stays while scanning with no rows yet', () => {
+  it('opens Home after the brand dwell even before the first project is sized', () => {
     expect(
       splashReady({
         dwellElapsedMs: SPLASH_MIN_DWELL_MS,
@@ -91,7 +91,7 @@ describe('splashReady', () => {
         recommendedBytes: 0,
         hasAnyRow: false,
       }),
-    ).toBe(false);
+    ).toBe(true);
   });
 
   it('uses 1200ms minimum dwell so the pixel title is perceptible', () => {

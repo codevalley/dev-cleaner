@@ -117,6 +117,7 @@ export interface MainDeps {
   storeHasIncomingHardlinks?: (storePath: string) => Promise<boolean>;
   readDiskUsage?: (pathOnVolume: string) => Promise<DiskUsage | undefined>;
   readTrashSummary?: () => Promise<TrashSummary>;
+  readTrashPreview?: () => Promise<TrashSummary>;
   emptyTrash?: () => Promise<EmptyTrashResult>;
 }
 
@@ -636,6 +637,10 @@ async function runInteractive(options: CliOptions, deps: MainDeps, io: CliIO): P
     const empty = deps.emptyTrash ?? (await import('./trash.js')).emptyTrash;
     return empty();
   };
+  const readTrashPreview = deps.readTrashPreview ?? (async (): Promise<TrashSummary> => {
+    const { readTrashSummary } = await import('./trash.js');
+    return readTrashSummary({ allowFinder: false });
+  });
 
   const summary = await runApp({
     stream,
@@ -645,6 +650,7 @@ async function runInteractive(options: CliOptions, deps: MainDeps, io: CliIO): P
     rootsLabel: formatRootsLabel(options.roots),
     readDisk,
     readTrash,
+    readTrashPreview,
     onEmptyTrash: emptyTheTrash,
     /**
      * Without this binding the whole pre-consent screening layer is dead code: `onScreen` is

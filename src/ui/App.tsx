@@ -79,9 +79,11 @@ import { formatBytes } from './format.js';
 import { bigBytes } from './glyphs.js';
 import { Headline, Logo, WORDMARK } from './Banner.js';
 import { Confirm, type BlockedEntry, type ConfirmEntry } from './Confirm.js';
-import { Detail } from './Detail.js';
+import { detailLines } from './Detail.js';
+import { helpLines } from './Help.js';
+import { TextPage, pageOffset } from './TextPage.js';
 import { BAR_LEGEND, Gauge } from './Gauge.js';
-import { Footer, hintsFor } from './Footer.js';
+import { Footer, hintsFor, TRIAGE_MORE_HINTS } from './Footer.js';
 import { Home, clampHomeFocus, defaultHomeFocus, homeActions } from './Home.js';
 import { List, statusLine } from './List.js';
 import { RoundSummary, type ProblemEntry, type RoundReport } from './Round.js';
@@ -185,6 +187,7 @@ export interface AppProps {
    * — are what the empty prompt is required to display. Absent means the offer is not made.
    */
   readTrash?: (() => Promise<TrashSummary>) | undefined;
+  readTrashPreview?: (() => Promise<TrashSummary>) | undefined;
   /** `emptyTrash` from src/trash.ts. Irreversible; reached only through the typed word. */
   onEmptyTrash?: (() => Promise<EmptyTrashResult>) | undefined;
   onExit?: ((summary: ExitSummary) => void) | undefined;
@@ -250,6 +253,7 @@ type Mode =
   | { kind: 'home' }
   | { kind: 'triage' }
   | { kind: 'detail' }
+  | { kind: 'help'; back: 'home' | 'triage' | 'detail' }
   | { kind: 'screening'; candidate: Candidate; provisional: readonly BlockedEntry[] }
   | { kind: 'confirm'; snapshot: ConfirmSnapshot }
   | { kind: 'cleaning'; snapshot: ConfirmSnapshot }
@@ -455,10 +459,11 @@ export function frameBudget(rows: number): {
   statusLine: boolean;
 } {
   const budget = Math.max(0, (Number.isFinite(rows) ? Math.floor(rows) : 0) - RESERVED_ROW);
-  const full = budget - CHROME_HEIGHT >= MIN_LIST_HEIGHT;
-  let chrome = full ? CHROME_HEIGHT : COMPACT_CHROME_HEIGHT;
-  if (budget - chrome < 1) chrome = MINI_CHROME_HEIGHT;
-  const statusLine = chrome > MINI_CHROME_HEIGHT;
+  const extraFooter = rows >= 8 ? 1 : 0;
+  const full = budget - CHROME_HEIGHT - extraFooter >= MIN_LIST_HEIGHT;
+  let chrome = (full ? CHROME_HEIGHT : COMPACT_CHROME_HEIGHT) + extraFooter;
+  if (budget - chrome < 1) chrome = MINI_CHROME_HEIGHT + extraFooter;
+  const statusLine = chrome > MINI_CHROME_HEIGHT + extraFooter;
   return { chrome, listHeight: Math.max(1, budget - chrome), full, statusLine };
 }
 
@@ -523,6 +528,7 @@ export function App({
   onScreen,
   readDisk,
   readTrash,
+  readTrashPreview,
   onEmptyTrash,
   onExit,
   preset: initialPreset,
@@ -565,6 +571,11 @@ export function App({
   const [cursorId, setCursorId] = useState<string | undefined>(undefined);
   const [homeFocus, setHomeFocus] = useState(0);
   const [mode, setMode] = useState<Mode>({ kind: 'splash' });
+  const [detailOffset, setDetailOffset] = useState(0);
+  const [helpOffset, setHelpOffset] = useState(0);
+  const [trashPreview, setTrashPreview] = useState<TrashSummary | undefined>(undefined);
+  const [trashLoading, setTrashLoading] = useState(readTrashPreview !== undefined);
+  const previewRun = useRef(0);
   const [message, setMessage] = useState<string | undefined>(undefined);
   const [disk, setDisk] = useState<DiskUsage | undefined>(undefined);
   const rootsLabel = rootsLabelProp ?? '.';
@@ -772,6 +783,27 @@ export function App({
   const view = windowFor(rows.length, cursorIndex(rows, cursorId), listHeight, viewRef.current);
   viewRef.current = view;
 
+  const pageWidth = Math.max(1, columns - 4);
+  const pageHeight = Math.max(1, frameRows - PANE_BORDER_HEIGHT - FOOTER_HEIGHT);
+  const inspectLines = useMemo(() => detailLines(currentRow, categories, pageWidth), [currentRow, categories, pageWidth]);
+  const helpContent = useMemo(() => helpLines(pageWidth), [pageWidth]);
+  const refreshTrashPreview = useCallback(async (): Promise<void> => {
+    if (readTrashPreview === undefined) return;
+    const run = ++previewRun.current;
+    setTrashLoading(true);
+    try {
+      const summary = await readTrashPreview();
+      if (mounted.current && run === previewRun.current) setTrashPreview(summary);
+    } catch {
+      if (mounted.current && run === previewRun.current) {
+        setTrashPreview({ available: false, bytes: 0, items: 0, source: 'blind' });
+      }
+    } finally {
+      if (mounted.current && run === previewRun.current) setTrashLoading(false);
+    }
+  }, [readTrashPreview]);
+  useEffect(() => { void refreshTrashPreview(); }, [refreshTrashPreview]);
+
   const canEmptyTrash = readTrash !== undefined && onEmptyTrash !== undefined;
 
   const refreshDisk = useCallback(async (): Promise<void> => {
@@ -848,7 +880,9 @@ export function App({
         // The volume did not actually change — the bytes are in the Trash — but the *selection*
         // did, so the projection segment must be redrawn from a fresh reading rather than left
         // describing a set of rows that no longer exists.
+        trashEmptiedRef.current = false;
         void refreshDisk();
+        void refreshTrashPreview();
       } catch (error) {
         setMode({ kind: returnToRef.current });
         setMessage(`clean failed: ${messageOf(error)}`);
@@ -858,7 +892,7 @@ export function App({
         cleanStarted.current = false;
       }
     },
-    [onClean, refreshDisk, writeSelection, writeSession],
+    [onClean, refreshDisk, refreshTrashPreview, writeSelection, writeSession],
   );
 
   /**
@@ -930,6 +964,9 @@ export function App({
     try {
       const summary = await readTrash();
       if (stale()) return;
+      previewRun.current += 1;
+      setTrashPreview(summary);
+      setTrashLoading(false);
       setMode({ kind: 'trash-confirm', summary, typed: '' });
     } catch (error) {
       if (stale()) return;
@@ -962,6 +999,9 @@ export function App({
       }
       if (!mounted.current) return;
       if (result.ok) trashEmptiedRef.current = true;
+      previewRun.current += 1;
+      setTrashPreview(after);
+      setTrashLoading(false);
       setMode({ kind: 'trash-result', ok: result.ok, detail: result.detail, summary: after });
       void refreshDisk();
     } catch (error) {
@@ -1088,8 +1128,23 @@ export function App({
         return;
       }
 
-      if (mode.kind === 'detail') {
-        if (key.escape) setMode({ kind: 'triage' });
+      if (input === '?' && (mode.kind === 'home' || mode.kind === 'triage' || mode.kind === 'detail')) {
+        setHelpOffset(0);
+        setMode({ kind: 'help', back: mode.kind });
+        return;
+      }
+      if (mode.kind === 'detail' || mode.kind === 'help') {
+        if (key.escape || key.leftArrow) {
+          setMode({ kind: mode.kind === 'help' ? mode.back : 'triage' });
+          return;
+        }
+        const length = mode.kind === 'detail' ? inspectLines.length : helpContent.length;
+        const update = mode.kind === 'detail' ? setDetailOffset : setHelpOffset;
+        const step = key.pageDown ? pageHeight - 1 : key.pageUp ? 1 - pageHeight
+          : key.downArrow || input === 'j' ? 1 : key.upArrow || input === 'k' ? -1 : 0;
+        if (input === 'g') update(0);
+        else if (input === 'G') update(pageOffset(length, length, pageHeight));
+        else if (step !== 0) update(current => pageOffset(pageOffset(current, length, pageHeight) + step, length, pageHeight));
         return;
       }
 
@@ -1141,7 +1196,8 @@ export function App({
         setMode({ kind: 'home' });
         return;
       }
-      if (input === 'd') {
+      if (input === 'd' || key.rightArrow) {
+        setDetailOffset(0);
         setMode({ kind: 'detail' });
         return;
       }
@@ -1217,6 +1273,8 @@ export function App({
           focusIndex={homeFocus}
           foundLabel={foundLabel}
           disk={disk}
+          trash={trashPreview}
+          trashLoading={trashLoading}
         />
         <Footer
           hints={hintsFor('home')}
@@ -1342,28 +1400,19 @@ export function App({
     );
   }
 
-  if (mode.kind === 'detail') {
+  if (mode.kind === 'detail' || mode.kind === 'help') {
     return (
       <Box flexDirection="column">
         <Box borderStyle="round" flexDirection="column" paddingX={1} width={columns}>
-          <Detail
-            row={currentRow}
-            categories={categories}
-            width={Math.max(0, columns - 4)}
-            height={Math.max(1, frameRows - PANE_BORDER_HEIGHT - FOOTER_HEIGHT)}
-          />
+          <TextPage lines={mode.kind === 'detail' ? inspectLines : helpContent}
+            offset={mode.kind === 'detail' ? detailOffset : helpOffset}
+            width={pageWidth} height={pageHeight} />
         </Box>
-        <Footer
-          hints={hintsFor('detail')}
-          session={sessionSummary(session)}
-          message={message}
-          width={columns}
-        />
+        <Footer hints={hintsFor(mode.kind)} width={columns} />
       </Box>
     );
   }
 
-  // Triage: full-width list + focused-row status line + contextual footer. No Detail sibling.
   const selectable = rows.reduce((sum, row) => (row.kind === 'header' ? sum : sum + 1), 0);
 
   /**
@@ -1465,6 +1514,7 @@ export function App({
       ) : null}
       <Footer
         hints={hintsFor('triage')}
+        secondaryHints={rowsAvailable >= 8 ? TRIAGE_MORE_HINTS : undefined}
         session={sessionSummary(session)}
         message={message}
         width={columns}

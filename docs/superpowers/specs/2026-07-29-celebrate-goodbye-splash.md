@@ -1,5 +1,7 @@
 # Celebrate → Home loop + branded goodbye (+ splash)
 
+> Historical design snapshot. See README.md and the 2026-10-27 inspection design for current behavior.
+
 **Date:** 2026-07-29  
 **Status:** Approved (chat) — implement on `feat/tui-session-redesign`  
 **Extends:** `2026-07-29-tui-session-redesign.md`

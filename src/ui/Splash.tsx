@@ -1,9 +1,8 @@
 /**
  * Brand entry while the scan starts. Tall wordmark, one purpose line, scan pulse.
  *
- * `splashReady` is the handoff contract: minimum dwell so the mark is perceptible, then leave
- * once the scan has finished, a recommended total exists, or rows have arrived while the walk
- * is still running.
+ * `splashReady` is the handoff contract: minimum dwell so the mark is perceptible, then open Home even when
+ * sizing the first project is slow. Home shows that its totals are provisional.
  */
 
 import { Box, Text } from 'ink';
@@ -38,18 +37,14 @@ type SplashLine =
   | { kind: 'purpose' }
   | { kind: 'status'; text: string };
 
-/** Pure: may leave splash when dwell elapsed AND (scan done OR recommendedBytes > 0 OR scanning stalled with rows). */
+/** Pure: the brand dwell is bounded independently of filesystem progress. */
 export function splashReady(input: {
   dwellElapsedMs: number;
   scanning: boolean;
   recommendedBytes: number;
   hasAnyRow: boolean;
 }): boolean {
-  if (input.dwellElapsedMs < SPLASH_MIN_DWELL_MS) return false;
-  if (!input.scanning) return true;
-  if (input.recommendedBytes > 0) return true;
-  if (input.hasAnyRow) return true;
-  return false;
+  return input.dwellElapsedMs >= SPLASH_MIN_DWELL_MS;
 }
 
 function splashStatusLine(

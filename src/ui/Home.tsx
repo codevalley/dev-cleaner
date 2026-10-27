@@ -15,6 +15,7 @@ import { type DiskUsage, diskLabels } from './diskbar.js';
 import { formatBytes, truncateLabel } from './format.js';
 import { BIG_ROWS, bigTextLines } from './glyphs.js';
 import { promptBox } from './Round.js';
+import type { TrashSummary } from '../trash.js';
 import {
   SCANNING_LABEL,
   SETTLED_MARK,
@@ -47,6 +48,8 @@ export interface HomeProps {
   foundLabel?: string | undefined;
   disk?: DiskUsage | undefined;
   session?: string | undefined;
+  trash?: TrashSummary | undefined;
+  trashLoading?: boolean | undefined;
 }
 
 function plural(count: number, noun: string): string {
@@ -84,6 +87,8 @@ export function homeDiskNote(disk: DiskUsage | undefined, reclaiming: number): s
 export function homeActions(
   recommendedCount: number,
   recommendedBytes: number,
+  trash?: TrashSummary,
+  trashLoading = false,
 ): HomeAction[] {
   const actions: HomeAction[] = [];
   if (recommendedCount > 0) {
@@ -95,10 +100,17 @@ export function homeActions(
   }
   actions.push(
     { id: 'browse', key: 'b', label: 'browse & adjust' },
-    { id: 'trash', key: 't', label: 'empty Trash' },
+    { id: 'trash', key: 't', label: `empty Trash · ${trashPreviewLabel(trash, trashLoading)}` },
     { id: 'quit', key: 'q', label: 'quit' },
   );
   return actions;
+}
+
+export function trashPreviewLabel(summary: TrashSummary | undefined, loading: boolean): string {
+  if (loading) return 'measuring…';
+  if (summary?.available) return `${formatBytes(summary.bytes)} · ${plural(summary.items, 'item')}`;
+  if (summary?.knownItems !== undefined) return `${plural(summary.knownItems, 'item')} · size unavailable`;
+  return 'size unavailable';
 }
 
 /** @deprecated Prefer `homeActions` — kept for tests that assert the old line list. */
@@ -167,15 +179,17 @@ export function Home({
   foundLabel,
   disk,
   session,
+  trash,
+  trashLoading = false,
 }: HomeProps): React.ReactElement {
   const spinner = useSpinner(scanning);
   const mark = scanning ? spinner : SETTLED_MARK;
-  const actions = homeActions(recommendedCount, recommendedBytes);
+  const actions = homeActions(recommendedCount, recommendedBytes, trash, trashLoading);
   const focus = clampHomeFocus(focusIndex, actions.length);
 
   const chrome = homeChromeLine(scanning, mark, rootsLabel, width);
   const caption = homeCaptionText(dormantCount, activeCount, cacheCount, disk);
-  const note = homeDiskNote(disk, recommendedBytes);
+  const note = scanning ? 'Scanning — totals may grow.' : homeDiskNote(disk, recommendedBytes);
   const progress =
     foundLabel !== undefined && foundLabel.length > 0
       ? foundLabel
@@ -201,7 +215,7 @@ export function Home({
     actionBlock.length;
 
   const allowTall = height >= fixedWithoutFigure + TALL_FIGURE_BUDGET;
-  const figure = figureLines(recommendedBytes, width, allowTall);
+  const figure = scanning && recommendedCount === 0 ? ['Scanning…'] : figureLines(recommendedBytes, width, allowTall);
   const muted = recommendedBytes <= 0;
 
   type Line = { key: string; node: React.ReactElement; keep: boolean };

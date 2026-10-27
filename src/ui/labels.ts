@@ -117,8 +117,8 @@ export const LABEL_SEPARATOR = ' · ';
  */
 export const LABEL_HELP: Record<LabelKind, string> = {
   uncommitted:
-    'Work in progress is sitting in this tree. Cleaning cannot reach it — only build output ' +
-    'is ever listed — but you may want to commit first so you do not lose your place.',
+    'Git reports local changes. This does not mean those changes are selected for cleanup. ' +
+    'Inspect the included directories before continuing; recent dirty projects get a 90-day grace period.',
   recency:
     'How long since you last touched this, and the signal that decided its score. The warmer ' +
     'it is, the sooner you will pay for the rebuild.',
@@ -126,13 +126,12 @@ export const LABEL_HELP: Record<LabelKind, string> = {
     'A secondary checkout, not your main repo. Its build output is usually the easiest thing ' +
     'here to give up — and the easiest to have forgotten you were keeping.',
   slow:
-    'Rebuilding this takes minutes, not seconds. What you are trading for the space is your ' +
-    'attention, and it has nothing to do with how big the directory is.',
+    'The next build may take several minutes because compiled output must be recreated. ' +
+    'This is a toolchain estimate, not a measured build time.',
   network:
-    'Rebuilding downloads dependencies again. Not something to start on a plane or bad wifi.',
+    'This preset includes installed dependencies. You may need to download them again before the next build.',
   offline:
-    'Rebuilds from source you already have. No connectivity needed, so this one is safe to ' +
-    'clear anywhere.',
+    'This preset keeps installed dependencies. An offline rebuild is usually possible; clearing global caches or custom build steps may still require downloads.',
 };
 
 /**
@@ -249,7 +248,7 @@ export function labelsFor(project: Project, categories?: ReadonlySet<Category>):
   if (recency !== undefined) labels.push(recency);
 
   if ([...project.types].some((type) => SLOW_TYPES.has(type))) {
-    labels.push({ kind: 'slow', text: 'slow', long: 'slow rebuild', tone: 'cost' });
+    labels.push({ kind: 'slow', text: 'slow rebuild', long: 'slow rebuild', tone: 'cost' });
   }
 
   // Exactly one of these, always, on every project — which is what makes the answer readable
@@ -257,8 +256,8 @@ export function labelsFor(project: Project, categories?: ReadonlySet<Category>):
   // "nobody worked out whether it needs the network", and the user would have to go and check.
   labels.push(
     artifacts.some((artifact) => artifact.category === 'deps')
-      ? { kind: 'network', text: 'needs network', long: 'needs network to rebuild', tone: 'cost' }
-      : { kind: 'offline', text: 'offline', long: 'rebuilds offline', tone: 'info' },
+      ? { kind: 'network', text: 'downloads needed', long: 'needs network to rebuild', tone: 'cost' }
+      : { kind: 'offline', text: 'rebuild offline', long: 'rebuilds offline', tone: 'info' },
   );
 
   return labels.sort(

@@ -107,12 +107,7 @@ async function signalsOf(
   }
 }
 
-/**
- * `scoreActivity`'s body is the plan's one intentional TODO, authored by the repository
- * owner. Until it lands — and after, since it encodes a judgement rather than a
- * derivation — a throw from it must not take the scan down. Failing closed means `active`:
- * an active project is protected, not selected for deletion.
- */
+/** An unexpected scoring failure protects the project rather than preselecting it. */
 function scoreOf(signals: ActivitySignals, nowMs: number): ActivityScore {
   try {
     return scoreActivity(signals, nowMs);

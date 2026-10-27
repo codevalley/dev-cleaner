@@ -115,8 +115,9 @@ documented here.
 ## The interface
 
 Run it in a terminal and you get a full-screen session: **Splash → Home → Triage →
-Confirm → Done**. The scan starts behind a short brand splash; once there is an honest
-recommended total, you land on Home with one primary action. Browse and adjust is opt-in
+Confirm → Done**. The scan starts behind a short brand splash; after a short brand dwell,
+you land on Home while scanning continues. Until results arrive it says “Scanning…”;
+partial totals are labeled as provisional. Browse and adjust is opt-in
 (`b`). Home lists actions in a boxed menu; Triage and later modes use a contextual footer
 with only the keys valid there.
 
@@ -129,7 +130,7 @@ with only the keys valid there.
  ╭──────────────────────────────────────────────────────────────╮
  │ enter  trash the recommended 4 items · 1.8G                  │
  │ b browse & adjust                                            │
- │ t Trash                                                      │
+ │ t empty Trash · 2.0G · 4 items                               │
  │ q quit                                                       │
  ╰──────────────────────────────────────────────────────────────╯
 ```
@@ -154,7 +155,8 @@ with only the keys valid there.
   ◉ npm cache                                      60.6M
 
  ▸ api · node · dormant 6mo · dist 44.0M
- space · a · j/k · d detail · p · enter · esc home · t · q
+ space toggle · ? help · →/d inspect · enter review
+ q quit · ↑↓/jk move · a toggle section · p preset · t Trash · esc home
 ```
 
 | Key | Does |
@@ -163,15 +165,38 @@ with only the keys valid there.
 | `space` | Toggle the highlighted row (Triage) |
 | `a` | Toggle everything in the current section (Triage) |
 | `b` | Browse & adjust — Home → Triage |
-| `d` | Full detail for the focused row (Triage); `esc` back |
+| `→` / `d` | Inspect the focused project: exact paths, sizes, categories, and included/kept status |
+| `↑` `↓` / `j` `k`, `PgUp` `PgDn`, `g` `G` | Scroll inspection/help; `g`/`G` jump to the beginning/end |
+| `←` / `esc` | Return from inspection/help without changing selection |
+| `?` | Keyboard help and explanations of the labels |
 | `p` | Cycle the preset (recommended ⇄ aggressive) |
 | `enter` | Home or Triage: screen the selection, then ask for confirmation; Confirm: execute |
 | `esc` | Triage → Home; Confirm → back; Done → Home |
 | `t` | Empty the Trash (requires typing the word `empty`) |
 | `q` | Quit |
 
-The list paints as soon as the first project root is known and keeps repainting as sizes
-arrive — it never blocks on a complete scan.
+Projects arrive one at a time, after each project’s artifacts are sized and its activity
+is scored. Global caches arrive after projects. Home and browsing remain usable while the
+scan runs; a large first project can delay the first result.
+
+Inspection shows the scan’s artifact inventory, including dependencies that the current
+preset keeps. It does not enumerate every source file or file inside an artifact. Long lists
+and paths are scrollable; nothing is selected just by inspecting it. The included directories
+are candidates, and confirmation can still refuse them.
+
+Home also measures the whole Trash in the background without requesting Finder automation.
+It shows bytes and item count when measurable, “measuring…” while loading, or “size
+unavailable” when access is restricted. Opening Trash explicitly can use the Finder fallback.
+
+| Label | What it means |
+| --- | --- |
+| `slow rebuild` | A toolchain estimate: the next build may take several minutes. |
+| `rebuild offline` | Dependency directories remain; a normal rebuild can usually reuse them. Global cache cleanup or custom build steps can still require downloads. |
+| `downloads needed` | This preset includes dependencies; reinstalling them may need the network. |
+| `uncommitted` | Git reports local changes. It does not mean those changes are selected for cleanup. |
+| `worktree` | A separate linked checkout; only its candidate artifact directories are considered. |
+
+Press `?` for these explanations or inspect a project for its full details.
 
 `enter` does not clean. It freezes your selection, runs it through the deletion boundary's
 own guards, and shows you the result: what will be trashed, what was refused and why, and
@@ -220,11 +245,12 @@ inside the project. This table is the allowlist — nothing outside it is deleta
 
 | Preset | Categories | What that means |
 | --- | --- | --- |
-| **recommended** (default) | `build` + `cache` | Rebuild from source you already have. No network needed. |
+| **recommended** (default) | `build` + `cache` | Keeps installed dependencies; build output and caches must be regenerated. |
 | **aggressive** | `build` + `deps` + `cache` | Also clears `node_modules`, `.venv`, `Pods`, `vendor/bundle`. Much bigger, but the next build has to re-download. |
 
-`--preset aggressive`, or press `p` in the interface. Switching presets recomputes the
-selection; it does not re-walk the filesystem.
+`--preset aggressive`, or press `p` in the interface. Switching presets changes the included categories without re-walking the filesystem.
+Home recomputes its recommendation; Triage retains your choices for existing rows and
+applies defaults to newly visible rows.
 
 ### Global caches
 
@@ -295,11 +321,10 @@ showed before.
 dev-cleaner therefore:
 
 - reports what is now sitting in the Trash rather than what was "freed";
-- prints the disclosure on the way out, so it survives scrollback. Redirected, that is
-  exactly one greppable line:
-  `dev-cleaner: <total> moved to the Trash in 1 round. Trashed files still occupy the disk until you empty the Trash.`;
+- prints a session summary and the Trash disclosure on exit after cleanup. Piped runs only
+  print the read-only report; they never perform cleanup;
 - offers to empty the Trash from inside the interface (`t`), showing the whole Trash's
-  size first and requiring you to type the word `empty` — emptying is irreversible and
+  size when available, or explicitly saying its size is unknown, and requiring `empty` — emptying is irreversible and
   covers files this tool never touched;
 - replaces the disclosure with "The Trash was emptied, so that space is back" when, and
   only when, you actually did.

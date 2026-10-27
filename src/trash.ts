@@ -163,6 +163,8 @@ export interface TrashRootOptions {
 }
 
 export interface TrashSummaryOptions extends TrashRootOptions {
+  /** Background previews must not trigger a Finder automation permission prompt. */
+  allowFinder?: boolean;
   /** Trash directories to measure. Defaults to every one Finder would empty. */
   roots?: readonly string[];
   /** Byte sizer, for tests that need a deterministic total. */
@@ -550,6 +552,7 @@ export async function readTrashSummary(options: TrashSummaryOptions = {}): Promi
   if (platform !== 'darwin') {
     return unknownTrash('blind', 'dev-cleaner could not read the Trash on this system.');
   }
+  if (options.allowFinder === false) return unknownTrash('blind', CANNOT_MEASURE_HINT);
   return readViaFinder(options.exec ?? readExec);
 }
 

@@ -1,5 +1,7 @@
 # dev-cleaner — TUI session redesign
 
+> Historical design snapshot. See README.md and the 2026-10-27 inspection design for current behavior.
+
 **Date:** 2026-07-29  
 **Status:** Draft — awaiting approval  
 **Supersedes:** the “User interface” section of `2026-07-25-dev-cleaner-design.md` (two-pane Ink workspace). All other sections of that spec (discovery, safety, clean, caches, degradation) remain in force.

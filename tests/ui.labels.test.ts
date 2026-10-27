@@ -174,13 +174,13 @@ describe('connectivity', () => {
     for (const relPath of ['node_modules', 'Pods', '.venv', 'vendor/bundle']) {
       const labels = labelsFor(project({ artifacts: [artifact(relPath, 'deps', GB)] }));
       expect(kinds(labels)).toContain('network');
-      expect(find(labels, 'network')?.text).toBe('needs network');
+      expect(find(labels, 'network')?.text).toBe('downloads needed');
     }
   });
 
   it('says offline when nothing has to be downloaded', () => {
     const labels = labelsFor(project({ artifacts: [artifact('dist', 'build', GB)] }));
-    expect(find(labels, 'offline')?.text).toBe('offline');
+    expect(find(labels, 'offline')?.text).toBe('rebuild offline');
   });
 
   it('emits exactly one of network/offline, always', () => {
@@ -452,7 +452,7 @@ describe('LABEL_HELP', () => {
 
   it('says of a dirty tree that cleaning cannot reach the work', () => {
     // The whole point of the chip row: state cost, never imply a danger that does not exist.
-    expect(LABEL_HELP.uncommitted.toLowerCase()).toMatch(/cannot reach|cannot touch/);
+    expect(LABEL_HELP.uncommitted.toLowerCase()).toMatch(/not mean.*selected|included directories/);
   });
 });
 
@@ -468,7 +468,7 @@ describe('rendering helpers', () => {
     );
 
     expect(joinLabels(labels)).toBe(
-      ['uncommitted', 'edited 8d', 'slow', 'needs network'].join(LABEL_SEPARATOR),
+      ['uncommitted', 'edited 8d', 'slow rebuild', 'downloads needed'].join(LABEL_SEPARATOR),
     );
     expect(joinLabels(labels, 'long')).toBe(
       [
@@ -493,7 +493,7 @@ describe('rendering helpers', () => {
     expect(labels).toHaveLength(5);
     for (const label of labels) {
       expect(label.text.length).toBeLessThanOrEqual(label.long.length);
-      expect(label.text.length).toBeLessThanOrEqual(14);
+      expect(label.text.length).toBeLessThanOrEqual(16);
       expect(label.text).not.toBe('');
     }
   });

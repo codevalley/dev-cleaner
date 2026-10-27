@@ -152,7 +152,7 @@ describe('the chip column', () => {
   it('draws every chip when the pane is wide enough for them', () => {
     const rows = [projectRow(CROWDED)];
     expect(everyChip(CROWDED, AGGRESSIVE)).toBe(
-      'uncommitted · edited 3d · worktree · slow · needs network',
+      'uncommitted · edited 3d · worktree · slow rebuild · downloads needed',
     );
     expect(chipsAt(rows, rows[0] as Row, 100, AGGRESSIVE)).toBe(everyChip(CROWDED, AGGRESSIVE));
   });
@@ -166,9 +166,9 @@ describe('the chip column', () => {
    * `uncommitted` survive longest because nothing else in this pane hints at either.
    */
   it.each([
-    [100, 'uncommitted · edited 3d · worktree · slow · needs network'],
-    [80, 'uncommitted · worktree · slow · needs network'],
-    [60, 'uncommitted · worktree · slow'],
+    [100, 'uncommitted · edited 3d · worktree · slow rebuild · downloads needed'],
+    [80, 'uncommitted · worktree · slow rebuild'],
+    [60, 'uncommitted · worktree'],
     [50, 'uncommitted · worktree'],
     [45, 'uncommitted'],
     [30, ''],
@@ -306,8 +306,8 @@ describe('the chip column', () => {
     const rows = [projectRow(node)];
 
     expect(chipsAt(rows, rows[0] as Row, 100, RECOMMENDED)).toContain('offline');
-    expect(chipsAt(rows, rows[0] as Row, 100, RECOMMENDED)).not.toContain('needs network');
-    expect(chipsAt(rows, rows[0] as Row, 100, AGGRESSIVE)).toContain('needs network');
+    expect(chipsAt(rows, rows[0] as Row, 100, RECOMMENDED)).not.toContain('downloads needed');
+    expect(chipsAt(rows, rows[0] as Row, 100, AGGRESSIVE)).toContain('downloads needed');
   });
 
   /**
@@ -320,13 +320,13 @@ describe('the chip column', () => {
    */
   it('says nothing about connectivity rather than contradict the detail pane', () => {
     // The contradiction being avoided, stated outright: the same project, two answers.
-    expect(joinLabels(labelsFor(CROWDED))).toContain('needs network');
+    expect(joinLabels(labelsFor(CROWDED))).toContain('downloads needed');
     expect(joinLabels(labelsFor(CROWDED, RECOMMENDED))).toContain('offline');
 
     const rows = [projectRow(CROWDED)];
     const plan = chipPlan(rows, undefined, chipBudget(100));
     expect(chipsFor(rows[0] as Row, undefined, plan)).toBe(
-      'uncommitted · edited 3d · worktree · slow',
+      'uncommitted · edited 3d · worktree · slow rebuild',
     );
   });
 
@@ -376,7 +376,7 @@ describe('a row is one line', () => {
   });
 
   it('puts the chips on the row at a comfortable width', () => {
-    expect(mount(90).lastFrame() ?? '').toContain('uncommitted · edited 3d · worktree');
+    expect(mount(90).lastFrame() ?? '').toContain('uncommitted · worktree · slow rebuild');
   });
 
   it('puts none on the row at a narrow one', () => {
@@ -463,7 +463,7 @@ describe('the detail pane carries every chip', () => {
     rendered.push(instance);
     const lines = (instance.lastFrame() ?? '').split('\n');
     const total = lines.findIndex((line) => line.includes('total'));
-    const help = lines.findIndex((line) => line.includes('Rebuilding this takes minutes'));
+    const help = lines.findIndex((line) => line.includes('The next build may take'));
     expect(total).toBeGreaterThan(-1);
     expect(help).toBeGreaterThan(total);
   });
@@ -527,14 +527,14 @@ describe('the chip column is actually reachable from the app', () => {
     );
 
     const plan = chipPlan([withDeps], deps, chipBudget(100));
-    expect(chipsFor(withDeps, deps, plan)).toContain('needs network');
+    expect(chipsFor(withDeps, deps, plan)).toContain('downloads needed');
 
     // ...and with no category set the pair is correctly WITHHELD rather than guessed:
     // "needs network" is false under a preset that does not clean node_modules, so a chip
     // that guesses is worse than no chip.
     const planless = chipPlan([withDeps], undefined, chipBudget(100));
     const guessed = chipsFor(withDeps, undefined, planless);
-    expect(guessed).not.toContain('needs network');
+    expect(guessed).not.toContain('downloads needed');
     expect(guessed).not.toContain('offline');
   });
 });

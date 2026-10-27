@@ -91,7 +91,7 @@ learning:
   regenerable junk in a directory nobody thought of is for someone to run the tool on a
   machine that has it.
 - The evidence base is one machine. dev-cleaner has been run to completion on the author's
-  macOS laptop, where it took `~/develop` from 133 GB to 20 GB — 107 GB reclaimed. That is
+  macOS laptop, where it took `~/develop` from 133 GB to 20 GB — about 113 GB less in that projects directory. That is
   a real result and it is also a sample size of one, on one operating system, with one
   person's set of toolchains.
 

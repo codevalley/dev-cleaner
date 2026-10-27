@@ -558,6 +558,15 @@ describe('readTrashSummary: falling back to Finder', () => {
 });
 
 describe('readTrashSummary: reading cannot destroy', () => {
+  it('can measure in the background without asking Finder for automation access', async () => {
+    f = await fixture({});
+    const root = await unlistableRoot();
+    const finder = fakeFinder({ count: { ok: true, stdout: '7' } });
+    const summary = await readTrashSummary({ roots: [root], platform: 'darwin', exec: finder.exec, allowFinder: false });
+    expect(summary.available).toBe(false);
+    expect(summary.detail).toContain('Full Disk Access');
+    expect(finder.calls).toHaveLength(0);
+  });
   it('never asks to run osascript when the filesystem answers', async () => {
     // Reading the Trash must not be able to empty it, structurally and not merely by
     // intention. With no process creation possible in this file, the assertion is on what was

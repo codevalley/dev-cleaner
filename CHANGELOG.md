@@ -15,6 +15,34 @@ One extra section type is used, and it is the important one:
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-10-27
+
+### Added
+
+- Home shows the whole Trash's size and item count when available, with explicit loading
+  and unavailable states. The background preview does not request Finder automation access.
+- Right arrow or `d` opens a scrollable project inspector with artifact paths, sizes,
+  categories, and included/kept status for the current preset. Left arrow or Escape returns.
+- `?` opens scrollable keyboard help and explanations of the project labels.
+
+### Changed
+
+- Home becomes available after the short splash even while the first project is being sized.
+  It labels ongoing scans and provisional totals explicitly.
+- Triage uses labeled actions across two footer rows, keeping full help reachable on narrow terminals.
+- Short labels now say `slow rebuild`, `rebuild offline`, and `downloads needed`; explanations
+  distinguish local changes from cleanup selection and qualify rebuild estimates.
+
+### Fixed
+
+- Long inspection lists can be scrolled instead of silently cutting off their final entries.
+- Long paths preserve Unicode characters and repeated spaces when wrapping on narrow screens.
+- Trash previews refresh after cleanup, and late earlier measurements cannot overwrite them.
+- Documentation now describes per-project scan updates, preset behavior, unknown Trash sizes,
+  and current test timing. Historical design notes are marked, and obsolete scoring-stub comments removed.
+
+Artifact/cache tables, activity thresholds, and deletion guards are unchanged.
+
 ## [0.2.0] — 2026-07-29
 
 Interface work. **Nothing about what the tool deletes has changed** — the artifact table is

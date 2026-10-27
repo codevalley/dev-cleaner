@@ -349,9 +349,11 @@ interface, because then it would be false in the other direction. A session that
 nothing prints nothing at all: `dev-cleaner` used as a viewer is as quiet as `ls`.
 
 Emptying the Trash is irreversible and covers files this tool never touched, so it sits
-behind the whole Trash's size being displayed first and the user typing the word `empty` —
-exact equality, never a prefix, and only when a total was actually disclosed, because an
-empty offered without a figure is an offer the user cannot evaluate.
+behind the user typing the word `empty`. When measurable, the prompt displays the whole
+Trash’s size. When macOS denies measurement, the prompt explicitly says that the size is
+unknown and that emptying includes everything already in Trash. Unknown never becomes 0B.
+Home uses a filesystem-only preview to avoid prompting for Finder access during startup;
+opening Trash explicitly may ask Finder. Emptying itself is supported only on macOS.
 
 ---
 
